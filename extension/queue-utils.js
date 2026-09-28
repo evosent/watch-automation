@@ -1,0 +1,877 @@
+import { skuKeyForModelName } from './sku-utils.js';
+
+export const QUEUE_GROUPS = Object.freeze({
+  in_sale_good: { label: 'В продаже · хорошее качество', folder: 'in_sale' },
+  in_sale_bad: { label: 'В продаже · плохое качество', folder: 'in_sale/bad_resolution' },
+  not_in_sale_good: { label: 'Не в продаже · хорошее качество', folder: 'not_in_sale' },
+  not_in_sale_bad: { label: 'Не в продаже · плохое качество', folder: 'not_in_sale/bad_resolution' }
+});
+
+export const QUEUE_GROUP_IDS = Object.freeze(Object.keys(QUEUE_GROUPS));
+export const REGENERATION_QUEUE_ID = 'regeneration';
+export const IMAGE_EXTENSIONS = Object.freeze(new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff']));
+
+// Persistent generation memory is intentionally separate from the transient
+// queue status. The queue is rebuilt when a folder is rescanned, while this
+// registry keeps the user's decision for every model across rescans and
+// extension updates.
+export const GENERATION_MEMORY_STATUSES = Object.freeze({
+  NOT_READY: 'not_ready',
+  RUNNING: 'running',
+  IMAGE_SAVED: 'image_saved',
+  FACTS_PENDING: 'facts_pending',
+  READY: 'ready'
+});
+
+export const GENERATION_MEMORY_STATUS_LABELS = Object.freeze({
+  not_ready: 'Не готово',
+  running: 'Запущена генерация',
+  image_saved: 'Фото сохранено · ждёт спецификацию',
+  facts_pending: 'Получение спецификации',
+  ready: 'Готово'
+});
+
+export const SALE_STATUS_FILTERS = Object.freeze({
+  all: { label: 'Все статусы' },
+  in_sale: { label: 'В продаже' },
+  not_in_sale: { label: 'Не в продаже' }
+});
+
+export const QUALITY_FILTERS = Object.freeze({
+  all: { label: 'Любое качество' },
+  good: { label: 'Хорошее качество' },
+  bad: { label: 'Плохое качество' }
+});
+
+// These ids intentionally match prompt-profiles.js. Keeping the small list in
+// the queue layer lets the service worker filter files without importing the
+// prompt profile module and creating a circular dependency.
+export const WATCH_BRAND_FILTERS = Object.freeze([
+  { id: 'all', label: 'Все бренды' },
+  { id: 'armani_exchange', label: 'Armani Exchange' },
+  { id: 'benyar', label: 'Benyar' },
+  { id: 'casio', label: 'Casio' },
+  { id: 'certina', label: 'Certina' },
+  { id: 'citizen', label: 'Citizen' },
+  { id: 'diesel', label: 'Diesel' },
+  { id: 'longines', label: 'Longines' },
+  { id: 'orient', label: 'Orient' },
+  { id: 'pagani_design', label: 'Pagani Design' },
+  { id: 'q_and_q', label: 'Q&Q' },
+  { id: 'seiko', label: 'Seiko' },
+  { id: 'tissot', label: 'Tissot' }
+]);
+
+const REFERENCE_NAMES = Object.freeze({
+  '1. base.png': 'template',
+  '2. base n ozon.png': 'ozonMap',
+  '2. ozon blind zones.png': 'ozonMap',
+  '2. ozon blind zones 2.png': 'ozonMap',
+  '3. logo black.png': 'storeLogo'
+});
+
+const BRAND_FOLDER_ALIASES = Object.freeze({
+  casio: 'casio',
+  orient: 'orient',
+  tissot: 'tissot',
+  benyar: 'benyar',
+  'pagani design': 'pagani_design',
+  pagani_design: 'pagani_design',
+  'q&q': 'q_and_q',
+  'q & q': 'q_and_q',
+  q_and_q: 'q_and_q',
+  seiko: 'seiko',
+  citizen: 'citizen',
+  longines: 'longines',
+  diesel: 'diesel',
+  'armani exchange': 'armani_exchange',
+  armani_exchange: 'armani_exchange',
+  certina: 'certina'
+});
+
+export function normalizeRelativePath(value) {
+  return String(value || '').replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+/g, '/');
+}
+
+export function isImageFileName(name) {
+  const value = String(name || '').toLowerCase();
+  return [...IMAGE_EXTENSIONS].some((extension) => value.endsWith(extension));
+}
+
+export function normalizeBrandFolderId(value) {
+  const normalized = String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (BRAND_FOLDER_ALIASES[normalized]) return BRAND_FOLDER_ALIASES[normalized];
+  return normalized
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, ' ')
+    .replace(/[^a-z0-9а-яё]+/gi, '_')
+    .replace(/^_+|_+$/g, '') || 'generic';
+}
+
+export function referenceDescriptorForPath(relativePath) {
+  const parts = normalizeRelativePath(relativePath).split('/').filter(Boolean);
+  const rootIndex = parts.findIndex((part) => part.toLowerCase() === 'input-ref-images');
+  if (rootIndex < 0) return null;
+  const brandParts = parts
+    .slice(rootIndex + 1, -1)
+    .filter((part) => !['brands', 'common'].includes(String(part).toLowerCase()));
+  const fileName = String(parts.at(-1) || '');
+  // Brand base images are often named after the brand (for example
+  // `brands/Benyar/1. Benyar.png`) when they are prepared manually. Treat
+  // that stable first-image convention as the same template key as
+  // `brands/Benyar/1. Base.png`.
+  let key = REFERENCE_NAMES[fileName.toLowerCase()];
+  if (!key && brandParts.length && /^1\.\s*.+\.(?:png|jpe?g|webp)$/i.test(fileName)) {
+    key = 'template';
+  }
+  if (!key) return null;
+  if (key === 'storeLogo') {
+    return brandParts.length ? null : { key, brandId: null, storageKey: key };
+  }
+  const brandId = brandParts.length ? normalizeBrandFolderId(brandParts.join(' ')) : null;
+  return { key, brandId, storageKey: brandId ? `${key}:${brandId}` : key };
+}
+
+export function referenceKeyForPath(relativePath) {
+  return referenceDescriptorForPath(relativePath)?.key || null;
+}
+
+export function referenceStorageKeyForPath(relativePath) {
+  return referenceDescriptorForPath(relativePath)?.storageKey || null;
+}
+
+export function classifyWatchPath(relativePath) {
+  const parts = normalizeRelativePath(relativePath).split('/').filter(Boolean);
+  const rootIndex = parts.findIndex((part) => part.toLowerCase() === 'input-watches-images');
+  // A directory input reports paths relative to the folder the user picked.
+  // When the user picks `in_sale` itself, the `input-watches-images` marker is
+  // absent; the sale segment is still enough to classify the image safely.
+  const saleIndex = rootIndex >= 0
+    ? rootIndex + 1
+    : parts.findIndex((part) => ['in_sale', 'not_in_sale'].includes(String(part).toLowerCase()));
+  if (saleIndex < 0) return null;
+  const salePart = String(parts[saleIndex] || '').toLowerCase();
+  if (salePart !== 'in_sale' && salePart !== 'not_in_sale') return null;
+  const isBad = parts.slice(saleIndex + 1, -1).some((part) => part.toLowerCase() === 'bad_resolution');
+  return `${salePart}_${isBad ? 'bad' : 'good'}`;
+}
+
+function normalizeBrandSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replaceAll('с', 'c')
+    .replaceAll('а', 'a')
+    .replaceAll('е', 'e')
+    .replaceAll('о', 'o')
+    .replaceAll('р', 'p')
+    .replaceAll('х', 'x')
+    .replaceAll('у', 'y')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function brandIdFromModelName(modelName) {
+  const value = normalizeBrandSearchText(modelName);
+  if (/\barmani\s+exchange\b/.test(value)) return 'armani_exchange';
+  if (/\bpagani\s+design\b/.test(value)) return 'pagani_design';
+  if (/\bbenyar\b/.test(value)) return 'benyar';
+  if (/\bcasio\b/.test(value)) return 'casio';
+  if (/\borient\b/.test(value)) return 'orient';
+  if (/\btissot\b/.test(value)) return 'tissot';
+  if (/\bq\s*&\s*q\b|\bq\s*n\s*q\b/.test(value)) return 'q_and_q';
+  if (/\bseiko\b/.test(value)) return 'seiko';
+  if (/\bcitizen\b/.test(value)) return 'citizen';
+  if (/\blongines\b/.test(value)) return 'longines';
+  if (/\bdiesel\b/.test(value)) return 'diesel';
+  if (/\bcertina\b/.test(value)) return 'certina';
+  return 'generic';
+}
+
+export function normalizeSaleStatusFilter(value) {
+  const normalized = String(value || '').trim();
+  return Object.hasOwn(SALE_STATUS_FILTERS, normalized) ? normalized : 'all';
+}
+
+export function normalizeQualityFilter(value) {
+  const normalized = String(value || '').trim();
+  return Object.hasOwn(QUALITY_FILTERS, normalized) ? normalized : 'all';
+}
+
+export function normalizeBrandFilter(value) {
+  const normalized = String(value || '').trim();
+  return WATCH_BRAND_FILTERS.some((item) => item.id === normalized) ? normalized : 'all';
+}
+
+export function normalizeCoverageMode(value) {
+  return String(value || '').trim() === 'one_per_brand' ? 'one_per_brand' : 'queue';
+}
+
+export function normalizeGenerationMemoryStatus(value, fallback = GENERATION_MEMORY_STATUSES.NOT_READY) {
+  const normalized = String(value || '').trim();
+  return Object.hasOwn(GENERATION_MEMORY_STATUS_LABELS, normalized)
+    ? normalized
+    : fallback;
+}
+
+export function queueStatusForGenerationMemoryStatus(value) {
+  const status = normalizeGenerationMemoryStatus(value);
+  if ([GENERATION_MEMORY_STATUSES.READY, GENERATION_MEMORY_STATUSES.IMAGE_SAVED,
+    GENERATION_MEMORY_STATUSES.FACTS_PENDING].includes(status)) return 'done';
+  if (status === GENERATION_MEMORY_STATUSES.RUNNING) return 'running';
+  return 'pending';
+}
+
+export function normalizeQueueStatus(value, fallback = 'pending') {
+  const status = String(value || '').trim();
+  return ['pending', 'running', 'done', 'error', 'failed'].includes(status)
+    ? status
+    : queueStatusForGenerationMemoryStatus(status || fallback);
+}
+
+export function factsMetadataProjections(patch = {}) {
+  const factsStatus = String(patch.factsStatus || '').toLowerCase();
+  const memoryStatus = factsStatus === 'ok'
+    ? GENERATION_MEMORY_STATUSES.READY
+    : factsStatus === 'pending'
+      ? GENERATION_MEMORY_STATUSES.FACTS_PENDING
+      : ['error', 'unavailable'].includes(factsStatus)
+        ? GENERATION_MEMORY_STATUSES.IMAGE_SAVED
+        : null;
+  return {
+    queue: { ...patch, status: 'done' },
+    memory: memoryStatus ? { ...patch, status: memoryStatus } : { ...patch }
+  };
+}
+
+export function generationMemoryStatusForQueueStatus(value) {
+  if (String(value || '').trim() === 'done') return GENERATION_MEMORY_STATUSES.READY;
+  if (String(value || '').trim() === 'running') return GENERATION_MEMORY_STATUSES.RUNNING;
+  return GENERATION_MEMORY_STATUSES.NOT_READY;
+}
+
+export function normalizeWatchFilter(value = {}) {
+  return {
+    saleStatus: normalizeSaleStatusFilter(value.saleStatus),
+    quality: normalizeQualityFilter(value.quality),
+    brand: normalizeBrandFilter(value.brand)
+  };
+}
+
+export function filterFromQueueGroup(groupId) {
+  const value = String(groupId || '').trim();
+  const match = /^(in_sale|not_in_sale)_(good|bad)$/.exec(value);
+  return normalizeWatchFilter(match
+    ? { saleStatus: match[1], quality: match[2], brand: 'all' }
+    : {});
+}
+
+export function queueGroupForWatchFilter(value = {}) {
+  const filter = normalizeWatchFilter(value);
+  if (filter.brand !== 'all' || filter.saleStatus === 'all' || filter.quality === 'all') return null;
+  return `${filter.saleStatus}_${filter.quality}`;
+}
+
+export function filterSelectionId(value = {}) {
+  const filter = normalizeWatchFilter(value);
+  return `filter:${filter.saleStatus}:${filter.quality}:${filter.brand}`;
+}
+
+export function parseFilterSelectionId(value) {
+  const match = /^filter:([^:]+):([^:]+):([^:]+)$/.exec(String(value || '').trim());
+  if (!match) return null;
+  return normalizeWatchFilter({ saleStatus: match[1], quality: match[2], brand: match[3] });
+}
+
+export function groupIdForWatchFilter(value = {}) {
+  return queueGroupForWatchFilter(value) || filterSelectionId(value);
+}
+
+export function watchFilterLabel(value = {}) {
+  const filter = normalizeWatchFilter(value);
+  const brand = WATCH_BRAND_FILTERS.find((item) => item.id === filter.brand)?.label || 'Все бренды';
+  return `${SALE_STATUS_FILTERS[filter.saleStatus].label} · ${QUALITY_FILTERS[filter.quality].label} · ${brand}`;
+}
+
+function entrySaleStatus(entry) {
+  const groupId = String(entry?.groupId || '');
+  return groupId.startsWith('in_sale_') ? 'in_sale' : (groupId.startsWith('not_in_sale_') ? 'not_in_sale' : null);
+}
+
+function entryQuality(entry) {
+  return String(entry?.groupId || '').endsWith('_bad') ? 'bad' : 'good';
+}
+
+export function matchesWatchFilter(entry, value = {}) {
+  const filter = normalizeWatchFilter(value);
+  if (Array.isArray(entry?.variants) && entry.variants.length) {
+    return entry.variants.some((variant) => matchesWatchFilter({
+      ...variant,
+      sourceId: entry.sourceId,
+      modelName: variant.modelName || entry.modelName,
+      groupId: variant.groupId
+    }, filter));
+  }
+  const saleStatus = entrySaleStatus(entry);
+  const quality = entryQuality(entry);
+  return (filter.saleStatus === 'all' || filter.saleStatus === saleStatus)
+    && (filter.quality === 'all' || filter.quality === quality)
+    && (filter.brand === 'all' || brandIdFromModelName(entry?.modelName || entry?.fileName) === filter.brand);
+}
+
+export function filteredWatchEntries(groups = {}, value = {}) {
+  const filter = normalizeWatchFilter(value);
+  const candidates = QUEUE_GROUP_IDS
+    .flatMap((groupId) => groups?.[groupId] || [])
+    .filter((entry) => matchesWatchFilter(entry, filter));
+  const bySource = new Map();
+  for (const entry of candidates) {
+    const modelName = entry?.modelName || entry?.fileName || '';
+    const sourceId = String(entry?.skuKey || skuKeyForModelName(modelName, brandIdFromModelName(modelName)));
+    if (!sourceId) continue;
+    const fallbackVariantId = entry.sourceVariantId || entry.inputSourceId
+      || sourceVariantIdFor(entry.groupId || 'in_sale_good', entry.relativePath || entry.fileName);
+    const candidate = {
+      ...entry,
+      sourceId,
+      skuKey: sourceId,
+      sourceVariantId: fallbackVariantId,
+      inputSourceId: entry.inputSourceId || fallbackVariantId,
+      variants: entry.variants?.length ? entry.variants : [{
+        ...entry,
+        sourceVariantId: fallbackVariantId,
+        variantId: fallbackVariantId,
+        assetKey: `watch:${fallbackVariantId}`
+      }]
+    };
+    const previous = bySource.get(sourceId);
+    if (!previous) {
+      bySource.set(sourceId, candidate);
+      continue;
+    }
+    const variants = new Map();
+    for (const variant of [...(previous.variants || []), ...(candidate.variants || [])]) {
+      const variantId = String(variant?.sourceVariantId || variant?.variantId || variant?.relativePath || '');
+      if (variantId) variants.set(variantId, variant);
+    }
+    previous.variants = [...variants.values()];
+  }
+  return [...bySource.values()].map((entry) => {
+    const selected = chooseSourceVariant(entry.variants || [], filter);
+    const sameInput = String(selected?.sourceVariantId || selected?.variantId || '')
+      === String(entry.sourceVariantId || entry.inputSourceId || '');
+    const status = normalizeQueueStatus(selected?.status || (sameInput ? entry.status : 'pending'));
+    return selected ? {
+      ...entry,
+      ...selected,
+      sourceId: entry.sourceId,
+      skuKey: entry.skuKey || entry.sourceId,
+      variants: entry.variants || [],
+      status,
+      generationId: selected.generationId || (sameInput ? entry.generationId : null),
+      previousGenerationId: sameInput ? entry.previousGenerationId : null,
+      outputPath: selected.outputPath || (sameInput ? entry.outputPath : null),
+      outputHash: selected.outputHash || (sameInput ? entry.outputHash : null),
+      recipeHash: selected.recipeHash || (sameInput ? entry.recipeHash : null),
+      groupId: selected.groupId || entry.groupId,
+      sourceVariantId: selected.sourceVariantId || selected.variantId || entry.sourceVariantId,
+      inputSourceId: selected.sourceVariantId || selected.variantId || entry.inputSourceId
+    } : entry;
+  });
+}
+
+export function chooseSourceVariant(variants = [], filterValue = {}) {
+  const filter = normalizeWatchFilter(filterValue);
+  const candidates = (variants || []).filter((variant) => {
+    if (!variant?.groupId) return true;
+    const groupFilter = filterFromQueueGroup(variant.groupId);
+    return (filter.saleStatus === 'all' || groupFilter.saleStatus === filter.saleStatus)
+      && (filter.quality === 'all' || groupFilter.quality === filter.quality)
+      && (filter.brand === 'all' || brandIdFromModelName(variant.modelName || variant.fileName) === filter.brand);
+  });
+  const list = candidates.length ? candidates : (variants || []);
+  return [...list].sort((left, right) => {
+    const quality = Number(entryQuality(left) === 'bad') - Number(entryQuality(right) === 'bad');
+    if (quality) return quality;
+    const sale = Number(entrySaleStatus(right) === 'in_sale') - Number(entrySaleStatus(left) === 'in_sale');
+    if (sale) return sale;
+    const path = normalizeRelativePath(left.relativePath || left.fileName).toLowerCase()
+      .localeCompare(normalizeRelativePath(right.relativePath || right.fileName).toLowerCase(), 'en');
+    return path || String(left.sourceVariantId || left.variantId || '').localeCompare(String(right.sourceVariantId || right.variantId || ''));
+  })[0] || null;
+}
+
+export function modelNameFromFileName(fileName) {
+  return String(fileName || '').replace(/\.[^.]+$/, '').trim();
+}
+
+export function sanitizeFilename(name) {
+  let value = String(name || 'generated-watch.png')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!value) value = 'generated-watch.png';
+  if (value.length > 180) value = value.slice(0, 180).replace(/[ .]+$/, '');
+  return value || 'generated-watch.png';
+}
+
+export function generatedFileName(sourceFileName) {
+  const safeName = sanitizeFilename(sourceFileName);
+  return safeName.toLowerCase().startsWith('gen-') ? safeName : `gen-${safeName}`;
+}
+
+// Every physical attempt gets its own output path. This keeps a Chrome
+// " (1)" filename collision from becoming an implicit version selector and
+// prevents a later revision from overwriting an older revision's PNG.
+export function generationOutputFileName(baseFileName, generationId) {
+  const safeBase = sanitizeFilename(baseFileName || 'generated-watch.png').replace(/\.png$/i, '') || 'generated-watch';
+  const safeId = String(generationId || 'revision').replace(/[^a-z0-9_-]+/gi, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '');
+  const suffix = (safeId || 'revision').slice(-48);
+  const ending = `__${suffix}.png`;
+  const maxStemLength = Math.max(1, 180 - ending.length);
+  const stem = safeBase.slice(0, maxStemLength).replace(/[ .]+$/g, '') || 'generated-watch';
+  return sanitizeFilename(`${stem}${ending}`);
+}
+
+export function ensureGenerationOutputFileName(slot, entry, revisionId) {
+  const existing = String(slot?.outputFileName || '').trim();
+  if (existing) return existing;
+  const outputFileName = generationOutputFileName(entry?.outputFileName, revisionId);
+  if (slot) slot.outputFileName = outputFileName;
+  return outputFileName;
+}
+
+export function sourceVariantIdFor(groupId, relativePath) {
+  const normalized = normalizeRelativePath(relativePath);
+  const parts = normalized.split('/').filter(Boolean);
+  const rootIndex = parts.findIndex((part) => part.toLowerCase() === 'input-watches-images');
+  const saleIndex = parts.findIndex((part) => ['in_sale', 'not_in_sale'].includes(String(part).toLowerCase()));
+  const canonical = rootIndex >= 0
+    ? parts.slice(rootIndex).join('/')
+    : saleIndex >= 0
+      ? ['input-watches-images', ...parts.slice(saleIndex)].join('/')
+      : normalized;
+  return `${groupId}|${canonical}`;
+}
+
+export function sourceIdFor(groupId, relativePath, modelName = null) {
+  const normalized = normalizeRelativePath(relativePath);
+  const candidate = String(modelName || normalized.split('/').at(-1) || '');
+  return skuKeyForModelName(candidate, brandIdFromModelName(candidate));
+}
+
+export function fingerprintForFile(file) {
+  return `${Number(file?.size || 0)}:${Number(file?.lastModified || 0)}:${String(file?.name || '')}`;
+}
+
+export function makeQueueEntry(file, relativePath, groupId, previous = null) {
+  const rawPath = normalizeRelativePath(relativePath || file?.webkitRelativePath || file?.name);
+  const rawParts = rawPath.split('/').filter(Boolean);
+  const watchRootIndex = rawParts.findIndex((part) => part.toLowerCase() === 'input-watches-images');
+  const saleIndex = rawParts.findIndex((part) => ['in_sale', 'not_in_sale'].includes(String(part).toLowerCase()));
+  const normalizedPath = watchRootIndex >= 0
+    ? rawParts.slice(watchRootIndex).join('/')
+    : saleIndex >= 0
+      ? ['input-watches-images', ...rawParts.slice(saleIndex)].join('/')
+      : rawPath;
+  const sourceVariantId = sourceVariantIdFor(groupId, normalizedPath);
+  const modelName = modelNameFromFileName(file?.name || normalizedPath.split('/').at(-1));
+  const skuKey = sourceIdFor(groupId, normalizedPath, modelName);
+  const sourceId = skuKey;
+  const fingerprint = fingerprintForFile(file);
+  const sameSource = (previous?.skuKey === skuKey || previous?.sourceId === sourceId || previous?.sourceId === sourceVariantId
+    || previous?.sourceVariantId === sourceVariantId || previous?.variantId === sourceVariantId)
+    && previous?.fingerprint === fingerprint;
+  const keepDone = sameSource && previous.status === 'done';
+  return {
+    sourceId,
+    skuKey,
+    sourceVariantId,
+    inputSourceId: sourceVariantId,
+    groupId,
+    relativePath: normalizedPath,
+    fileName: String(file?.name || normalizedPath.split('/').at(-1) || 'watch.png'),
+    modelName,
+    outputFileName: generatedFileName(file?.name || normalizedPath.split('/').at(-1)),
+    fingerprint,
+    sourceHash: sameSource ? (previous.sourceHash || null) : null,
+    size: Number(file?.size || 0),
+    lastModified: Number(file?.lastModified || 0),
+    status: keepDone ? 'done' : 'pending',
+    generationId: sameSource ? (previous.generationId || null) : null,
+    previousGenerationId: sameSource ? (previous.previousGenerationId || null) : null,
+    retryCount: sameSource ? Number(previous.retryCount || 0) : 0,
+    lastError: sameSource ? (previous.lastError || null) : null,
+    generatedAt: keepDone ? (previous.generatedAt || null) : null,
+    outputPath: keepDone ? (previous.outputPath || null) : null,
+    outputHash: keepDone ? (previous.outputHash || null) : null,
+    outputWidth: keepDone ? (previous.outputWidth || null) : null,
+    outputHeight: keepDone ? (previous.outputHeight || null) : null,
+    verificationMode: keepDone ? (previous.verificationMode || null) : null,
+    recipeHash: sameSource ? (previous.recipeHash || null) : null,
+    profileId: sameSource ? (previous.profileId || null) : null,
+    profileVersion: sameSource ? (previous.profileVersion || null) : null,
+    attempt: sameSource ? Number(previous.attempt || 0) : 0,
+    errorClass: sameSource ? (previous.errorClass || null) : null,
+    nextRetryAt: sameSource ? (previous.nextRetryAt || null) : null
+  };
+}
+
+export function generationMemoryRecordFromEntry(entry, overrides = {}) {
+  const status = normalizeGenerationMemoryStatus(
+    overrides.status,
+    generationMemoryStatusForQueueStatus(entry?.status)
+  );
+  return {
+    sourceId: entry?.sourceId || null,
+    generationId: overrides.generationId ?? entry?.generationId ?? null,
+    previousGenerationId: overrides.previousGenerationId ?? entry?.previousGenerationId ?? null,
+    groupId: entry?.groupId || null,
+    sourceVariantId: overrides.sourceVariantId ?? entry?.inputSourceId ?? entry?.sourceVariantId ?? null,
+    sourceHash: overrides.sourceHash ?? entry?.sourceHash ?? null,
+    relativePath: entry?.relativePath || null,
+    fileName: entry?.fileName || null,
+    modelName: entry?.modelName || null,
+    outputFileName: entry?.outputFileName || null,
+    fingerprint: entry?.fingerprint || null,
+    status,
+    sourcePresent: overrides.sourcePresent ?? true,
+    statusSource: overrides.statusSource || 'automatic',
+    generationStartedAt: overrides.generationStartedAt || null,
+    generatedAt: overrides.generatedAt || entry?.generatedAt || null,
+    outputPath: overrides.outputPath ?? entry?.outputPath ?? null,
+    outputHash: overrides.outputHash ?? entry?.outputHash ?? null,
+    outputWidth: Number(overrides.outputWidth ?? entry?.outputWidth ?? 0) || null,
+    outputHeight: Number(overrides.outputHeight ?? entry?.outputHeight ?? 0) || null,
+    verificationMode: overrides.verificationMode ?? entry?.verificationMode ?? null,
+    recipeHash: overrides.recipeHash ?? entry?.recipeHash ?? null,
+    profileId: overrides.profileId ?? entry?.profileId ?? null,
+    profileVersion: overrides.profileVersion ?? entry?.profileVersion ?? null,
+    attempt: Number(overrides.attempt ?? entry?.attempt ?? 0),
+    errorClass: overrides.errorClass ?? entry?.errorClass ?? null,
+    nextRetryAt: overrides.nextRetryAt ?? entry?.nextRetryAt ?? null,
+    retryCount: Number(overrides.retryCount ?? entry?.retryCount ?? 0),
+    lastError: overrides.lastError ?? entry?.lastError ?? null,
+    lastRunId: overrides.lastRunId || null,
+    reviewStatus: overrides.reviewStatus ?? null,
+    reviewedAt: overrides.reviewedAt ?? null,
+    reviewReason: overrides.reviewReason ?? null,
+    createdAt: overrides.createdAt || new Date().toISOString(),
+    updatedAt: overrides.updatedAt || new Date().toISOString()
+  };
+}
+
+export function applyGenerationMemory(groups = {}, memory = {}) {
+  const items = memory?.items || {};
+  for (const groupId of QUEUE_GROUP_IDS) {
+    for (const entry of groups[groupId] || []) {
+      const record = items[entry.sourceId];
+      if (!record) continue;
+      const activeVariantId = String(entry.inputSourceId || entry.sourceVariantId || '');
+      if (record.sourceVariantId && activeVariantId && String(record.sourceVariantId) !== activeVariantId) continue;
+      if (record.relativePath && entry.relativePath && normalizeRelativePath(record.relativePath) !== normalizeRelativePath(entry.relativePath)) continue;
+      if (record.fingerprint && entry.fingerprint && String(record.fingerprint) !== String(entry.fingerprint)) continue;
+      if (record.sourceHash && entry.sourceHash && String(record.sourceHash).toLowerCase() !== String(entry.sourceHash).toLowerCase()) continue;
+      const status = normalizeGenerationMemoryStatus(record.status);
+      entry.status = queueStatusForGenerationMemoryStatus(status);
+      entry.generationId = record.generationId || null;
+      entry.previousGenerationId = record.previousGenerationId || null;
+      entry.generatedAt = record.generatedAt || null;
+      entry.outputPath = record.outputPath || null;
+      entry.outputHash = record.outputHash || null;
+      entry.outputWidth = record.outputWidth || null;
+      entry.outputHeight = record.outputHeight || null;
+      entry.verificationMode = record.verificationMode || null;
+      entry.recipeHash = record.recipeHash || null;
+      entry.profileId = record.profileId || null;
+      entry.profileVersion = record.profileVersion || null;
+      entry.attempt = Number(record.attempt || entry.attempt || 0);
+      entry.errorClass = record.errorClass || null;
+      entry.nextRetryAt = record.nextRetryAt || null;
+      entry.retryCount = Number(record.retryCount || entry.retryCount || 0);
+      entry.lastError = record.lastError || null;
+      if (status === GENERATION_MEMORY_STATUSES.READY) entry.lastError = null;
+    }
+  }
+  return groups;
+}
+
+export function mergeScannedGroups(scannedGroups, previousGroups = {}) {
+  const result = Object.fromEntries(QUEUE_GROUP_IDS.map((groupId) => [groupId, []]));
+  const previousEntries = QUEUE_GROUP_IDS.flatMap((groupId) => previousGroups[groupId] || []);
+  const previousBySku = new Map(previousEntries.map((entry) => [String(entry.skuKey || entry.sourceId || ''), entry]));
+  const previousByVariant = new Map();
+  for (const entry of previousEntries) {
+    const topLevelId = String(entry.sourceVariantId || entry.inputSourceId || '');
+    if (topLevelId) previousByVariant.set(topLevelId, entry);
+    for (const variant of entry.variants || []) {
+      const variantId = String(variant?.sourceVariantId || variant?.variantId || '');
+      if (variantId) previousByVariant.set(variantId, variant);
+    }
+  }
+  const grouped = new Map();
+  for (const groupId of QUEUE_GROUP_IDS) {
+    for (const item of scannedGroups[groupId] || []) {
+      const entry = makeQueueEntry(item.file, item.relativePath, groupId, null);
+      entry.sourceHash = item.sourceHash || null;
+      const previousVariant = previousByVariant.get(entry.sourceVariantId);
+      const sameVariant = Boolean(previousVariant && (
+        previousVariant.sourceHash && entry.sourceHash
+          ? String(previousVariant.sourceHash).toLowerCase() === String(entry.sourceHash).toLowerCase()
+          : previousVariant.fingerprint === entry.fingerprint
+      ));
+      const variant = {
+        sourceVariantId: entry.sourceVariantId,
+        variantId: entry.sourceVariantId,
+        assetKey: `watch:${entry.sourceVariantId}`,
+        groupId,
+        relativePath: entry.relativePath,
+        fileName: entry.fileName,
+        modelName: entry.modelName,
+        outputFileName: entry.outputFileName,
+        fingerprint: entry.fingerprint,
+        sourceFingerprint: entry.fingerprint,
+        sourceHash: item.sourceHash || null,
+        status: sameVariant ? previousVariant.status : 'pending',
+        generationId: sameVariant ? previousVariant.generationId || null : null,
+        outputPath: sameVariant ? previousVariant.outputPath || null : null,
+        outputHash: sameVariant ? previousVariant.outputHash || null : null,
+        recipeHash: sameVariant ? previousVariant.recipeHash || null : null,
+        size: entry.size,
+        lastModified: entry.lastModified
+      };
+      const variants = grouped.get(entry.skuKey) || [];
+      variants.push(variant);
+      grouped.set(entry.skuKey, variants);
+    }
+  }
+  for (const [skuKey, variants] of grouped) {
+    const selected = chooseSourceVariant(variants, {});
+    const priorVariant = selected ? previousByVariant.get(selected.sourceVariantId) : null;
+    const priorHashMatches = priorVariant?.sourceHash && selected?.sourceHash
+      ? String(priorVariant.sourceHash).toLowerCase() === String(selected.sourceHash).toLowerCase()
+      : priorVariant?.fingerprint === selected?.fingerprint;
+    const oldSku = previousBySku.get(skuKey);
+    const oldSkuMatchesSelected = oldSku && (
+      String(oldSku.sourceVariantId || oldSku.inputSourceId || '') === String(selected?.sourceVariantId || '')
+      || normalizeRelativePath(oldSku.relativePath || '') === normalizeRelativePath(selected?.relativePath || '')
+    );
+    const prior = priorVariant && priorHashMatches ? priorVariant
+      : (oldSkuMatchesSelected && priorHashMatches ? oldSku : null);
+    const selectedGroup = selected?.groupId || 'in_sale_good';
+    const representative = makeQueueEntry(
+      { name: selected?.fileName || variants[0]?.fileName, size: selected?.size, lastModified: selected?.lastModified },
+      selected?.relativePath || variants[0]?.relativePath,
+      selectedGroup,
+      prior
+    );
+    representative.sourceId = skuKey;
+    representative.skuKey = skuKey;
+    representative.variants = variants;
+    representative.sourceVariantIds = variants.map((variant) => variant.sourceVariantId);
+    representative.inputSourceId = selected?.sourceVariantId || representative.sourceVariantId;
+    representative.sourceVariantId = representative.inputSourceId;
+    representative.sourceHash = selected?.sourceHash || null;
+    representative.groupId = selectedGroup;
+    const groupIds = [...new Set(variants.map((variant) => variant.groupId))];
+    for (const groupId of groupIds) result[groupId].push({ ...representative, groupId });
+  }
+  for (const groupId of QUEUE_GROUP_IDS) {
+    result[groupId].sort((left, right) => String(left.modelName || '').localeCompare(String(right.modelName || ''), 'ru'));
+  }
+  return result;
+}
+
+export function modelCatalogRecordsFromGroups(groups = {}) {
+  const bySku = new Map();
+  for (const groupId of QUEUE_GROUP_IDS) {
+    for (const entry of groups[groupId] || []) {
+      const skuKey = String(entry?.skuKey || entry?.sourceId || '');
+      if (!skuKey) continue;
+      const row = bySku.get(skuKey) || {
+        skuKey,
+        sourceId: skuKey,
+        modelName: entry.modelName || entry.fileName || '',
+        brandId: brandIdFromModelName(entry.modelName || entry.fileName),
+        variants: [],
+        sourcePresent: true
+      };
+      const variants = entry.variants?.length ? entry.variants : [{
+        ...entry,
+        sourceVariantId: entry.sourceVariantId || entry.inputSourceId || sourceVariantIdFor(entry.groupId || groupId, entry.relativePath || entry.fileName),
+        assetKey: `watch:${entry.sourceVariantId || entry.inputSourceId || sourceVariantIdFor(entry.groupId || groupId, entry.relativePath || entry.fileName)}`
+      }];
+      const known = new Set(row.variants.map((item) => String(item.sourceVariantId || item.variantId || '')));
+      for (const variant of variants) {
+        const id = String(variant.sourceVariantId || variant.variantId || entry.sourceVariantId || entry.inputSourceId || '');
+        if (!id || known.has(id)) continue;
+        known.add(id);
+        row.variants.push({
+          ...variant,
+          sourceVariantId: id,
+          variantId: id,
+          groupId: variant.groupId || entry.groupId || groupId,
+          relativePath: variant.relativePath || entry.relativePath || null,
+          fileName: variant.fileName || entry.fileName || null,
+          modelName: variant.modelName || entry.modelName || null,
+          fingerprint: variant.fingerprint || entry.fingerprint || null,
+          assetKey: variant.assetKey || `watch:${id}`
+        });
+      }
+      bySku.set(skuKey, row);
+    }
+  }
+  return [...bySku.values()].map((record) => {
+    const variants = record.variants.sort((a, b) => String(a.relativePath || '').toLowerCase().localeCompare(String(b.relativePath || '').toLowerCase(), 'en'));
+    const selected = chooseSourceVariant(variants, {});
+    record.queueState = {
+      status: selected?.status || 'pending', generationId: selected?.generationId || null,
+      recipeHash: selected?.recipeHash || null, profileVersion: selected?.profileVersion || null,
+      retryCount: Number(selected?.retryCount || 0), lastError: selected?.lastError || null
+    };
+    return { ...record, variants };
+  });
+}
+
+export function queueGroupsFromCatalog(records = [], previousGroups = {}) {
+  const result = Object.fromEntries(QUEUE_GROUP_IDS.map((groupId) => [groupId, []]));
+  const previous = new Map(QUEUE_GROUP_IDS.flatMap((groupId) => previousGroups[groupId] || [])
+    .map((entry) => [String(entry.skuKey || entry.sourceId || ''), entry]));
+  for (const record of records || []) {
+    if (!record?.skuKey || record.sourcePresent === false) continue;
+    const variants = Array.isArray(record.variants) ? record.variants : [];
+    if (!variants.length) continue;
+    const old = previous.get(String(record.skuKey));
+    const defaultVariant = chooseSourceVariant(variants, {});
+    const baseVariant = defaultVariant || variants[0];
+    const representative = old || makeQueueEntry({
+      name: baseVariant.fileName || record.modelName,
+      size: baseVariant.size,
+      lastModified: baseVariant.lastModified
+    }, baseVariant.relativePath, baseVariant.groupId || 'in_sale_good');
+    const groupIds = [...new Set(variants.map((item) => item.groupId).filter((id) => QUEUE_GROUP_IDS.includes(id)))];
+    for (const groupId of groupIds) {
+      const queuedStatus = baseVariant.status || record.queueState?.status;
+      result[groupId].push({
+        ...representative,
+        sourceId: String(record.skuKey),
+        skuKey: String(record.skuKey),
+        modelName: representative.modelName || record.modelName || baseVariant.modelName,
+        variants,
+        groupId,
+        sourceVariantId: baseVariant.sourceVariantId || baseVariant.variantId,
+        inputSourceId: baseVariant.sourceVariantId || baseVariant.variantId,
+        sourceHash: baseVariant.sourceHash || null,
+        relativePath: baseVariant.relativePath,
+        fileName: baseVariant.fileName,
+        fingerprint: baseVariant.fingerprint,
+        size: Number(baseVariant.size || 0),
+        lastModified: Number(baseVariant.lastModified || 0),
+        status: normalizeQueueStatus(queuedStatus || representative.status),
+        generationId: baseVariant.generationId || record.queueState?.generationId || representative.generationId || null,
+        outputPath: baseVariant.outputPath || representative.outputPath || null,
+        outputHash: baseVariant.outputHash || representative.outputHash || null,
+        recipeHash: baseVariant.recipeHash || record.queueState?.recipeHash || representative.recipeHash || null,
+        lastError: baseVariant.lastError || record.queueState?.lastError || null,
+        retryCount: Number(record.queueState?.retryCount || representative.retryCount || 0)
+      });
+    }
+  }
+  return result;
+}
+
+export function queueCounts(groups = {}) {
+  return Object.fromEntries(QUEUE_GROUP_IDS.map((groupId) => {
+    const entries = groups[groupId] || [];
+    return [groupId, {
+      total: entries.length,
+      done: entries.filter((entry) => entry.status === 'done').length,
+      pending: entries.filter((entry) => entry.status !== 'done').length
+    }];
+  }));
+}
+
+export function normalizeRunLimit(value, fallback = 1) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+}
+
+export function normalizeWorkerCount(value, fallback = 4) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(6, Math.max(2, Math.floor(parsed)));
+}
+
+export function pendingEntryIds(entries = [], runLimit = 0) {
+  const ids = entries
+    .filter((entry) => !['done', 'running'].includes(entry?.status) && entry?.sourceId)
+    .map((entry) => entry.sourceId);
+  const limit = normalizeRunLimit(runLimit, 0);
+  return limit > 0 ? ids.slice(0, limit) : ids;
+}
+
+export function pendingEntryIdsForFilter(entries = [], runLimit = 0, coverageMode = 'queue') {
+  const pending = entries.filter((entry) => !['done', 'running'].includes(entry?.status) && entry?.sourceId);
+  const selected = normalizeCoverageMode(coverageMode) === 'one_per_brand'
+    ? pending.filter((entry, index, list) => {
+      const brand = brandIdFromModelName(entry.modelName || entry.fileName);
+      return list.findIndex((candidate) => (
+        brandIdFromModelName(candidate.modelName || candidate.fileName) === brand
+      )) === index;
+    })
+    : pending;
+  const limit = normalizeRunLimit(runLimit, 0);
+  return limit > 0 ? selected.slice(0, limit).map((entry) => entry.sourceId) : selected.map((entry) => entry.sourceId);
+}
+
+export function historyRecordFromEntry(entry, overrides = {}) {
+  return {
+    sourceId: entry?.sourceId || null,
+    generationId: overrides.generationId ?? entry?.generationId ?? null,
+    previousGenerationId: overrides.previousGenerationId ?? entry?.previousGenerationId ?? null,
+    groupId: entry?.groupId || null,
+    sourceVariantId: entry?.inputSourceId || entry?.sourceVariantId || null,
+    sourceHash: entry?.sourceHash || null,
+    relativePath: entry?.relativePath || null,
+    fileName: entry?.fileName || null,
+    modelName: entry?.modelName || null,
+    outputFileName: entry?.outputFileName || null,
+    fingerprint: entry?.fingerprint || null,
+    generatedAt: overrides.generatedAt || entry?.generatedAt || new Date().toISOString(),
+    outputPath: overrides.outputPath ?? entry?.outputPath ?? null,
+    outputHash: overrides.outputHash ?? entry?.outputHash ?? null,
+    outputWidth: Number(overrides.outputWidth ?? entry?.outputWidth ?? 0) || null,
+    outputHeight: Number(overrides.outputHeight ?? entry?.outputHeight ?? 0) || null,
+    verificationMode: overrides.verificationMode ?? entry?.verificationMode ?? null,
+    recipeHash: overrides.recipeHash ?? entry?.recipeHash ?? null,
+    profileId: overrides.profileId ?? entry?.profileId ?? null,
+    profileVersion: overrides.profileVersion ?? entry?.profileVersion ?? null
+  };
+}
+
+export function applyGenerationHistory(groups = {}, history = {}) {
+  const items = history?.items || {};
+  for (const groupId of QUEUE_GROUP_IDS) {
+    for (const entry of groups[groupId] || []) {
+      const record = items[entry.sourceId];
+      if (!record) continue;
+      const activeVariantId = String(entry.inputSourceId || entry.sourceVariantId || '');
+      if (record.sourceVariantId && activeVariantId && String(record.sourceVariantId) !== activeVariantId) continue;
+      if (record.relativePath && entry.relativePath && normalizeRelativePath(record.relativePath) !== normalizeRelativePath(entry.relativePath)) continue;
+      if (record.fingerprint && entry.fingerprint && String(record.fingerprint) !== String(entry.fingerprint)) continue;
+      entry.status = 'done';
+      entry.generatedAt = record.generatedAt || entry.generatedAt || null;
+      entry.generationId = record.generationId || entry.generationId || null;
+      entry.previousGenerationId = record.previousGenerationId || entry.previousGenerationId || null;
+      entry.outputPath = record.outputPath || entry.outputPath || null;
+      entry.outputHash = record.outputHash || entry.outputHash || null;
+      entry.outputWidth = record.outputWidth || entry.outputWidth || null;
+      entry.outputHeight = record.outputHeight || entry.outputHeight || null;
+      entry.verificationMode = record.verificationMode || entry.verificationMode || null;
+      entry.recipeHash = record.recipeHash || entry.recipeHash || null;
+      entry.profileId = record.profileId || entry.profileId || null;
+      entry.profileVersion = record.profileVersion || entry.profileVersion || null;
+      entry.lastError = null;
+    }
+  }
+  return groups;
+}

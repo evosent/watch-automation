@@ -1,0 +1,7 @@
+ПРОФИЛЬ CITIZEN
+
+ЗАКРЫТЫЙ СЛОВАРЬ СЕРИЙ И СЕМЕЙСТВ: Eco-Drive, Eco-Drive One, Promaster, Promaster Marine, Promaster Sky, Promaster Land, Tsuyosa, Series8, Series8 831, Series8 870, Series8 880 GMT, Series8 890, The Citizen, Attesa, Satellite Wave, Super Titanium, Citizen L, Corso, Calendrier, PCAT, Silhouette Crystal.
+ИСТОЧНИКИ: официальные страницы Citizen и карточка модели. Для Series8 проверяй подсемейство 831 / 870 / 880 GMT / 890; для Promaster — Marine / Sky / Land, только если источник связывает его с кодом.
+ИСКЛЮЧЕНИЯ: код Citizen, Automatic, Quartz и Eco-Drive как характеристика механизма сами по себе серию не назначают. Словарь интернетом не расширяется.
+FALLBACK: отсутствует.
+ПРАВИЛО TITLE-BLOCK: если серия подтверждена для точного артикула, её каноническое имя во второй строке обязательно. Не удаляй вторую строку, не объединяй её с брендом и не переходи к двухстрочному варианту. Если места мало, уменьши кегль/трекинг в пределах шаблона, но сохрани все строки.

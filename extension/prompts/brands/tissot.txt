@@ -1,0 +1,7 @@
+ПРОФИЛЬ TISSOT
+
+ЗАКРЫТЫЙ СЛОВАРЬ СЕРИЙ: Ballade, Bellissima, Carson, Chemin des Tourelles, Chrono L, Classic Dream, Desir, Everytime, Flamingo, Gentleman, Goldrun, Heritage 1938, Le Locle, Lepine, Lovely, Nordic, Pinarello, PR 100, PR 100 Jungfraubahn, PR 516, PRC 100 Solar, PRC 200, PRS 516, PRX, PRX Digital, Rockwatch, Savonnette, Seastar, SRV, Supersport, Supersport Chrono, T-Complication, T-Race, T-Race MotoGP, T-Wave, Tradition, T-Touch, T-Touch Connect Solar, T-My Lady, Visodate, XL.
+ИСТОЧНИКИ: официальный каталог Tissot и карточка модели по полному референсу; коллекцию принимай только после связи с конкретным кодом.
+ИСКЛЮЧЕНИЯ: Digital, Lady, Automatic и Powermatic 80 остаются характеристиками, если источник не называет их серией из словаря.
+FALLBACK: отсутствует; список нельзя расширять собственными коллекциями или догадками.
+ПРАВИЛО TITLE-BLOCK: если серия подтверждена для точного артикула, её каноническое имя во второй строке обязательно. Не удаляй вторую строку, не объединяй её с брендом и не переходи к двухстрочному варианту. Если места мало, уменьши кегль/трекинг в пределах шаблона, но сохрани все строки.

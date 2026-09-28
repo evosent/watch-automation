@@ -1,0 +1,7 @@
+ПРОФИЛЬ LONGINES
+
+ЗАКРЫТЫЙ СЛОВАРЬ СЕРИЙ И ЛИНИЕК: Master Collection, Master Collection GMT, Master Collection Chronograph, Master Collection Moonphase, HydroConquest, HydroConquest GMT, Spirit, Spirit Zulu Time, Spirit Flyback, Spirit Chronograph, Conquest, Conquest Classic, Conquest Chronograph, Conquest Heritage, Flagship, Flagship Classic, Flagship Heritage, DolceVita, Mini DolceVita, La Grande Classique, Présence, Record, Legend Diver, Ultra-Chron, Pilot Majetek, Heritage Classic, Heritage Military, Evidenza, PrimaLuna, Elegant Collection, Avigation, Lindbergh Hour Angle.
+ИСТОЧНИКИ: официальная карточка Longines и официальный раздел коллекции; для архивных reference numbers — инструкция или надёжный каталог.
+НОРМАЛИЗАЦИЯ: учитывай официальную иерархию Master, Conquest, HydroConquest, Spirit, Elegance и Heritage, но выводи только каноническое значение из словаря, связанное с этим reference number.
+FALLBACK: отсутствует. Артикул сам по себе серией не является; словарь интернетом не расширяется.
+ПРАВИЛО TITLE-BLOCK: если серия подтверждена для точного артикула, её каноническое имя во второй строке обязательно. Не удаляй вторую строку, не объединяй её с брендом и не переходи к двухстрочному варианту. Если места мало, уменьши кегль/трекинг в пределах шаблона, но сохрани все строки.

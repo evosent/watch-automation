@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Галерея генераций</title>
+  <link rel="stylesheet" href="gallery.css">
+</head>
+<body>
+  <main class="gallery-app">
+    <header class="topbar">
+      <div class="topbar-title">
+        <div class="logo">A</div>
+        <div>
+          <h1>Галерея генераций</h1>
+          <p>Фактические PNG из папки результатов и Downloads · быстрый возврат брака в очередь</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button id="exportFactsCsv" class="button secondary" type="button">Экспорт CSV</button>
+        <button id="exportFactsJson" class="button secondary" type="button">Экспорт JSON</button>
+        <button id="refreshGallery" class="button" type="button">Обновить файлы</button>
+      </div>
+    </header>
+
+    <section class="toolbar" aria-label="Фильтры и сортировка галереи">
+      <label class="search-field">
+        <span>Поиск</span>
+        <input id="search" type="search" placeholder="Модель, код, файл…" autocomplete="off">
+      </label>
+      <label>
+        <span>Бренд</span>
+        <select id="brandFilter"><option value="all">Все бренды</option></select>
+      </label>
+      <label>
+        <span>Продажа</span>
+        <select id="saleFilter">
+          <option value="all">Все</option>
+          <option value="in_sale">В продаже</option>
+          <option value="not_in_sale">Не в продаже</option>
+        </select>
+      </label>
+      <label>
+        <span>Качество исходника</span>
+        <select id="qualityFilter">
+          <option value="all">Любое</option>
+          <option value="good">Хорошее</option>
+          <option value="bad">Плохое</option>
+        </select>
+      </label>
+      <label>
+        <span>Текст карточки</span>
+        <select id="factsFilter">
+          <option value="all">Все</option>
+          <option value="missing">Не извлечено / пусто</option>
+          <option value="warnings">Есть замечания</option>
+          <option value="error">Ошибка извлечения</option>
+          <option value="missing_series">Серия / заголовок</option>
+          <option value="missing_utp">Проблемы УТП</option>
+          <option value="missing_water">Нет водозащиты</option>
+          <option value="missing_size">Нет размера</option>
+        </select>
+      </label>
+      <label>
+        <span>Сортировка</span>
+        <select id="sortOrder">
+          <option value="date_desc">Дата: новые сначала</option>
+          <option value="date_asc">Дата: старые сначала</option>
+          <option value="name_asc">Название: А → Я</option>
+          <option value="name_desc">Название: Я → А</option>
+          <option value="brand_asc">Бренд: А → Я</option>
+          <option value="brand_desc">Бренд: Я → А</option>
+          <option value="facts_issues">Текст: проблемы сначала</option>
+        </select>
+      </label>
+      <label class="fast-reject-toggle" title="Если включено, кнопка «Брак» отправляет изображение в архив без дополнительного подтверждения">
+        <input id="fastReject" type="checkbox">
+        <span>Брак без подтверждения</span>
+      </label>
+    </section>
+
+    <section class="statusbar">
+      <div>
+        <strong id="visibleCount">0</strong>
+        <span>по фильтрам</span>
+        <span class="dot">·</span>
+        <strong id="totalCount">0</strong>
+        <span>PNG на диске, включая архив</span>
+      </div>
+      <div id="folderStatus" class="folder-status">Сканирую файлы…</div>
+    </section>
+
+    <section id="emptyState" class="empty-state" hidden>
+      <h2>Нет карточек по текущим фильтрам</h2>
+      <p>Измени фильтры или обнови файлы.</p>
+    </section>
+
+    <section id="grid" class="generation-grid" aria-live="polite"></section>
+    <div class="load-more-wrap"><button id="loadMore" class="button secondary" type="button" hidden>Показать ещё</button></div>
+  </main>
+
+  <dialog id="viewer" class="viewer">
+    <div class="viewer-shell">
+      <header class="viewer-header">
+        <div class="viewer-title-wrap">
+          <div class="viewer-kicker" id="viewerMeta">—</div>
+          <h2 id="viewerTitle">—</h2>
+        </div>
+        <div class="viewer-head-actions">
+          <button id="viewerOpenChat" class="icon-button viewer-chat-button" type="button" title="Открыть чат, где была создана эта карточка" hidden>Чат ↗</button>
+          <button id="viewerOpenFile" class="icon-button" type="button" title="Открыть оригинальный PNG">↗</button>
+          <button id="viewerClose" class="icon-button" type="button" title="Закрыть">×</button>
+        </div>
+      </header>
+
+      <div class="viewer-body">
+        <button id="viewerPrev" class="nav-button prev" type="button" aria-label="Предыдущая">‹</button>
+        <div id="viewerStage" class="viewer-stage">
+          <div id="viewerPlaceholder" class="viewer-placeholder">Загрузка изображения…</div>
+          <img id="viewerImage" alt="" draggable="false">
+        </div>
+        <aside id="viewerFacts" class="viewer-facts" aria-label="Распознанный текст"></aside>
+        <button id="viewerNext" class="nav-button next" type="button" aria-label="Следующая">›</button>
+      </div>
+
+      <footer class="viewer-footer">
+        <div class="zoom-controls">
+          <button id="zoomOut" class="small-button" type="button">−</button>
+          <span id="zoomValue">100%</span>
+          <button id="zoomIn" class="small-button" type="button">+</button>
+          <button id="zoomReset" class="small-button text" type="button">Вписать</button>
+        </div>
+        <div class="viewer-counter" id="viewerCounter">0 / 0</div>
+        <div class="review-actions">
+          <button id="viewerReject" class="button reject" type="button">✕ Брак · перегенерировать</button>
+        </div>
+      </footer>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <script type="module" src="gallery.js"></script>
+</body>
+</html>

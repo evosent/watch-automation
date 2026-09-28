@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Автогенерация",
+  "version": "0.3.30",
+  "description": "Автогенерация карточек часов: фоновые OCR-проверки и атомарные ревизии PNG, характеристик и ChatGPT-чатов.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "downloads",
+    "scripting",
+    "sidePanel",
+    "alarms",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "http://127.0.0.1:17321/*",
+    "http://localhost:17321/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "automation-gate.js",
+        "dom-recorder.js",
+        "selector-resolver.js",
+        "overlay.js",
+        "facts-json-utils.js",
+        "chatgpt-adapter.js",
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "Автогенерация"
+  }
+}

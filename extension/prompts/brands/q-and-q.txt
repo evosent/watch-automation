@@ -1,0 +1,7 @@
+ПРОФИЛЬ Q&Q
+
+ЗАКРЫТЫЙ СЛОВАРЬ СЕРИЙ: SmileSolar, Superior, Sports, Fashion, Digital, Elegant, Ladies, Series 003, Series 004, Matching Style Series 002, Mini Series, 20BAR Series, STAR WARS Collection, Peanuts Collection, Disney Collection, Champion Collection, CAPTAIN STAG Collaboration, PAPIER TIGRE Collaboration, Q&Q SmileSolar BY groovisions, THE PARK SHOP Collaboration, OSAMU GOODS Collaboration, kaoyorinakami Collaboration, Suzuki Masaru Collaboration.
+ИСТОЧНИКИ: для SmileSolar — официальный smile-qq.com, разделы Collections и карточки товаров; для остальных моделей — официальная карточка и надёжный каталог.
+НОРМАЛИЗАЦИЯ: G06A-, M-, QZ- и любой другой код модели серией не являются. Сверяй регистр, пробелы и написание со словарём.
+FALLBACK: отсутствует. Форму и цвет часов для выбора серии не используй; словарь интернетом не расширяется.
+ПРАВИЛО TITLE-BLOCK: если серия подтверждена для точного артикула, её каноническое имя во второй строке обязательно. Не удаляй вторую строку, не объединяй её с брендом и не переходи к двухстрочному варианту. Если места мало, уменьши кегль/трекинг в пределах шаблона, но сохрани все строки.

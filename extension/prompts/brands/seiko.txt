@@ -1,0 +1,7 @@
+ПРОФИЛЬ SEIKO
+
+ЗАКРЫТЫЙ СЛОВАРЬ СЕРИЙ И ПОДЛИНЕЕК: Prospex, Prospex Alpinist, Prospex Speedtimer, Prospex Diver Scuba, Prospex Marinemaster, Presage, Presage Classic Series, Presage Cocktail Time, Presage Style60's, Presage Inspired by Japanese Gardens, Presage Sharp Edged Series, Astron, Astron GPS Solar, 5 Sports, 5 Sports SKX, 5 Sports Field, 5 Sports SNXS, King Seiko, King Seiko KSK, King Seiko VANAC, King Seiko KS1969, Premier, Coutura, Lukia, Alpinist, Recraft, Selection, Spirit.
+ИСТОЧНИКИ: Seiko Products и официальная страница конкретной линейки; для Presage, King Seiko и 5 Sports сверяй официальные подсерии из словаря.
+НОРМАЛИЗАЦИЯ: SR-, SSK-, SBD-, SPB- и другие коды — поисковый ключ, не серия. Механизм и тип часов серией не являются.
+FALLBACK: отсутствует; словарь интернетом не расширяется.
+ПРАВИЛО TITLE-BLOCK: если серия подтверждена для точного артикула, её каноническое имя во второй строке обязательно. Не удаляй вторую строку, не объединяй её с брендом и не переходи к двухстрочному варианту. Если места мало, уменьши кегль/трекинг в пределах шаблона, но сохрани все строки.

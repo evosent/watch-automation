@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Автогенерация</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="app-header">
+      <div class="header-main">
+        <div class="brand-mark" aria-hidden="true">A</div>
+        <div class="brand-copy">
+          <h1>Автогенерация</h1>
+        </div>
+        <div class="health-cluster" aria-label="Состояние системы">
+          <span class="health-item" title="Состояние расширения">
+            <span id="statusSignal" class="health-signal is-ready" aria-hidden="true"></span>
+            <strong id="status">OK</strong>
+          </span>
+          <span class="health-item" title="Пауза отправки">
+            <span id="pauseSignal" class="health-signal is-ready" aria-hidden="true"></span>
+            <strong id="pauseStatus">OK</strong>
+          </span>
+        </div>
+      </div>
+
+      <nav class="workspace-tabs" aria-label="Разделы панели">
+        <button class="workspace-tab is-active" type="button" data-workspace-tab="run" aria-selected="true">Запуск</button>
+        <button class="workspace-tab" type="button" data-workspace-tab="models" aria-selected="false">Модели</button>
+        <button class="workspace-tab" type="button" data-workspace-tab="service" aria-selected="false">Сервис</button>
+      </nav>
+      <button id="openGallery" class="gallery-launch" type="button" title="Открыть галерею генераций в отдельной вкладке">
+        <span class="gallery-launch-icon" aria-hidden="true">▦</span>
+        <span class="gallery-launch-label">Галерея результатов</span>
+        <span class="gallery-launch-arrow" aria-hidden="true">↗</span>
+      </button>
+    </header>
+
+    <div id="feedback" class="feedback" role="status" aria-live="polite" hidden>
+      <span id="feedbackText" class="feedback-text"></span>
+      <button id="feedbackAction" class="feedback-action" type="button" hidden></button>
+      <button id="feedbackClose" class="feedback-close" type="button" aria-label="Закрыть сообщение">×</button>
+    </div>
+
+    <div class="workspace">
+      <section class="workspace-view" data-workspace-view="run">
+        <section class="panel-card launch-card">
+          <div class="card-heading compact-heading">
+            <div>
+              <span class="eyebrow">ПАРАМЕТРЫ</span>
+              <h2>Новый запуск</h2>
+            </div>
+            <span id="promptStatus" class="status-text">загружается</span>
+          </div>
+
+          <div class="launch-grid">
+            <label class="field"><span>Вкладки</span>
+              <select id="workerCount">
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4" selected>4</option>
+                <option value="5">5</option>
+                <option value="6">6</option>
+              </select>
+            </label>
+            <label class="field"><span>Фото</span>
+              <input type="number" id="runLimit" min="1" step="1" value="1" inputmode="numeric">
+            </label>
+            <label class="field field-wide"><span>Референсы</span>
+              <select id="inputMode" title="Сколько изображений прикладывать к генерации">
+                <option value="2">2 · шаблон + часы</option>
+                <option value="3" selected>3 · шаблон + Ozon + часы</option>
+                <option value="4">4 · legacy</option>
+              </select>
+            </label>
+          </div>
+
+          <section class="queue-picker" aria-labelledby="queuePickerTitle">
+            <div class="queue-picker-heading">
+              <div>
+                <span class="eyebrow">ОЧЕРЕДЬ</span>
+                <h3 id="queuePickerTitle">Что генерировать</h3>
+              </div>
+              <span id="launchQueueSummary" class="summary-meta">Загружаю список…</span>
+            </div>
+            <label class="field"><span>Список запуска</span>
+              <select id="runQueueMode">
+                <option value="regular">Обычная очередь</option>
+                <option value="regeneration">Перегенерация брака</option>
+              </select>
+            </label>
+            <div class="filter-grid launch-filters">
+              <select id="runGroupFilter" aria-label="Категория очереди">
+                <option value="all">Все категории</option>
+                <option value="in_sale_good">В продаже · хорошее</option>
+                <option value="in_sale_bad">В продаже · плохое</option>
+                <option value="not_in_sale_good">Не в продаже · хорошее</option>
+                <option value="not_in_sale_bad">Не в продаже · плохое</option>
+              </select>
+              <select id="runBrandFilter" aria-label="Бренд для запуска">
+                <option value="all">Все бренды</option>
+              </select>
+            </div>
+          </section>
+
+          <div id="preflightSummary" class="preflight-summary" role="status" aria-live="polite">Перед стартом выполню проверку файлов и референсов.</div>
+          <textarea id="prompt" hidden readonly aria-hidden="true"></textarea>
+        </section>
+
+        <section class="panel-card run-status-card" aria-labelledby="runStatusTitle">
+          <div class="run-status-heading">
+            <div>
+              <span class="eyebrow">СТАТУС</span>
+              <h2 id="runStatusTitle">Ход прогона</h2>
+            </div>
+            <span id="stateBadge" class="state-badge">ГОТОВО</span>
+          </div>
+          <p id="currentAction" class="run-current-action">Ожидание запуска.</p>
+          <div class="run-progress-heading">
+            <strong id="runProgressCount">0 из 1</strong>
+            <span id="runProgressPercent">0%</span>
+          </div>
+          <div id="runProgressTrack" class="run-progress-track" role="progressbar" aria-label="Выполнение прогона" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0" aria-valuetext="0 из 1">
+            <div id="runProgressBar" class="run-progress-bar"></div>
+          </div>
+          <div class="run-metrics">
+            <div class="run-metric">
+              <span>Время прогона</span>
+              <strong id="runElapsed">—</strong>
+            </div>
+            <div class="run-metric">
+              <span>Среднее на изображение</span>
+              <strong id="runAverage" title="Общее время от запуска до текущего момента, делённое на число готовых изображений; учитывает параллельную работу вкладок.">—</strong>
+            </div>
+          </div>
+          <div id="meta" class="run-status-meta"></div>
+        </section>
+
+        <details class="panel-card disclosure slots-disclosure" id="slotsDisclosure" open>
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">LIVE</span>
+              <strong>Рабочие вкладки</strong>
+            </span>
+            <span id="slotSummary" class="section-chip">0/4 занято</span>
+          </summary>
+          <div class="disclosure-body">
+            <div id="slotGrid" class="slot-grid"></div>
+          </div>
+        </details>
+
+      </section>
+
+      <section class="workspace-view" data-workspace-view="models" hidden>
+        <section class="panel-card models-card">
+          <div class="card-heading models-heading">
+            <div>
+              <span class="eyebrow">КАТАЛОГ</span>
+              <h2>Модели</h2>
+            </div>
+            <span id="memoryVisibleCount" class="section-chip">Показано 0/0</span>
+          </div>
+          <div id="memoryStats" class="memory-stats">Готово 0 · В работе 0 · Не готово 0</div>
+
+          <div class="model-search-row">
+            <input id="memorySearch" type="search" placeholder="Поиск модели" autocomplete="off">
+          </div>
+          <div class="filter-grid">
+            <select id="memoryGroupFilter" aria-label="Фильтр списка">
+              <option value="all">Все списки</option>
+              <option value="in_sale_good">В продаже · хорошее</option>
+              <option value="in_sale_bad">В продаже · плохое</option>
+              <option value="not_in_sale_good">Не в продаже · хорошее</option>
+              <option value="not_in_sale_bad">Не в продаже · плохое</option>
+            </select>
+            <select id="memoryBrandFilter" aria-label="Фильтр бренда">
+              <option value="all">Все бренды</option>
+            </select>
+            <select id="memoryStatusFilter" aria-label="Фильтр статуса">
+              <option value="all">Все статусы</option>
+              <option value="not_ready">Не готово</option>
+              <option value="running">В работе</option>
+              <option value="image_saved">Фото сохранено · ждёт спецификацию</option>
+              <option value="facts_pending">Получение спецификации</option>
+              <option value="ready">Готово</option>
+            </select>
+          </div>
+
+          <div class="memory-table-head" aria-hidden="true"><span>Модель</span><span>Статус и результат</span></div>
+          <div id="memoryList" class="memory-list" aria-live="polite"></div>
+        </section>
+      </section>
+
+      <section class="workspace-view" data-workspace-view="service" hidden>
+        <details class="panel-card disclosure" id="timingDisclosure" open>
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">ИНТЕРВАЛЫ</span>
+              <strong>Паузы генерации</strong>
+            </span>
+          </summary>
+          <div class="disclosure-body">
+            <label class="field"><span>Пауза после лимита запросов</span>
+              <select id="rateLimitPauseMinutes" title="Сколько ждать после ограничения запросов">
+                <option value="1">1 мин</option>
+                <option value="2">2 мин</option>
+                <option value="3" selected>3 мин</option>
+                <option value="5">5 мин</option>
+                <option value="10">10 мин</option>
+                <option value="15">15 мин</option>
+                <option value="30">30 мин</option>
+              </select>
+            </label>
+            <label class="field"><span>Игнорировать лимиты после паузы</span>
+              <select id="rateLimitIgnoreMinutes" title="После cooldown закрывать предупреждения о лимите без новой паузы">
+                <option value="0">Выключено</option>
+                <option value="5">5 мин</option>
+                <option value="10" selected>10 мин</option>
+                <option value="15">15 мин</option>
+                <option value="30">30 мин</option>
+                <option value="60">60 мин</option>
+              </select>
+            </label>
+            <div class="generation-pause-grid">
+              <label class="field"><span>Между генерациями, мин</span>
+                <input type="number" id="generationPauseMinutes" min="0" max="120" step="0.01" value="0.17" inputmode="decimal" title="Базовый интервал между отправками промптов" disabled>
+              </label>
+              <label class="field"><span>Разброс, сек</span>
+                <input type="number" id="generationJitterSeconds" min="0" max="3600" step="1" value="2" inputmode="numeric" title="Случайное отклонение от базовой паузы" disabled>
+              </label>
+            </div>
+            <p class="generation-pause-hint">Первая отправка — без паузы. Далее: база ± разброс × случайные 50–150%. Изменения действуют со следующего запуска.</p>
+          </div>
+        </details>
+
+        <details class="panel-card disclosure" id="sourcesDisclosure" open>
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">ДАННЫЕ</span>
+              <strong>Файлы и результаты</strong>
+            </span>
+            <span id="folderStatus" class="summary-meta">проверяю…</span>
+          </summary>
+          <div class="disclosure-body">
+            <div class="source-list">
+              <div class="source-row">
+                <div class="source-copy">
+                  <div class="source-title-row"><strong>Референсы</strong><span id="refCount" class="count-chip">0 наборов</span></div>
+                  <span id="refFolderPath" class="source-path">папка не выбрана</span>
+                </div>
+                <label class="compact-file-button">
+                  <input type="file" id="refFolder" webkitdirectory directory multiple accept="image/*">
+                  <span>Изменить</span>
+                </label>
+              </div>
+
+              <div class="source-row">
+                <div class="source-copy">
+                  <div class="source-title-row"><strong>Фото часов</strong><span id="watchCount" class="count-chip">0/0</span></div>
+                  <span id="watchFolderPath" class="source-path">папка не выбрана</span>
+                </div>
+                <label class="compact-file-button">
+                  <input type="file" id="watchFolder" webkitdirectory directory multiple accept="image/*">
+                  <span>Изменить</span>
+                </label>
+              </div>
+
+              <div class="source-row">
+                <div class="source-copy">
+                  <div class="source-title-row"><strong>Результаты</strong><span id="outputModeChip" class="count-chip">Downloads</span></div>
+                  <span id="outputFolderPath" class="source-path">Downloads/WatchAutomation</span>
+                </div>
+                <div class="inline-actions">
+                  <button id="grantOutputFolder" class="text-button" type="button" hidden>Разрешить</button>
+                  <button id="chooseOutputFolder" class="compact-button" type="button">Выбрать</button>
+                  <button id="useDownloadsOutput" class="icon-button" type="button" title="Использовать Downloads" aria-label="Использовать Downloads">↺</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="panel-card disclosure" id="diagnosticsDisclosure" open>
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">СИСТЕМА</span>
+              <strong>Диагностика</strong>
+            </span>
+            <span id="domDiagnosticsStatus" class="summary-meta">выключена</span>
+          </summary>
+          <div class="disclosure-body">
+            <label class="field"><span>Сбор DOM</span>
+              <select id="domDiagnosticsMode" title="Постоянный сбор DOM может замедлять браузер">
+                <option value="off">Выкл. · максимум производительности</option>
+                <option value="errors">Только при ошибках</option>
+                <option value="full">Полный журнал DOM</option>
+              </select>
+            </label>
+            <div class="service-actions">
+              <button id="exportDiagnostics" class="secondary" type="button">Скачать диагностику JSON</button>
+              <button id="clearDomDiagnostics" class="secondary muted" type="button">Очистить DOM-архив</button>
+            </div>
+          </div>
+        </details>
+
+        <details class="panel-card disclosure" id="historyDisclosure">
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">ПАМЯТЬ</span>
+              <strong>История и данные</strong>
+            </span>
+            <span id="historyStatus" class="summary-meta">История сохраняется</span>
+          </summary>
+          <div class="disclosure-body">
+            <div class="service-actions two-col">
+              <button id="memoryExport" class="secondary" type="button">Экспорт памяти</button>
+              <button id="memoryImport" class="secondary" type="button">Импорт памяти</button>
+              <input id="memoryImportFile" type="file" accept="application/json,.json" hidden>
+              <button id="openDownloadsFolder" class="secondary" type="button">Открыть результаты</button>
+              <a href="#" id="clearHistory" class="danger-link">Очистить историю</a>
+            </div>
+          </div>
+        </details>
+
+        <details class="panel-card disclosure" id="promptDisclosure">
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">ПРОМПТ</span>
+              <strong>Конфигурация генерации</strong>
+            </span>
+          </summary>
+          <div class="disclosure-body compact-body">
+            <div class="info-row"><span>Схема</span><strong>Base Prompt v5 + профиль бренда</strong></div>
+            <div class="info-row"><span>Режим</span><strong>2 / 3 / 4 изображения</strong></div>
+          </div>
+        </details>
+
+        <details class="panel-card disclosure danger-disclosure" id="maintenanceDisclosure">
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">ОБСЛУЖИВАНИЕ</span>
+              <strong>Сброс и пересканирование</strong>
+            </span>
+          </summary>
+          <div class="disclosure-body">
+            <p class="service-copy">Останавливает текущую сессию, освобождает рабочие вкладки и заново сверяет уже готовые результаты.</p>
+            <button id="resetRunRescan" class="danger-outline" type="button">Сбросить сессию и пересканировать</button>
+          </div>
+        </details>
+
+        <details class="panel-card disclosure logs-section" id="logsDisclosure">
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">ЖУРНАЛ</span>
+              <strong>Последние события</strong>
+            </span>
+            <span class="logs-hint">12 записей</span>
+          </summary>
+          <div class="disclosure-body logs-body"><pre id="logs">Пока пусто.</pre></div>
+        </details>
+      </section>
+    </div>
+
+    <footer class="command-dock">
+      <div class="dock-state">
+        <span class="dock-label">Готовность</span>
+        <span id="dockCopy" class="dock-copy" aria-hidden="true">Проверка перед стартом выполняется автоматически</span>
+      </div>
+      <div class="dock-actions">
+        <button id="start" class="primary"><span class="button-icon">▶</span><span>СТАРТ</span></button>
+        <button id="pauseRun" class="stop-button"><span class="button-icon">Ⅱ</span><span>ПАУЗА</span></button>
+        <button id="stop" class="stop-button"><span class="button-icon">■</span><span>СТОП</span></button>
+      </div>
+    </footer>
+  </main>
+  <script type="module" src="sidepanel.js"></script>
+</body>
+</html>

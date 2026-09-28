@@ -1,0 +1,12 @@
+node_modules/
+diagnostics/
+input-ref-images/
+input-watches-images/
+reference-prompts/
+config/
+Base Prompt v4.txt
+docs/*.pdf
+*.log
+*.jsonl
+Thumbs.db
+desktop.ini
