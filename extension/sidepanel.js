@@ -1069,17 +1069,32 @@ function formatDuration(milliseconds) {
 function renderRunStatus(pause = countdown(runtime.rateLimitPauseUntil)) {
   const state = String(runtime.state || 'IDLE').toUpperCase();
   const stateLabel = RUN_STATE_LABELS[state] || runtime.status || state;
-  const badgeLabel = runtime.status === 'RATE_LIMIT_PAUSE' && pause
-    ? `ПАУЗА ЗАПУСКА · ${pause}`
-    : (runtime.status === 'RUNNING_WITH_ERRORS'
-      ? 'РАБОТАЕТ · ЕСТЬ ОШИБКА'
-      : (runtime.status === 'DONE_WITH_FACTS_ERRORS' ? 'ЗАВЕРШЕНО · ОШИБКИ OCR' : stateLabel));
+  const recoveryStage = String(runtime.conversationRecovery?.stage || '').toUpperCase();
+  const conversationWait = recoveryStage === 'WAITING' ? countdown(runtime.conversationRecovery?.dueAt) : '';
+  let badgeLabel = stateLabel;
+  if (recoveryStage === 'INSPECTING') badgeLabel = 'ПРОВЕРЯЮ ЧАТЫ';
+  else if (recoveryStage === 'WAITING') badgeLabel = `ВОССТАНОВЛЕНИЕ · ${conversationWait || 'скоро'}`;
+  else if (recoveryStage === 'REOPENING') badgeLabel = 'ВОССТАНОВЛЕНИЕ ЧАТОВ';
+  else if (recoveryStage === 'FAILED') badgeLabel = 'ВОССТАНОВЛЕНИЕ ОСТАНОВЛЕНО';
+  else if (runtime.status === 'RATE_LIMIT_PAUSE' && pause) badgeLabel = `ПАУЗА ЗАПУСКА · ${pause}`;
+  else if (runtime.status === 'RUNNING_WITH_ERRORS') badgeLabel = 'РАБОТАЕТ · ЕСТЬ ОШИБКА';
+  else if (runtime.status === 'DONE_WITH_FACTS_ERRORS') badgeLabel = 'ЗАВЕРШЕНО · ОШИБКИ OCR';
   $('stateBadge').textContent = badgeLabel;
-  $('currentAction').textContent = pause
-    ? (state === 'PAUSED'
+  let actionText = runtime.currentAction || (state === 'IDLE' ? 'Ожидание запуска.' : 'Состояние обновляется.');
+  if (recoveryStage === 'INSPECTING') {
+    actionText = runtime.currentAction || 'Приостанавливаю новые отправки и проверяю сохранённые разговоры ChatGPT…';
+  } else if (recoveryStage === 'WAITING') {
+    actionText = `${runtime.currentAction || 'Разговоры ChatGPT будут открыты повторно.'} · осталось ${conversationWait || 'меньше секунды'}`;
+  } else if (recoveryStage === 'REOPENING') {
+    actionText = runtime.currentAction || 'Повторно открываю сохранённые разговоры ChatGPT…';
+  } else if (recoveryStage === 'FAILED') {
+    actionText = runtime.currentAction || runtime.conversationRecovery?.error || 'Восстановление остановлено; очередь сохранена.';
+  } else if (pause) {
+    actionText = state === 'PAUSED'
       ? `${runtime.currentAction || 'Лимит изображений: очередь ожидает восстановления.'} · осталось ${pause}`
-      : `Отправка новых промптов приостановлена · ${pause}. Готовые результаты продолжают скачиваться.`)
-    : (runtime.currentAction || (state === 'IDLE' ? 'Ожидание запуска.' : 'Состояние обновляется.'));
+      : `Отправка новых промптов приостановлена · ${pause}. Готовые результаты продолжают скачиваться.`;
+  }
+  $('currentAction').textContent = actionText;
 
   const hasSavedRun = Boolean(runtime.operationId || (runtime.startedAt && ['DONE', 'STOPPED'].includes(state)));
   const total = Math.max(0, Math.floor(Number(hasSavedRun
@@ -1361,16 +1376,34 @@ function renderGenerationMemory() {
 
 function updateActionButtons() {
   const canContinue = runtime.state === 'PAUSED' && runtime.run;
+  const conversationRecoveryStage = String(runtime.conversationRecovery?.stage || '').toUpperCase();
+  const conversationRecoveryBusy = ['INSPECTING', 'WAITING', 'REOPENING'].includes(conversationRecoveryStage);
+  const recoveryCountdown = countdown(runtime.conversationRecovery?.dueAt);
   const waitingImageLimit = canContinue && runtime.imageLimitDetected === true
     && Number(runtime.rateLimitPauseUntil || 0) > Date.now();
   const isRunning = ['RUNNING', 'STARTING', 'DRAINING'].includes(runtime.state);
   const isReconciling = runtime.state === 'RECONCILING';
-  $('start').querySelector('span:last-child').textContent = actionBusy
-    ? 'ПРОВЕРКА…'
-    : (waitingImageLimit ? 'ОЖИДАНИЕ ЛИМИТА' : (canContinue ? 'ПРОДОЛЖИТЬ' : 'СТАРТ'));
-  $('start').disabled = isRunning || isReconciling || actionBusy || waitingImageLimit;
+  let startLabel = canContinue ? 'ПРОДОЛЖИТЬ' : 'СТАРТ';
+  if (actionBusy) startLabel = 'ПРОВЕРКА…';
+  else if (conversationRecoveryStage === 'INSPECTING') startLabel = 'ПРОВЕРЯЮ ЧАТЫ…';
+  else if (conversationRecoveryStage === 'WAITING') startLabel = `ВОССТАНОВЛЕНИЕ ${recoveryCountdown ? `· ${recoveryCountdown}` : ''}`.trim();
+  else if (conversationRecoveryStage === 'REOPENING') startLabel = 'ОТКРЫВАЮ ЧАТЫ…';
+  else if (waitingImageLimit) startLabel = 'ОЖИДАНИЕ ЛИМИТА';
+  $('start').querySelector('span:last-child').textContent = startLabel;
+  $('start').disabled = isRunning || isReconciling || actionBusy || waitingImageLimit || conversationRecoveryBusy;
   $('pauseRun').disabled = !isRunning || isReconciling || actionBusy;
-  $('stop').disabled = !(isRunning || canContinue) || isReconciling || actionBusy;
+  const stopButton = $('stop');
+  const stopLabel = stopButton?.querySelector('span:last-child');
+  const stopIcon = stopButton?.querySelector('.button-icon');
+  const resetInsteadOfStop = Boolean(runtime.stopBlocked);
+  if (stopLabel) stopLabel.textContent = resetInsteadOfStop ? 'СБРОС' : 'СТОП';
+  if (stopIcon) stopIcon.textContent = resetInsteadOfStop ? '↻' : '■';
+  if (stopButton) {
+    stopButton.title = resetInsteadOfStop
+      ? 'Сверить готовые PNG и вернуть незавершённые генерации в очередь'
+      : 'Остановить прогон';
+    stopButton.disabled = !(isRunning || canContinue || resetInsteadOfStop) || isReconciling || actionBusy || conversationRecoveryBusy;
+  }
   if ($('resetRunRescan')) $('resetRunRescan').disabled = actionBusy;
   if ($('exportDiagnostics')) $('exportDiagnostics').disabled = actionBusy;
   const controlsLocked = isRunning || isReconciling || actionBusy || Boolean(canContinue);
@@ -1503,12 +1536,23 @@ async function stopRun() {
   updateActionButtons();
   try {
     const response = await chrome.runtime.sendMessage({ type: 'STOP_RUN' });
-    if (!response?.ok) throw new Error(response?.error || 'Остановка не выполнена');
+    if (!response?.ok) {
+      await refreshRuntime();
+      throw new Error(response?.error || 'Остановка не выполнена');
+    }
     await refreshRuntime();
   } finally {
     actionBusy = false;
     updateActionButtons();
   }
+}
+
+function stopOrResetRun() {
+  if (runtime.stopBlocked) {
+    resetRunAndRescanFromUi();
+    return Promise.resolve();
+  }
+  return stopRun();
 }
 
 async function pauseRun() {
@@ -1712,7 +1756,7 @@ $('clearDomDiagnostics')?.addEventListener('click', () => clearDomDiagnosticsFro
 $('exportDiagnostics')?.addEventListener('click', () => exportDiagnosticSnapshot().catch(showError));
 $('start').addEventListener('click', () => setWorkspaceView('run'));
 $('start').addEventListener('click', () => startOrResume().catch(showError));
-$('stop').addEventListener('click', () => stopRun().catch(showError));
+$('stop').addEventListener('click', () => stopOrResetRun().catch(showError));
 $('pauseRun').addEventListener('click', () => pauseRun().catch(showError));
 $('resetRunRescan')?.addEventListener('click', () => setWorkspaceView('service'));
 $('resetRunRescan')?.addEventListener('click', () => resetRunAndRescanFromUi().catch(showError));

@@ -69,7 +69,10 @@ export function freshSlotRevisionFields() {
     pageRunAcceptedAt: null,
     lastSendClickedAt: null,
     rendererBootstrappedAt: null,
-    rendererBootstrapVisibility: null
+    rendererBootstrapVisibility: null,
+    noResponseSince: null,
+    autoRefreshGenerationId: null,
+    autoRefreshAt: null
   };
 }
 

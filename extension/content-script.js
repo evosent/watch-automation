@@ -22,7 +22,8 @@
       slotId: runCache?.slotId,
       entryId: runCache?.entryId,
       generationId: runCache?.job?.generationId || runCache?.factsExtraction?.generationId || null,
-      entryName: runCache?.job?.outputFileName
+      entryName: runCache?.job?.outputFileName,
+      chatUrl: currentConversationUrl()
     };
   }
 
@@ -416,6 +417,7 @@
     // conversation normally in the same audit pass.
     const rateLimit = await checkAndDismissRateLimit({ dismiss: !runCache?.sendConfirmationPending });
     const result = A().inspectGeneratedImage({ baselineAssistantCount: runCache.baselineAssistantCount || 0 });
+    result.chatUrl = currentConversationUrl();
     if (result.state === 'READY') {
       runCache.imageCandidateSrc = null;
       runCache.imageCandidateSince = 0;
@@ -1007,7 +1009,7 @@
         job: message.job,
         recovery: message.recovery === true,
         buildId: message.buildId || message.job?.buildId || null,
-        promptSent: false,
+        promptSent: message.recovery === true,
         preparedForSubmit: false,
         preparedAt: null,
         submittedAtMs: null,

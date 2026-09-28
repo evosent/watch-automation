@@ -250,6 +250,30 @@
       });
   }
 
+  function visibleConversationLoadError(root = document) {
+    const isErrorText = (value) => /не\s+удалось\s+загрузить\s+этот\s+разговор\s+chatgpt/i
+      .test(String(value || '').replace(/\s+/g, ' ').trim());
+    const isRetry = (element) => {
+      const label = `${element.innerText || element.textContent || ''} ${element.getAttribute('aria-label') || ''}`
+        .replace(/\s+/g, ' ').trim();
+      return /^(?:повторить|retry)$/i.test(label);
+    };
+    const retryButtons = [...root.querySelectorAll('button, [role="button"]')]
+      .filter((element) => visible(element) && isRetry(element));
+    for (const button of retryButtons) {
+      let candidate = button;
+      for (let depth = 0; candidate && depth < 9; depth += 1, candidate = candidate.parentElement) {
+        if (!visible(candidate)) continue;
+        const text = (candidate.innerText || candidate.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text.length > 3000) continue;
+        if (isErrorText(text) && [...candidate.querySelectorAll('button, [role="button"]')].some(isRetry)) {
+          return candidate;
+        }
+      }
+    }
+    return null;
+  }
+
   window.WatchSelectorResolver = {
     visible,
     resolve,
@@ -267,6 +291,7 @@
     rateLimitDialogs,
     dismissRateLimitDialog,
     visibleErrors,
+    visibleConversationLoadError,
     strategies
   };
 })();

@@ -761,6 +761,20 @@
       });
     }
 
+    const conversationLoadError = R().visibleConversationLoadError?.();
+    if (conversationLoadError) {
+      const text = (conversationLoadError.innerText || conversationLoadError.textContent || '')
+        .replace(/\s+/g, ' ').trim().slice(0, 3000);
+      return reportInspection({
+        state: 'CONVERSATION_LOAD_ERROR',
+        errorClass: 'CONVERSATION_LOAD_ERROR',
+        error: text || 'Не удалось загрузить этот разговор ChatGPT',
+        responseText: text,
+        assistantCount: turns.length,
+        userCount
+      });
+    }
+
     if (turns.length <= baselineAssistantCount) {
       return reportInspection({ state: 'WAITING_ASSISTANT', assistantCount: turns.length, userCount });
     }

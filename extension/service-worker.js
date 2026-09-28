@@ -48,6 +48,7 @@ import {
 import { brandPromptPath, buildGenerationPrompt, detectBrandProfile, resolveTitleSpec } from './prompt-profiles.js';
 import {
   AUTOMATION_ERROR_CLASSES,
+  CONVERSATION_LOAD_RECOVERY_DELAY_MS,
   SLOT_PHASES,
   classifyAutomationError,
   coalescedPauseDeadline,
@@ -62,7 +63,8 @@ import {
   resolveGenerationPause,
   retryDelayMs,
   scheduledRunRetries,
-  stableHash
+  stableHash,
+  shouldRefreshUnresponsiveGeneration
 } from './reliability-utils.js';
 
 const DEFAULT_WORKERS = 4;
@@ -95,6 +97,7 @@ const DEFAULT_RATE_LIMIT_PAUSE_MINUTES = RATE_LIMIT_PAUSE_MS / 60000;
 const MIN_RATE_LIMIT_PAUSE_MINUTES = 1;
 const MAX_RATE_LIMIT_PAUSE_MINUTES = 30;
 const RATE_LIMIT_RESUME_ALARM_NAME = 'watch-automation-rate-limit-resume';
+const CONVERSATION_LOAD_RECOVERY_ALARM_NAME = 'watch-automation-conversation-load-recovery';
 const REVISION_FACTS_RECOVERY_ALARM_NAME = 'watch-automation-revision-facts-recovery';
 const DEV_RELOAD_ALARM_NAME = 'watch-automation-dev-reload';
 const DEV_RELOAD_STATUS_URL = 'http://127.0.0.1:17321/status';
@@ -117,7 +120,7 @@ const SLOT_PROBE_TIMEOUT_MS = 8000;
 const GLOBAL_NO_PROGRESS_WINDOW_MS = 300000;
 const MAX_RUN_EVENTS = 600;
 const OUTPUT_VERIFY_TIMEOUT_MS = 2000;
-const EXTENSION_BUILD_ID = '2026-09-27.1';
+const EXTENSION_BUILD_ID = '2026-09-28.1';
 const PROMPT_PIPELINE_VERSION = '6';
 const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
@@ -151,6 +154,7 @@ const activeLaunchTasks = new Map();
 const imageLimitTasks = new Map();
 const activeFactsSendTasks = new Map();
 const revisionFactsRecoveryTasks = new Map();
+const conversationRecoveryRuns = new Set();
 // In-memory bridge between chrome.downloads.download() and the deferred state
 // write. It lets DOWNLOAD_GENERATED return immediately without risking a very
 // fast download completing before slot.downloadId reaches storage.
@@ -286,6 +290,29 @@ async function rehydrateWorkerWake() {
   const stored = await getStored();
   const run = stored.run;
   if (!run) return;
+  const conversationStage = String(run.conversationRecovery?.stage || '').toUpperCase();
+  if (conversationStage === 'INSPECTING') {
+    void beginConversationLoadRecovery(run.operationId, {
+      slotId: run.conversationRecovery?.triggerSlotId,
+      entryId: run.conversationRecovery?.triggerEntryId
+    });
+    return;
+  }
+  if (['WAITING', 'REOPENING'].includes(conversationStage)) {
+    void (async () => {
+      await closeConversationRecoveryTabs(run.operationId);
+      if (conversationStage === 'WAITING' && Number(run.conversationRecovery.dueAt || 0) > Date.now()) {
+        scheduleConversationLoadRecovery(run.operationId, run.conversationRecovery.dueAt);
+      } else {
+        await resumeConversationLoadRecovery(run.operationId);
+      }
+    })().catch(async (error) => {
+      await failConversationLoadRecovery(run.operationId,
+        `Не удалось закрыть прежние рабочие вкладки перед восстановлением: ${error.message}`,
+        { attempt: Number(run.conversationRecovery?.attempts || 0) });
+    });
+    return;
+  }
   if (run.state === 'PAUSED' && run.imageLimitDetected === true
     && Object.values(run.slots || {}).some((slot) => slot.entryId && !slot.downloadId)) {
     void pauseForImageLimit(run.operationId, { text: run.rateLimitReason },
@@ -545,6 +572,529 @@ function normalizeChatConversationUrl(value) {
     return `${url.origin}${url.pathname}`;
   } catch (_) {
     return null;
+  }
+}
+
+function conversationRecoveryIsBlocked(run) {
+  return ['INSPECTING', 'WAITING', 'REOPENING', 'FAILED'].includes(String(run?.conversationRecovery?.stage || '').toUpperCase());
+}
+
+function scheduleConversationLoadRecovery(operationId, dueAt) {
+  if (!operationId || !dueAt || !chrome.alarms?.create) return;
+  Promise.resolve(chrome.alarms.create(CONVERSATION_LOAD_RECOVERY_ALARM_NAME, {
+    when: Math.max(Date.now() + 1000, Number(dueAt))
+  })).catch(() => {});
+}
+
+function chatTabFingerprint(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.origin !== 'https://chatgpt.com') return null;
+    return `${url.origin}${url.pathname}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function closeConversationRecoveryTabs(operationId) {
+  const { run } = await getStored();
+  if (!run || run.operationId !== operationId) return { closed: 0 };
+  const stage = String(run.conversationRecovery?.stage || '').toUpperCase();
+  if (!['WAITING', 'REOPENING'].includes(stage)) return { closed: 0 };
+  const tabs = Array.isArray(run.conversationRecovery?.closeTabs) ? run.conversationRecovery.closeTabs : [];
+  const failures = [];
+  let closed = 0;
+  for (const saved of tabs) {
+    const tabId = Number(saved?.tabId || 0);
+    if (!tabId) continue;
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) continue;
+    if (Number(tab.windowId) !== Number(saved.windowId)
+      || chatTabFingerprint(tab.url || tab.pendingUrl) !== saved.urlFingerprint) {
+      failures.push(tabId);
+      continue;
+    }
+    await chrome.tabs.remove(tabId).catch(() => {});
+    if (await chrome.tabs.get(tabId).catch(() => null)) failures.push(tabId);
+    else closed += 1;
+  }
+  if (failures.length) throw new Error(`вкладки ${failures.join(', ')} изменились или не закрылись`);
+  return { closed };
+}
+
+async function failConversationLoadRecovery(operationId, message, { attempt = null } = {}) {
+  if (chrome.alarms?.clear) await chrome.alarms.clear(CONVERSATION_LOAD_RECOVERY_ALARM_NAME).catch(() => {});
+  await withStateLock(async () => {
+    const stored = await getStored();
+    const run = stored.run;
+    if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)) return;
+    const previous = run.conversationRecovery || {};
+    run.conversationRecovery = {
+      ...previous,
+      stage: 'FAILED',
+      attempts: Number(attempt ?? previous.attempts ?? 0),
+      failedAt: new Date().toISOString(),
+      error: String(message || 'Не удалось восстановить разговоры ChatGPT').slice(0, 1200)
+    };
+    run.state = 'PAUSED';
+    run.status = 'PAUSED_ON_ERROR';
+    run.pauseReason = 'CONVERSATION_LOAD';
+    run.unresolvedError = true;
+    run.error = { message: run.conversationRecovery.error };
+    run.currentAction = `${run.conversationRecovery.error} Вкладки и задания сохранены; можно продолжить вручную или выполнить сброс.`;
+    run.lastActivityAt = new Date().toISOString();
+    await saveRunAndQueue(run, stored.queue, stored.history, stored.generationMemory);
+    await publishRun(run, stored.queue);
+  });
+  await appendLog('Восстановление разговора ChatGPT остановлено; состояние сохранено', { operationId, message });
+}
+
+async function beginConversationLoadRecovery(operationId, signal = null) {
+  if (conversationRecoveryRuns.has(operationId)) return { skipped: true, inFlight: true };
+  conversationRecoveryRuns.add(operationId);
+  try {
+    return await beginConversationLoadRecoveryInternal(operationId, signal);
+  } catch (error) {
+    const stored = await getStored().catch(() => ({ run: null }));
+    await failConversationLoadRecovery(operationId,
+      `Не удалось подготовить безопасное восстановление разговоров: ${error.message}`,
+      { attempt: Number(stored.run?.conversationRecovery?.attempts || 0) });
+    return { failed: true, error: error.message };
+  } finally {
+    conversationRecoveryRuns.delete(operationId);
+  }
+}
+
+async function beginConversationLoadRecoveryInternal(operationId, signal = null) {
+  let initial = await getStored();
+  let run = initial.run;
+  if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)) return { skipped: true };
+  let previousRecovery = run.conversationRecovery || {};
+  let previousStage = String(previousRecovery.stage || '').toUpperCase();
+  if (['WAITING', 'REOPENING', 'FAILED'].includes(previousStage)) return { skipped: true, stage: previousStage };
+  const previousAttempts = Number(previousRecovery.attempts || 0);
+  if (previousAttempts >= 1) {
+    await failConversationLoadRecovery(operationId,
+      `Ошибка «Не удалось загрузить этот разговор ChatGPT» появилась повторно после автоматического восстановления${signal?.entryId ? ` (${signal.entryId})` : ''}.`,
+      { attempt: previousAttempts });
+    return { failed: true, repeated: true };
+  }
+
+  if (previousStage !== 'INSPECTING') {
+    const claimed = await withStateLock(async () => {
+      const stored = await getStored();
+      const current = stored.run;
+      if (!current || current.operationId !== operationId || ['DONE', 'STOPPED'].includes(current.state)) return false;
+      const stage = String(current.conversationRecovery?.stage || '').toUpperCase();
+      if (['INSPECTING', 'WAITING', 'REOPENING', 'FAILED'].includes(stage)) return false;
+      current.conversationRecovery = {
+        ...(current.conversationRecovery || {}),
+        stage: 'INSPECTING',
+        attempts: Number(current.conversationRecovery?.attempts || 0),
+        inspectionStartedAt: new Date().toISOString(),
+        triggerSlotId: signal?.slotId ?? null,
+        triggerEntryId: signal?.entryId ?? null
+      };
+      current.state = 'PAUSED';
+      current.status = 'CONVERSATION_RECOVERY';
+      current.pauseReason = 'CONVERSATION_LOAD';
+      current.unresolvedError = false;
+      current.stopBlocked = null;
+      current.currentAction = 'ChatGPT сообщил, что разговор не загрузился. Проверяю ссылки и состояние отправленных генераций; новые запросы пока не запускаются.';
+      current.lastActivityAt = new Date().toISOString();
+      await saveRunAndQueue(current, stored.queue);
+      await publishRun(current, stored.queue);
+      return true;
+    });
+    if (!claimed) return { skipped: true, inFlight: true };
+    initial = await getStored();
+    run = initial.run;
+    previousRecovery = run?.conversationRecovery || previousRecovery;
+    previousStage = String(previousRecovery.stage || '').toUpperCase();
+  }
+
+  const entries = groupEntries(initial.queue, run.groupId);
+  const submittedJobs = new Map();
+  const unsafeReasons = [];
+  for (const slot of Object.values(run.slots || {})) {
+    if (slot.tabId) {
+      const tab = await chrome.tabs.get(Number(slot.tabId)).catch(() => null);
+      if (tab) {
+        const actualChatUrl = normalizeChatConversationUrl(tab.url || tab.pendingUrl);
+        const savedChatUrl = normalizeChatConversationUrl(slot.chatUrl);
+        const urlFingerprint = chatTabFingerprint(tab.url || tab.pendingUrl);
+        const expectedWindowId = Number(run.automationWindowId || 0);
+        if (!urlFingerprint || (expectedWindowId && Number(tab.windowId) !== expectedWindowId)) {
+          unsafeReasons.push(`Вкладка ${Number(slot.slotId) + 1} больше не соответствует сохранённой рабочей вкладке.`);
+        }
+        if (slot.entryId && slotGenerationSubmitted(slot) && !actualChatUrl && !savedChatUrl) {
+          unsafeReasons.push(`Для отправленной модели во вкладке ${Number(slot.slotId) + 1} не удалось подтвердить ссылку разговора.`);
+        }
+        if (slot.entryId && slotGenerationSubmitted(slot) && actualChatUrl && savedChatUrl
+          && chatTabFingerprint(actualChatUrl) !== chatTabFingerprint(savedChatUrl)) {
+          unsafeReasons.push(`Ссылка разговора во вкладке ${Number(slot.slotId) + 1} изменилась после отправки модели.`);
+        }
+      }
+    }
+    if (!slot.entryId || !slotGenerationSubmitted(slot)) continue;
+    const entry = entries.find((item) => item.sourceId === slot.entryId);
+    if (!entry || entry.status === 'done') continue;
+    const tab = slot.tabId ? await chrome.tabs.get(Number(slot.tabId)).catch(() => null) : null;
+    const actualChatUrl = normalizeChatConversationUrl(tab?.url || tab?.pendingUrl);
+    const savedChatUrl = normalizeChatConversationUrl(slot.chatUrl);
+    const chatUrl = actualChatUrl || savedChatUrl;
+    if (actualChatUrl && savedChatUrl
+      && chatTabFingerprint(actualChatUrl) !== chatTabFingerprint(savedChatUrl)) {
+      unsafeReasons.push(`Ссылка разговора для уже отправленной модели «${entryDisplayName(entry, slot)}» изменилась.`);
+      continue;
+    }
+    let generationIdValue = slot.generationId;
+    try {
+      generationIdValue ||= ensureSlotGenerationIdentity(run, slot, entry, initial.generationMemory);
+    } catch (_) {}
+    const submittedAtMs = Date.parse(slot.generationSubmittedAt || slot.lastSendClickedAt || '');
+    if (!chatUrl || !slot.leaseId || !generationIdValue || !Number.isFinite(submittedAtMs) || submittedAtMs <= 0) {
+      unsafeReasons.push(`Для уже отправленной модели «${entryDisplayName(entry, slot)}» не хватает ссылки чата или подтверждённого идентификатора отправки.`);
+      continue;
+    }
+    submittedJobs.set(`${Number(slot.slotId)}:${slot.entryId}`, {
+      slotId: Number(slot.slotId),
+      entryId: slot.entryId,
+      chatUrl,
+      generationId: generationIdValue,
+      leaseId: slot.leaseId,
+      submittedAtMs,
+      baselineAssistantCount: Number(slot.baselineAssistantCount || 0),
+      oldTabId: Number(slot.tabId || 0) || null,
+      outputFileName: slot.outputFileName || slot.lastEntryName || null,
+      modelName: slot.lastModelName || entry.modelName || null
+    });
+  }
+  if (unsafeReasons.length) {
+    await failConversationLoadRecovery(operationId,
+      `${unsafeReasons[0]} Автоматически закрывать вкладки опасно, поэтому они остались открыты.`,
+      { attempt: previousAttempts });
+    return { failed: true, unsafe: true };
+  }
+
+  const cancelledRevisions = [];
+  const commit = await withStateLock(async () => {
+    const stored = await getStored();
+    const currentRun = stored.run;
+    if (!currentRun || currentRun.operationId !== operationId || ['DONE', 'STOPPED'].includes(currentRun.state)) return null;
+    const stage = String(currentRun.conversationRecovery?.stage || '').toUpperCase();
+    if (['WAITING', 'REOPENING', 'FAILED'].includes(stage)) return null;
+    const history = normalizeHistory(stored.history);
+    const memory = normalizeGenerationMemory(stored.generationMemory);
+    await reconcileRunVerifiedRevisions(currentRun, stored.queue, history, memory);
+    const currentEntries = groupEntries(stored.queue, currentRun.groupId);
+    const recoverySlots = [];
+    const toClose = [];
+    const closeTabRecords = [];
+    for (const slot of Object.values(currentRun.slots || {})) {
+      if (slot.tabId) {
+        const tabId = Number(slot.tabId);
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (tab) {
+          const urlFingerprint = chatTabFingerprint(tab.url || tab.pendingUrl);
+          const expectedWindowId = Number(currentRun.automationWindowId || 0);
+          if (!urlFingerprint || (expectedWindowId && Number(tab.windowId) !== expectedWindowId)) {
+            return { unsafe: `Рабочая вкладка ${Number(slot.slotId) + 1} изменилась во время сверки; её оставили открытой.` };
+          }
+          const submitted = slot.entryId && slotGenerationSubmitted(slot)
+            ? submittedJobs.get(`${Number(slot.slotId)}:${slot.entryId}`)
+            : null;
+          const currentChatUrl = normalizeChatConversationUrl(tab.url || tab.pendingUrl);
+          if (submitted && currentChatUrl
+            && chatTabFingerprint(currentChatUrl) !== chatTabFingerprint(submitted.chatUrl)) {
+            return { unsafe: `Ссылка разговора во вкладке ${Number(slot.slotId) + 1} изменилась во время сверки; её оставили открытой.` };
+          }
+          toClose.push(tabId);
+          closeTabRecords.push({ tabId, windowId: Number(tab.windowId), urlFingerprint });
+        }
+      }
+      if (!slot.entryId) continue;
+      const entry = currentEntries.find((item) => item.sourceId === slot.entryId);
+      if (!entry || entry.status === 'done') {
+        slot.tabId = null;
+        slot.entryId = null;
+        slot.status = 'IDLE';
+        slot.phase = SLOT_PHASES.IDLE;
+        slot.downloadId = null;
+        slot.finalCheckPending = false;
+        slot.finalCheckDeadlineAt = null;
+        slot.finalCheckAttempts = 0;
+        slot.failed = false;
+        Object.assign(slot, freshSlotRevisionFields());
+        continue;
+      }
+      const sent = slotGenerationSubmitted(slot);
+      const key = `${Number(slot.slotId)}:${slot.entryId}`;
+      const submitted = submittedJobs.get(key);
+      if (sent && (!submitted
+        || slot.leaseId !== submitted.leaseId
+        || (slot.generationId && slot.generationId !== submitted.generationId)
+        || Date.parse(slot.generationSubmittedAt || slot.lastSendClickedAt || '') !== submitted.submittedAtMs)) {
+        return { unsafe: `Идентификатор отправки модели «${entryDisplayName(entry, slot)}» изменился во время сверки; её оставили в сохранённом состоянии.` };
+      }
+      if (sent && submitted) {
+        slot.chatUrl = submitted.chatUrl;
+        slot.generationId = submitted.generationId;
+        slot.tabId = null;
+        slot.status = 'OBSERVING';
+        slot.phase = SLOT_PHASES.OBSERVING;
+        slot.finalCheckPending = true;
+        slot.finalCheckDeadlineAt = Number(slot.finalCheckDeadlineAt || 0) > Date.now()
+          ? slot.finalCheckDeadlineAt : finalCheckDeadline();
+        slot.finalCheckAttempts = 0;
+        slot.noResponseSince = null;
+        slot.failed = false;
+        recoverySlots.push(submitted);
+        continue;
+      }
+      if (entry.status !== 'done') {
+        entry.status = 'pending';
+        entry.lastError = null;
+        entry.errorClass = null;
+        entry.nextRetryAt = null;
+        entry.generationStartedAt = null;
+        setGenerationMemoryStatus(memory, entry, GENERATION_MEMORY_STATUSES.NOT_READY, {
+          statusSource: 'automatic', generationStartedAt: null, lastError: null, lastRunId: operationId
+        });
+      }
+      if (slot.generationId) cancelledRevisions.push({ generationId: slot.generationId, sourceId: slot.entryId });
+      slot.tabId = null;
+      slot.entryId = null;
+      slot.status = 'IDLE';
+      slot.phase = SLOT_PHASES.IDLE;
+      slot.downloadId = null;
+      slot.launchWaitUntil = null;
+      slot.finalCheckPending = false;
+      slot.finalCheckDeadlineAt = null;
+      slot.finalCheckAttempts = 0;
+      slot.failed = false;
+      slot.rateLimitRetryNeeded = false;
+      Object.assign(slot, freshSlotRevisionFields());
+    }
+    const protectedIds = new Set(recoverySlots.map((item) => item.entryId));
+    const plannedIds = new Set(Array.isArray(currentRun.plannedIds) ? currentRun.plannedIds : []);
+    currentRun.pendingIds = currentEntries
+      .filter((entry) => plannedIds.has(entry.sourceId) && entry.status !== 'done' && !protectedIds.has(entry.sourceId))
+      .map((entry) => entry.sourceId);
+    const now = Date.now();
+    currentRun.conversationRecovery = {
+      stage: 'WAITING',
+      attempts: previousAttempts + 1,
+      startedAt: new Date(now).toISOString(),
+      dueAt: now + CONVERSATION_LOAD_RECOVERY_DELAY_MS,
+      error: 'ChatGPT временно не загрузил разговор. Проверю сохранённые чаты после паузы в 2 минуты.',
+      triggerSlotId: signal?.slotId ?? null,
+      triggerEntryId: signal?.entryId ?? null,
+      slots: recoverySlots,
+      closeTabs: closeTabRecords
+    };
+    currentRun.state = 'PAUSED';
+    currentRun.status = 'CONVERSATION_RECOVERY';
+    currentRun.pauseReason = 'CONVERSATION_LOAD';
+    currentRun.unresolvedError = false;
+    currentRun.stopBlocked = null;
+    currentRun.error = null;
+    currentRun.currentAction = 'Обнаружена ошибка загрузки разговора ChatGPT. Рабочие вкладки закрываются; через 2 минуты открою их и проверю уже отправленные генерации.';
+    currentRun.lastActivityAt = new Date().toISOString();
+    recordRunEvent(currentRun, 'conversation_load_recovery_started', {
+      triggerSlotId: signal?.slotId ?? null,
+      triggerEntryId: signal?.entryId ?? null,
+      submittedCount: recoverySlots.length,
+      requeuedCount: currentRun.pendingIds.length
+    });
+    await saveRunAndQueue(currentRun, stored.queue, history, memory);
+    await publishRun(currentRun, stored.queue);
+    return { tabIds: [...new Set(toClose.filter((id) => id > 0))], recoverySlots };
+  });
+  if (!commit) return { skipped: true };
+  if (commit.unsafe) {
+    await failConversationLoadRecovery(operationId, commit.unsafe, { attempt: previousAttempts });
+    return { failed: true, unsafe: true };
+  }
+
+  await Promise.all(cancelledRevisions.map(({ generationId: id, sourceId }) =>
+    cancelUnsubmittedGenerationRevision(id, sourceId, 'conversation_load_recovery_before_send').catch(() => {})));
+  let closeError = null;
+  try {
+    await Promise.all(commit.tabIds.map((tabId) => sendTabMessage(tabId, { type: 'STOP' }, 2000).catch(() => null)));
+    await closeConversationRecoveryTabs(operationId);
+  } catch (error) {
+    closeError = error;
+  }
+  if (closeError) {
+    await failConversationLoadRecovery(operationId,
+      `Не получилось безопасно закрыть рабочие вкладки (${closeError.message}). Восстановление остановлено; сохранённые задания доступны для ручной сверки.`,
+      { attempt: previousAttempts + 1 });
+    return { failed: true, error: closeError.message };
+  }
+  const current = await getStored();
+  if (current.run?.operationId === operationId && current.run.conversationRecovery?.stage === 'WAITING') {
+    scheduleConversationLoadRecovery(operationId, current.run.conversationRecovery.dueAt);
+    await appendLog('Рабочие вкладки ChatGPT закрыты для восстановления разговора', {
+      operationId,
+      reopenAt: current.run.conversationRecovery.dueAt,
+      submittedCount: commit.recoverySlots.length,
+      tabCount: commit.tabIds.length
+    });
+  }
+  return { waiting: true, dueAt: current.run?.conversationRecovery?.dueAt || null };
+}
+
+async function resumeConversationLoadRecovery(operationId = null) {
+  const initial = await getStored();
+  const run = initial.run;
+  const recovery = run?.conversationRecovery;
+  const stage = String(recovery?.stage || '').toUpperCase();
+  if (!run || (operationId && run.operationId !== operationId) || !['WAITING', 'REOPENING'].includes(stage)) return { skipped: true };
+  if (stage === 'WAITING' && Number(recovery.dueAt || 0) > Date.now()) {
+    scheduleConversationLoadRecovery(run.operationId, recovery.dueAt);
+    return { waiting: true, dueAt: recovery.dueAt };
+  }
+
+  await closeConversationRecoveryTabs(run.operationId);
+  await withStateLock(async () => {
+    const stored = await getStored();
+    if (!stored.run || stored.run.operationId !== run.operationId) return;
+    const currentStage = String(stored.run.conversationRecovery?.stage || '').toUpperCase();
+    if (!['WAITING', 'REOPENING'].includes(currentStage)) return;
+    stored.run.conversationRecovery.stage = 'REOPENING';
+    stored.run.conversationRecovery.reopeningAt ||= new Date().toISOString();
+    stored.run.currentAction = 'Пауза завершена. Повторно открываю сохранённые разговоры и сверяю уже отправленные генерации.';
+    await saveRunAndQueue(stored.run, stored.queue);
+    await publishRun(stored.run, stored.queue);
+  });
+
+  try {
+    const host = await ensureAutomationWindow(run.operationId);
+    const latest = await getStored();
+    const snapshotSlots = latest.run?.conversationRecovery?.slots || [];
+    const opened = [];
+    for (let index = 0; index < snapshotSlots.length; index += 1) {
+      const saved = snapshotSlots[index];
+      const current = await getStored();
+      if (current.run?.operationId !== run.operationId
+        || String(current.run.conversationRecovery?.stage || '').toUpperCase() !== 'REOPENING') return { skipped: true };
+      const slot = current.run.slots?.[saved.slotId];
+      if (!slot || slot.entryId !== saved.entryId) continue;
+      let tab = slot.tabId ? await chrome.tabs.get(Number(slot.tabId)).catch(() => null) : null;
+      const wantedUrl = normalizeChatConversationUrl(saved.chatUrl);
+      if (!wantedUrl) throw new Error(`У слота ${Number(saved.slotId) + 1} нет сохранённой ссылки на разговор.`);
+      if (!tab || normalizeChatConversationUrl(tab.url || tab.pendingUrl) !== wantedUrl) {
+        if (index > 0) await sleep(900);
+        tab = await chrome.tabs.create({
+          windowId: host.windowId,
+          url: automationConversationUrl(wantedUrl),
+          active: false
+        });
+        await withStateLock(async () => {
+          const stored = await getStored();
+          if (stored.run?.operationId !== run.operationId
+            || String(stored.run.conversationRecovery?.stage || '').toUpperCase() !== 'REOPENING') return;
+          const latestSlot = stored.run.slots?.[saved.slotId];
+          if (!latestSlot || latestSlot.entryId !== saved.entryId) return;
+          latestSlot.tabId = tab.id;
+          latestSlot.chatUrl = wantedUrl;
+          latestSlot.status = 'OBSERVING';
+          latestSlot.phase = SLOT_PHASES.OBSERVING;
+          const recoverySlot = stored.run.conversationRecovery?.slots?.find((item) => (
+            Number(item.slotId) === Number(saved.slotId) && item.entryId === saved.entryId
+          ));
+          if (recoverySlot) {
+            recoverySlot.reopenedTabId = tab.id;
+            recoverySlot.reopenedAt = new Date().toISOString();
+          }
+          await saveRunAndQueue(stored.run, stored.queue);
+        });
+      }
+      await waitTabReady(tab.id, 90000);
+      await markTabAsAutomation(tab.id, {
+        operationId: run.operationId,
+        slotId: saved.slotId,
+        entryId: saved.entryId
+      });
+      opened.push({ saved, tabId: tab.id });
+    }
+
+    const probes = await Promise.all(opened.map(async ({ saved, tabId }) => {
+      try {
+        const response = await sendTabMessage(tabId, {
+          type: 'CHECK_GENERATION',
+          operationId: run.operationId,
+          slotId: saved.slotId,
+          entryId: saved.entryId,
+          leaseId: saved.leaseId,
+          generationId: saved.generationId,
+          outputFileName: saved.outputFileName,
+          modelName: saved.modelName,
+          submittedAtMs: saved.submittedAtMs,
+          baselineAssistantCount: saved.baselineAssistantCount,
+          recover: true
+        }, TAB_MESSAGE_TIMEOUT_MS);
+        return { saved, tabId, value: response?.value || {}, error: null };
+      } catch (error) {
+        return { saved, tabId, value: null, error };
+      }
+    }));
+    const failedProbe = probes.find((item) => item.error
+      || item.value?.state === 'CONVERSATION_LOAD_ERROR');
+    if (failedProbe) {
+      const label = failedProbe.value?.error || failedProbe.error?.message || 'разговор всё ещё не загружается';
+      await failConversationLoadRecovery(run.operationId,
+        `После одной попытки переоткрытия ChatGPT не восстановил разговор: ${String(label).slice(0, 700)}. Повторный автоматический цикл отключён.`,
+        { attempt: Number(recovery.attempts || 1) });
+      return { failed: true, reason: label };
+    }
+
+    await withStateLock(async () => {
+      const stored = await getStored();
+      if (!stored.run || stored.run.operationId !== run.operationId) return;
+      const currentRecovery = stored.run.conversationRecovery;
+      if (String(currentRecovery?.stage || '').toUpperCase() !== 'REOPENING') return;
+      for (const item of probes) {
+        const slot = stored.run.slots?.[item.saved.slotId];
+        if (!slot || slot.entryId !== item.saved.entryId) continue;
+        slot.tabId = item.tabId;
+        slot.chatUrl = item.saved.chatUrl;
+        slot.status = 'OBSERVING';
+        slot.phase = SLOT_PHASES.OBSERVING;
+        slot.finalCheckPending = true;
+        slot.finalCheckDeadlineAt = Number(slot.finalCheckDeadlineAt || 0) > Date.now()
+          ? slot.finalCheckDeadlineAt : finalCheckDeadline();
+        slot.lastCheckState = item.value?.state || 'UNKNOWN';
+        slot.lastCheckError = item.value?.error || null;
+        slot.noResponseSince = null;
+      }
+      currentRecovery.stage = 'COMPLETED';
+      currentRecovery.completedAt = new Date().toISOString();
+      currentRecovery.error = null;
+      stored.run.state = 'PAUSED';
+      stored.run.status = 'PAUSED_RECOVERING';
+      stored.run.pauseReason = 'CONVERSATION_LOAD';
+      stored.run.unresolvedError = false;
+      stored.run.error = null;
+      stored.run.currentAction = 'Сохранённые чаты открылись. Продолжаю с уже отправленных генераций и запускаю следующие модели.';
+      stored.run.lastActivityAt = new Date().toISOString();
+      recordRunEvent(stored.run, 'conversation_load_recovery_completed', { reopenedCount: opened.length });
+      await saveRunAndQueue(stored.run, stored.queue);
+      await publishRun(stored.run, stored.queue);
+    });
+    if (chrome.alarms?.clear) await chrome.alarms.clear(CONVERSATION_LOAD_RECOVERY_ALARM_NAME).catch(() => {});
+    await resumeRun({ conversationRecoveryInternal: true });
+    await appendLog('Сохранённые разговоры восстановлены; генерационные промпты повторно не отправлялись', {
+      operationId: run.operationId,
+      reopenedCount: opened.length
+    });
+    return { recovered: true, reopenedCount: opened.length };
+  } catch (error) {
+    await failConversationLoadRecovery(run.operationId,
+      `Не удалось безопасно переоткрыть и проверить сохранённые разговоры: ${error.message}`,
+      { attempt: Number(recovery.attempts || 1) });
+    return { failed: true, error: error.message };
   }
 }
 
@@ -1913,6 +2463,30 @@ async function recoverInterruptedRun(reason) {
   const initial = await getStored();
   const initialRun = initial.run;
   const initialMemory = normalizeGenerationMemory(initial.generationMemory);
+  const recoveryStage = String(initialRun?.conversationRecovery?.stage || '').toUpperCase();
+  if (initialRun && recoveryStage === 'INSPECTING') {
+    await beginConversationLoadRecovery(initialRun.operationId, {
+      slotId: initialRun.conversationRecovery?.triggerSlotId,
+      entryId: initialRun.conversationRecovery?.triggerEntryId
+    });
+    return;
+  }
+  if (initialRun && ['WAITING', 'REOPENING'].includes(recoveryStage)) {
+    try {
+      await closeConversationRecoveryTabs(initialRun.operationId);
+    } catch (error) {
+      await failConversationLoadRecovery(initialRun.operationId,
+        `Не удалось закрыть прежние рабочие вкладки перед восстановлением: ${error.message}`,
+        { attempt: Number(initialRun.conversationRecovery?.attempts || 0) });
+      return;
+    }
+    if (recoveryStage === 'WAITING' && Number(initialRun.conversationRecovery.dueAt || 0) > Date.now()) {
+      scheduleConversationLoadRecovery(initialRun.operationId, initialRun.conversationRecovery.dueAt);
+    } else {
+      await resumeConversationLoadRecovery(initialRun.operationId);
+    }
+    return;
+  }
   if (initialRun && ['DONE', 'STOPPED'].includes(initialRun.state)) {
     const orphaned = await discoverAutomationTabsForRun(initialRun);
     const tabIds = [...new Set([...orphaned.values()].map((tab) => Number(tab.id || 0)).filter(Boolean))];
@@ -1941,16 +2515,11 @@ async function recoverInterruptedRun(reason) {
     });
     return;
   }
-  if (initialRun && String(initialRun.buildId || '') !== EXTENSION_BUILD_ID) {
-    await resetRunAndRescan({
-      reason: `Обновление расширения: ${initialRun.buildId || 'старый build'} → ${EXTENSION_BUILD_ID}`,
-      automatic: true,
-      // Do not spend minutes reconnecting obsolete page scripts during a
-      // version migration. Completed Chrome downloads are rescanned below.
-      salvageReady: false
-    });
-    return;
-  }
+  const buildChanged = Boolean(initialRun && String(initialRun.buildId || '') !== EXTENSION_BUILD_ID);
+  if (buildChanged) await appendLog('Восстанавливаю сессию после обновления расширения без сброса очереди', {
+    previousBuildId: initialRun.buildId || null,
+    buildId: EXTENSION_BUILD_ID
+  });
   const recoverableActiveState = ['RUNNING', 'STARTING', 'DRAINING'].includes(initialRun?.state);
   const recoverablePausedObservation = initialRun?.state === 'PAUSED' && hasObservationWork(initialRun);
   if (initialRun?.state === 'PAUSED' && !recoverablePausedObservation) {
@@ -1958,6 +2527,7 @@ async function recoverInterruptedRun(reason) {
       const stored = await getStored();
       const run = stored.run;
       if (!run || run.operationId !== initialRun.operationId || run.state !== 'PAUSED') return;
+      run.buildId = EXTENSION_BUILD_ID;
       const queue = stored.queue;
       const history = normalizeHistory(stored.history);
       const memory = normalizeGenerationMemory(stored.generationMemory);
@@ -2024,6 +2594,7 @@ async function recoverInterruptedRun(reason) {
     const stillRecoverable = ['RUNNING', 'STARTING', 'DRAINING'].includes(run?.state)
       || (run?.state === 'PAUSED' && hasObservationWork(run));
     if (!run || run.operationId !== initialRun.operationId || !stillRecoverable) return;
+    run.buildId = EXTENSION_BUILD_ID;
     ({ queue, history, memory: generationMemory } = syncQueueWithHistory(
       queue,
       history,
@@ -2138,7 +2709,7 @@ async function recoverInterruptedRun(reason) {
     const latest = await getStored();
     if (latest.run?.operationId === recoveredRunId) {
       try {
-        const recoveryResults = await recoverVisibleResults(latest.run);
+        const recoveryResults = await recoverVisibleResults(latest.run, { forceReload: buildChanged });
         await releaseRetryableRecoveredSlots(recoveredRunId, recoveryResults, reason);
       } catch (error) {
         await appendLog('Не удалось досканировать восстановленные вкладки', { error: error.message });
@@ -2161,6 +2732,12 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
   }
   if (alarm.name === RATE_LIMIT_RESUME_ALARM_NAME) {
     resumeAfterRateLimitPause().catch((error) => appendLog('Ошибка автопродолжения после ограничения запросов', { error: error.message }));
+    return;
+  }
+  if (alarm.name === CONVERSATION_LOAD_RECOVERY_ALARM_NAME) {
+    resumeConversationLoadRecovery().catch((error) => appendLog(
+      'Ошибка восстановления вкладок после ошибки загрузки разговора', { error: error.message }
+    ));
     return;
   }
   if (alarm.name.startsWith(GENERATION_SEND_ALARM_PREFIX)) {
@@ -3042,8 +3619,9 @@ function scheduleAudit(delay = AUDIT_INTERVAL_MS) {
       .catch((error) => appendLog('Ошибка фоновой проверки генераций', { error: error.message }))
       .finally(async () => {
         const { run, queue } = await getStored().catch(() => ({ run: null, queue: null }));
-        if (run && (['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)
-          || (run.state === 'PAUSED' && (hasObservationWork(run) || hasScheduledRunRetries(run, queue))))) scheduleAudit();
+        if (run && !conversationRecoveryIsBlocked(run)
+          && (['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)
+            || (run.state === 'PAUSED' && (hasObservationWork(run) || hasScheduledRunRetries(run, queue))))) scheduleAudit();
       });
   }, delay);
 }
@@ -3064,6 +3642,7 @@ function phaseForProbeState(state, { finalCheckPending = false, generationSubmit
     if (downloadId || generationSubmitted || finalCheckPending) return finalCheckPending ? SLOT_PHASES.OBSERVING : SLOT_PHASES.GENERATING;
     return SLOT_PHASES.RATE_LIMIT_PAUSE;
   }
+  if (normalized === 'CONVERSATION_LOAD_ERROR') return SLOT_PHASES.OBSERVING;
   if (normalized === 'ERROR') return finalCheckPending ? SLOT_PHASES.OBSERVING : SLOT_PHASES.NEEDS_ATTENTION;
   if (finalCheckPending) return SLOT_PHASES.OBSERVING;
   if (['WAITING_ASSISTANT', 'GENERATING', 'WAITING_GENERATION', 'WAITING_IMAGE'].includes(normalized)) {
@@ -3112,6 +3691,20 @@ function runSummary(run, queue) {
     status: run?.status || null,
     pauseReason: run?.pauseReason || null,
     imageLimitDetected: run?.imageLimitDetected === true,
+    conversationRecovery: run?.conversationRecovery ? {
+      stage: run.conversationRecovery.stage || null,
+      attempts: Number(run.conversationRecovery.attempts || 0),
+      startedAt: run.conversationRecovery.startedAt || null,
+      dueAt: Number(run.conversationRecovery.dueAt || 0) || null,
+      completedAt: run.conversationRecovery.completedAt || null,
+      error: run.conversationRecovery.error || null,
+      remaining: Array.isArray(run.conversationRecovery.slots) ? run.conversationRecovery.slots.length : 0
+    } : null,
+    stopBlocked: run?.stopBlocked ? {
+      count: Number(run.stopBlocked.count || 0),
+      at: run.stopBlocked.at || null,
+      message: run.stopBlocked.message || null
+    } : null,
     startedAt: run?.startedAt || null,
     finishedAt: run?.finishedAt || null,
     automationWindowId: run?.automationWindowId || null,
@@ -3158,8 +3751,9 @@ async function publishRun(run, queue) {
     ...runSummary(run, queue),
     error: run.error?.message || null
   });
-  if (['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)
-    || (run.state === 'PAUSED' && hasScheduledRunRetries(run, queue))) startAuditMonitor();
+  if (!conversationRecoveryIsBlocked(run)
+    && (['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)
+      || (run.state === 'PAUSED' && hasScheduledRunRetries(run, queue)))) startAuditMonitor();
   else stopAuditMonitor();
 }
 
@@ -3216,7 +3810,7 @@ async function ensureAutomationScripts(tabId) {
   return true;
 }
 
-async function reloadTabForRecovery(tabId, slotId) {
+async function reloadTabForRecovery(tabId, slotId, { force = false } = {}) {
   const beforeReload = await getStored();
   const automationWindowId = Number(beforeReload.run?.automationWindowId || 0);
   await withStateLock(async () => {
@@ -3248,7 +3842,7 @@ async function reloadTabForRecovery(tabId, slotId) {
   // Reuse them when possible; a forced reload is only the fallback for stale
   // scripts left behind by an unpacked-extension update.
   const ping = await sendTabMessage(tabId, { type: 'PING' }, 5000).catch(() => null);
-  if (ping?.ok) return;
+  if (ping?.ok && !force) return;
   await chrome.tabs.reload(tabId);
   await waitTabReady(tabId, 60000);
 }
@@ -4206,6 +4800,8 @@ function auditActiveRun() {
     const pauseRequests = [];
     const rateLimitRequests = [];
     const expiredObservationTabs = [];
+    const conversationLoadFailures = [];
+    const transportRefreshes = [];
     let meaningfulProgress = false;
     let globalNoProgress = false;
     await withStateLock(async () => {
@@ -4224,6 +4820,9 @@ function auditActiveRun() {
         slot.lastHeartbeatAt = checkedAt;
         if (result.response?.ok) {
           const value = result.response.value || {};
+          slot.noResponseSince = null;
+          const reportedChatUrl = normalizeChatConversationUrl(value.chatUrl);
+          if (reportedChatUrl) slot.chatUrl = reportedChatUrl;
           const previousProbe = {
             state: slot.lastCheckState,
             assistantCount: Number(slot.assistantCount || 0),
@@ -4265,6 +4864,12 @@ function auditActiveRun() {
               text: value.error || 'Слишком много запросов'
             });
           }
+          if (value.state === 'CONVERSATION_LOAD_ERROR') {
+            slot.status = 'OBSERVING';
+            slot.phase = SLOT_PHASES.OBSERVING;
+            slot.lastCheckError = value.error || 'Не удалось загрузить этот разговор ChatGPT';
+            conversationLoadFailures.push({ slotId: slot.slotId, entryId: slot.entryId, error: slot.lastCheckError });
+          }
           if (slot.finalCheckPending) {
             slot.status = 'OBSERVING';
             slot.finalCheckAttempts = Number(slot.finalCheckAttempts || 0) + 1;
@@ -4281,12 +4886,20 @@ function auditActiveRun() {
         } else {
           slot.lastCheckState = 'NO_RESPONSE';
           slot.lastCheckError = result.error?.message || result.response?.error?.message || 'Нет ответа вкладки';
+          slot.noResponseSince ||= checkedAt;
           slot.checkFailures = Number(slot.checkFailures || 0) + 1;
           if (slot.checkFailures >= 3) slot.phase = SLOT_PHASES.TAB_LOST;
+          if (shouldRefreshUnresponsiveGeneration(slot)) {
+            slot.autoRefreshGenerationId = slot.generationId;
+            slot.autoRefreshAt = checkedAt;
+            slot.noResponseSince = null;
+            slot.checkFailures = 0;
+            transportRefreshes.push({ slotId: slot.slotId, entryId: slot.entryId, tabId: slot.tabId });
+          }
           if (slot.finalCheckPending) {
             slot.status = 'OBSERVING';
             slot.finalCheckAttempts = Number(slot.finalCheckAttempts || 0) + 1;
-          } else if (slot.checkFailures >= 3) {
+          } else if (slot.checkFailures >= 3 && !slotGenerationSubmitted(slot)) {
             pauseRequests.push({
               slotId: slot.slotId,
               entryId: slot.entryId,
@@ -4341,6 +4954,7 @@ function auditActiveRun() {
         // whole window before it can pause the run.
         globalNoProgress = current.run.state !== 'PAUSED'
           && !rateLimitActive
+          && !transportRefreshes.length
           && allProbesUnreachable
           && Number.isFinite(lastProgress)
           && Date.now() - lastProgress >= GLOBAL_NO_PROGRESS_WINDOW_MS
@@ -4357,6 +4971,29 @@ function auditActiveRun() {
     await Promise.all([...new Set(expiredObservationTabs.filter(Boolean))].map((tabId) => (
       sendTabMessage(tabId, { type: 'STOP' }).catch(() => null)
     )));
+
+    await Promise.all(transportRefreshes.map(async (item) => {
+      try {
+        await reloadTabForRecovery(item.tabId, item.slotId, { force: true });
+        await appendLog('Зависшая вкладка обновлена один раз; проверяю существующий разговор без повторной отправки', {
+          operationId: run.operationId,
+          slotId: item.slotId,
+          entryId: item.entryId
+        });
+      } catch (error) {
+        await appendLog('Не удалось обновить неотвечающую вкладку', {
+          operationId: run.operationId,
+          slotId: item.slotId,
+          entryId: item.entryId,
+          error: error.message
+        });
+      }
+    }));
+
+    if (conversationLoadFailures.length) {
+      await beginConversationLoadRecovery(run.operationId, conversationLoadFailures[0]);
+      return;
+    }
 
     if (rateLimitRequests.length) {
       const signal = rateLimitRequests[0];
@@ -5347,6 +5984,8 @@ async function startRun(options = {}) {
       state: 'RUNNING',
       status: 'RUNNING',
       error: null,
+      stopBlocked: null,
+      conversationRecovery: null,
       unresolvedError: false,
       currentAction: 'Запускаю первые генерации',
       lastActivityAt: new Date().toISOString(),
@@ -5584,7 +6223,7 @@ async function stopRun() {
   const runTotal = plannedIds.size;
   const runCompleted = entries.filter((entry) => plannedIds.has(entry.sourceId) && entry.status === 'done').length;
   const unsaved = run ? (await Promise.all(Object.values(run.slots || {}).map(async (slot) => {
-    if (!slot.entryId || !slot.tabId || !slotGenerationSubmitted(slot)) return null;
+    if (!slot.entryId || !slotGenerationSubmitted(slot)) return null;
     const entry = entries.find((item) => item.sourceId === slot.entryId);
     if (entry?.status === 'done') return null;
     const revision = slot.generationId
@@ -5594,7 +6233,16 @@ async function stopRun() {
       ? null : slot;
   }))).filter(Boolean) : [];
   if (unsaved.length) {
-    throw new Error(`Стоп пока заблокирован: ${unsaved.length} отправленных генераций ещё без сохранённого PNG. Вкладки и история сохранены. Сначала нажмите «Продолжить» для восстановления результатов; для сознательного отказа от них используйте сброс сессии в разделе «Сервис».`);
+    const message = `Стоп временно заблокирован: ${unsaved.length} отправленных генераций ещё без сохранённого PNG. Нажми «Продолжить» для сверки результатов или кнопку «Сброс» внизу, чтобы сохранить готовые файлы и вернуть незавершённые модели в очередь.`;
+    await withStateLock(async () => {
+      const stored = await getStored();
+      if (!stored.run || stored.run.operationId !== run?.operationId) return;
+      stored.run.stopBlocked = { count: unsaved.length, at: new Date().toISOString(), message };
+      stored.run.currentAction = message;
+      await saveRunAndQueue(stored.run, stored.queue);
+      await publishRun(stored.run, stored.queue);
+    });
+    throw new Error(message);
   }
   const result = await resetRunAndRescan({
     reason: 'Пользователь остановил генерацию',
@@ -5614,6 +6262,8 @@ async function stopRun() {
     slots: [],
     factsJobs: [],
     currentAction: 'Генерация остановлена. Подтверждённые результаты сохранены; незавершённые модели доступны для нового запуска.',
+    stopBlocked: null,
+    conversationRecovery: null,
     error: null
   });
   return result;
@@ -5856,7 +6506,14 @@ async function quickProbeReadyResultsBeforeReset(run) {
         type: 'CHECK_GENERATION',
         operationId: run.operationId,
         slotId: slot.slotId,
-        entryId: slot.entryId
+        entryId: slot.entryId,
+        leaseId: slot.leaseId || null,
+        generationId: slot.generationId || null,
+        outputFileName: slot.outputFileName || slot.lastEntryName || null,
+        modelName: slot.lastModelName || null,
+        submittedAtMs: Date.parse(slot.generationSubmittedAt || '') || 0,
+        baselineAssistantCount: Number(slot.baselineAssistantCount || 0),
+        recover: Boolean(slot.generationSubmittedAt && slot.generationId && slot.leaseId)
       }, 4000);
       if (response?.ok && ['READY', 'DOWNLOADING'].includes(String(response.value?.state || '').toUpperCase())) {
         downloadsStarted += 1;
@@ -5888,6 +6545,8 @@ async function resetRunAndRescan(options = {}) {
     currentAction: automatic
       ? 'Обновляю состояние расширения и сверяю сохранённые ревизии…'
       : 'Сбрасываю временную сессию и сверяю сохранённые ревизии…',
+    stopBlocked: null,
+    conversationRecovery: null,
     error: null,
     buildId: EXTENSION_BUILD_ID
   });
@@ -5913,6 +6572,11 @@ async function resetRunAndRescan(options = {}) {
   const recoveryTabIds = Object.keys(initialRun?.recoveryTabs || {})
     .map((tabId) => Number(tabId || 0))
     .filter((tabId) => tabId > 0);
+  const conversationTabIds = (initialRun?.conversationRecovery?.slots || [])
+    .flatMap((slot) => [slot.oldTabId, slot.reopenedTabId])
+    .concat((initialRun?.conversationRecovery?.closeTabs || []).map((item) => item.tabId))
+    .map((tabId) => Number(tabId || 0))
+    .filter((tabId) => tabId > 0);
   const windowTabs = automationWindowOwned && automationWindowId
     ? await chrome.tabs.query({ windowId: automationWindowId }).catch(() => [])
     : [];
@@ -5920,6 +6584,7 @@ async function resetRunAndRescan(options = {}) {
     ...slotTabIds,
     ...postprocessTabIds,
     ...recoveryTabIds,
+    ...conversationTabIds,
     ...windowTabs
       .filter((tab) => /^https:\/\/chatgpt\.com\//i.test(tab.url || tab.pendingUrl || ''))
       .map((tab) => Number(tab.id || 0))
@@ -6056,6 +6721,7 @@ async function resetRunAndRescan(options = {}) {
     await sendTabMessage(tabId, { type: 'STOP' }, 1500).catch(() => null);
     await chrome.tabs.remove(tabId).catch(() => null);
   }));
+  if (chrome.alarms?.clear) await chrome.alarms.clear(CONVERSATION_LOAD_RECOVERY_ALARM_NAME).catch(() => {});
   if (automationWindowOwned && automationWindowId) await chrome.windows.remove(automationWindowId).catch(() => {});
 
   await updateRuntime({
@@ -6068,6 +6734,8 @@ async function resetRunAndRescan(options = {}) {
     pending: 0,
     rateLimitPauseUntil: null,
     currentAction: `Сессия сброшена. Состояние восстановлено по сохранённым ревизиям: ${restoredFromRevisions}.`,
+    stopBlocked: null,
+    conversationRecovery: null,
     error: null,
     buildId: EXTENSION_BUILD_ID
   });
@@ -6592,7 +7260,7 @@ async function pauseRunOnError(runId, error, context = {}) {
   }
 }
 
-async function recoverVisibleResults(run) {
+async function recoverVisibleResults(run, { forceReload = false } = {}) {
   const stored = await getStored();
   if (!run || !stored.run || stored.run.operationId !== run.operationId) return [];
   const entries = groupEntries(stored.queue, run.groupId);
@@ -6621,7 +7289,7 @@ async function recoverVisibleResults(run) {
       generationId: recoveryGenerationId
     };
     try {
-      await reloadTabForRecovery(slot.tabId, slot.slotId);
+      await reloadTabForRecovery(slot.tabId, slot.slotId, { force: forceReload });
       await sendTabMessage(slot.tabId, {
         type: 'PREPARE_PAGE_RUN',
         operationId: run.operationId,
@@ -6699,7 +7367,7 @@ async function recoverVisibleResults(run) {
 }
 
 async function resumeRun(options = {}) {
-  await waitForStartupReconciliation();
+  if (options?.conversationRecoveryInternal !== true) await waitForStartupReconciliation();
   const preferredWindowId = Number(options?.preferredWindowId || 0);
   if (preferredWindowId) {
     const host = await chrome.windows.get(preferredWindowId).catch(() => null);
@@ -6713,6 +7381,9 @@ async function resumeRun(options = {}) {
   }
   const current = await getStored();
   if (!current.run || !['PAUSED', 'STOPPED'].includes(current.run.state)) throw new Error('Нет запуска, который можно продолжить');
+  if (['INSPECTING', 'WAITING', 'REOPENING'].includes(String(current.run.conversationRecovery?.stage || '').toUpperCase())) {
+    throw new Error('Идёт безопасное восстановление разговоров ChatGPT. Дождись его завершения.');
+  }
   if (current.run.imageLimitDetected === true && Number(current.run.rateLimitPauseUntil || 0) > Date.now()) {
     throw new Error(`Лимит создания изображений действует до ${clockTime(current.run.rateLimitPauseUntil)}. Очередь продолжится автоматически.`);
   }
@@ -6850,6 +7521,11 @@ async function resumeRun(options = {}) {
     run.pauseReason = null;
     run.error = null;
     run.unresolvedError = false;
+    run.stopBlocked = null;
+    if (String(run.conversationRecovery?.stage || '').toUpperCase() === 'FAILED') {
+      run.conversationRecovery.stage = 'MANUAL_RESUME';
+      run.conversationRecovery.manualResumeAt = new Date().toISOString();
+    }
     run.currentAction = 'Продолжаю незавершённые генерации';
     run.lastActivityAt = new Date().toISOString();
     run.generationPauseMinutes = normalizeGenerationPauseMinutes(run.generationPauseMinutes);
@@ -8502,6 +9178,15 @@ async function storeDiagnostics(diagnostic) {
 
 async function handleStateEvent(message, sender) {
   const patch = message.patch || {};
+  if (patch.state === 'CONVERSATION_LOAD_ERROR'
+    || String(patch.errorClass || '').toUpperCase() === AUTOMATION_ERROR_CLASSES.CONVERSATION_LOAD_ERROR) {
+    await beginConversationLoadRecovery(message.operationId, {
+      slotId: message.slotId,
+      entryId: message.entryId,
+      error: patch.error || 'Не удалось загрузить этот разговор ChatGPT'
+    });
+    return;
+  }
   if (patch.state === 'ERROR') {
     await pauseRunOnError(message.operationId, new Error(patch.error || 'Ошибка страницы'), {
       slotId: message.slotId,
@@ -8536,6 +9221,8 @@ async function handleStateEvent(message, sender) {
     const now = new Date().toISOString();
     slot.lastHeartbeatAt = now;
     if (patch.phase) slot.phase = patch.phase;
+    const reportedChatUrl = normalizeChatConversationUrl(message.chatUrl || sender?.tab?.url);
+    if (reportedChatUrl) slot.chatUrl = reportedChatUrl;
     if (!patch.phase) {
       const phaseByPageState = {
         CREATING_NEW_CHAT: SLOT_PHASES.PREPARING,

@@ -22,6 +22,8 @@ import {
   AUTOMATION_ERROR_CLASSES,
   classifyAutomationError,
   coalescedPauseDeadline,
+  CONVERSATION_LOAD_RECOVERY_DELAY_MS,
+  GENERATION_TRANSPORT_REFRESH_AFTER_MS,
   imageLimitResumeAt,
   normalizeGenerationJitterSeconds,
   normalizeGenerationPauseMinutes,
@@ -32,7 +34,8 @@ import {
   sampleGenerationPause,
   stableHash,
   generationId,
-  isMeaningfulProgress
+  isMeaningfulProgress,
+  shouldRefreshUnresponsiveGeneration
 } from '../extension/reliability-utils.js';
 import {
   referenceDescriptorForPath,
@@ -454,13 +457,21 @@ test('host-window resolver uses the supplied window without creating a Chrome wi
 });
 
 test('new slot lease clears every previous revision and page binding before reassignment', async () => {
-  const cleared = { ...{ generationId: 'old', factsJobId: 'old-facts', pageRunAcceptedAt: 'old-page', rendererBootstrappedAt: 'old-renderer', outputFileName: 'old.png', lastSendClickedAt: '2026-09-27T20:00:00Z' }, ...freshSlotRevisionFields() };
+  const cleared = { ...{
+    generationId: 'old', factsJobId: 'old-facts', pageRunAcceptedAt: 'old-page',
+    rendererBootstrappedAt: 'old-renderer', outputFileName: 'old.png',
+    lastSendClickedAt: '2026-09-27T20:00:00Z', noResponseSince: '2026-09-27T20:00:00Z',
+    autoRefreshGenerationId: 'old', autoRefreshAt: '2026-09-27T20:00:00Z'
+  }, ...freshSlotRevisionFields() };
   assert.equal(cleared.generationId, null);
   assert.equal(cleared.factsJobId, null);
   assert.equal(cleared.outputFileName, null);
   assert.equal(cleared.pageRunAcceptedAt, null);
   assert.equal(cleared.rendererBootstrappedAt, null);
   assert.equal(cleared.lastSendClickedAt, null);
+  assert.equal(cleared.noResponseSince, null);
+  assert.equal(cleared.autoRefreshGenerationId, null);
+  assert.equal(cleared.autoRefreshAt, null);
   const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
   assert.equal((worker.match(/\.\.\.freshSlotRevisionFields\(\)/g) || []).length, 2, 'ordinary claim and resume both reset identity');
   assert.match(worker, /Slot generation identity does not match its current SKU and lease/);
@@ -648,6 +659,73 @@ test('generated image is found through current accessible label even when legacy
   assert.equal(resolver.assistantTurns().length, 1);
   assert.equal(resolver.userTurns().length, 1);
   assert.equal(resolver.generatedImage(), image);
+});
+
+test('ChatGPT conversation load error requires the visible error text and a visible Retry button', async () => {
+  const source = await readFile(path.join(extensionDir, 'selector-resolver.js'), 'utf8');
+  class Element {
+    constructor({ tag = 'div', text = '', ariaLabel = '' } = {}) {
+      this.tagName = tag.toUpperCase();
+      this.innerText = text;
+      this.textContent = text;
+      this.isConnected = true;
+      this.parentElement = null;
+      this.children = [];
+      this.attributes = { 'aria-label': ariaLabel };
+    }
+    append(child) { child.parentElement = this; this.children.push(child); }
+    getAttribute(name) { return this.attributes[name] || null; }
+    getBoundingClientRect() { return { width: 160, height: 30 }; }
+    querySelectorAll(selector) {
+      const found = [];
+      const visit = (element) => {
+        for (const child of element.children) {
+          if (selector === 'button, [role="button"]' && child.tagName === 'BUTTON') found.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return found;
+    }
+  }
+  const retry = new Element({ tag: 'button', text: 'Повторить' });
+  const alert = new Element({ text: 'Не удалось загрузить этот разговор ChatGPT Повторить' });
+  alert.append(retry);
+  const document = { querySelectorAll: (selector) => selector === 'button, [role="button"]' ? [retry] : [] };
+  const window = { __WATCH_AUTOMATION_ENABLED__: true };
+  runInNewContext(source, {
+    window, document, Element,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' })
+  });
+  assert.equal(window.WatchSelectorResolver.visibleConversationLoadError(), alert);
+  alert.innerText = alert.textContent = 'Попробуйте обновить страницу';
+  assert.equal(window.WatchSelectorResolver.visibleConversationLoadError(), null);
+});
+
+test('conversation load error is reported only when no generated image is already available', async () => {
+  const source = await readFile(path.join(extensionDir, 'chatgpt-adapter.js'), 'utf8');
+  const errorCard = { innerText: 'Не удалось загрузить этот разговор ChatGPT Повторить' };
+  const image = {
+    src: 'https://chatgpt.com/backend-api/estuary/content/ready.png',
+    currentSrc: '', alt: 'Сгенерированное изображение 1', complete: true,
+    naturalWidth: 1024, naturalHeight: 1365,
+    getAttribute: () => null
+  };
+  let hasImage = false;
+  const resolver = {
+    assistantTurns: () => [], userTurns: () => [], latestAssistantTurn: () => null,
+    generatedImage: () => hasImage ? image : null,
+    visibleConversationLoadError: () => errorCard,
+    dismissRateLimitDialog: () => ({ detected: false }), rateLimitDialog: () => null,
+    visibleErrors: () => [], stopGeneratingButton: () => null,
+    hasResponseActions: () => false
+  };
+  const window = { __WATCH_AUTOMATION_ENABLED__: true, WatchSelectorResolver: resolver };
+  runInNewContext(source, { window, document: {}, setTimeout, clearTimeout, AbortController, DOMException });
+  const adapter = window.WatchChatGPTAdapter;
+  assert.equal(adapter.inspectGeneratedImage().state, 'CONVERSATION_LOAD_ERROR');
+  hasImage = true;
+  assert.equal(adapter.inspectGeneratedImage().state, 'READY');
 });
 
 test('long image generation remains observable with zero legacy assistant turns', async () => {
@@ -1074,6 +1152,29 @@ test('intentional user-pause cancellation is distinguishable from a generation f
   assert.equal(isUserPauseCancellation('Запуск генерации отменён: очередь больше не активна'), true);
   assert.equal(isUserPauseCancellation('Отправка генерации отменена у физического Send-gate'), true);
   assert.equal(isUserPauseCancellation('PNG verification failed'), false);
+});
+
+test('submitted generation refresh is bounded to one reload after four minutes without a tab response', () => {
+  const now = 2_000_000_000_000;
+  const base = {
+    tabId: 14,
+    generationId: 'gen-1',
+    leaseId: 'lease-1',
+    generationSubmittedAt: new Date(now - 10 * 60_000).toISOString(),
+    noResponseSince: new Date(now - GENERATION_TRANSPORT_REFRESH_AFTER_MS).toISOString()
+  };
+  assert.equal(GENERATION_TRANSPORT_REFRESH_AFTER_MS, 4 * 60_000);
+  assert.equal(shouldRefreshUnresponsiveGeneration(base, now), true);
+  assert.equal(shouldRefreshUnresponsiveGeneration({ ...base, noResponseSince: new Date(now - GENERATION_TRANSPORT_REFRESH_AFTER_MS + 1).toISOString() }, now), false);
+  assert.equal(shouldRefreshUnresponsiveGeneration({ ...base, autoRefreshGenerationId: 'gen-1' }, now), false);
+  assert.equal(shouldRefreshUnresponsiveGeneration({ ...base, downloadId: 7 }, now), false);
+  assert.equal(shouldRefreshUnresponsiveGeneration({ ...base, generationSubmittedAt: null }, now), false);
+});
+
+test('load-error classification and recovery delay are stable and explicit', () => {
+  assert.equal(CONVERSATION_LOAD_RECOVERY_DELAY_MS, 2 * 60_000);
+  assert.equal(classifyAutomationError('Не удалось загрузить этот разговор ChatGPT'), AUTOMATION_ERROR_CLASSES.CONVERSATION_LOAD_ERROR);
+  assert.equal(classifyAutomationError('Повторить'), AUTOMATION_ERROR_CLASSES.UNKNOWN);
 });
 
 test('gallery physical PNG counter includes archived files while keeping gallery cards separate', () => {
@@ -1801,4 +1902,43 @@ test('submitted generation observation can recover an evicted page cache without
   assert.match(checkBlock, /promptSent: true/);
   assert.match(checkBlock, /preparedForSubmit: false/);
   assert.doesNotMatch(checkBlock, /prepareRunForSubmit\(|submitPreparedRun\(|clickSendPrompt\(/);
+});
+
+test('conversation load recovery pauses sends, closes only recorded worker tabs, waits, and checks saved chats without resending', async () => {
+  const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
+  const panel = await readFile(path.join(extensionDir, 'sidepanel.js'), 'utf8');
+  const recoveryStart = worker.indexOf('async function beginConversationLoadRecoveryInternal');
+  const recoveryEnd = worker.indexOf('function automationConversationUrl', recoveryStart);
+  const recovery = worker.slice(recoveryStart, recoveryEnd);
+  const failureRecovery = worker.slice(worker.indexOf('async function failConversationLoadRecovery'), recoveryStart);
+  const probeStart = recovery.indexOf('const probes = await Promise.all');
+  const probeBlock = recovery.slice(probeStart, recovery.indexOf('if (failedProbe)', probeStart));
+  const resetStart = worker.indexOf('async function resetRunAndRescan(options = {})');
+  const resetEnd = worker.indexOf('async function clearGenerationHistory', resetStart);
+  const reset = worker.slice(resetStart, resetEnd);
+  const interruptedStart = worker.indexOf('async function recoverInterruptedRun(reason)');
+  const interruptedEnd = worker.indexOf('function hasObservationWork', interruptedStart);
+  const interrupted = worker.slice(interruptedStart, interruptedEnd);
+
+  assert.match(recovery, /stage: 'INSPECTING'/);
+  assert.match(recovery, /stage: 'WAITING'/);
+  assert.match(recovery, /CONVERSATION_LOAD_RECOVERY_DELAY_MS/);
+  assert.match(recovery, /closeTabs: closeTabRecords/);
+  assert.match(recovery, /slot\.leaseId !== submitted\.leaseId/);
+  assert.match(recovery, /chatTabFingerprint\(actualChatUrl\) !== chatTabFingerprint\(savedChatUrl\)/);
+  assert.doesNotMatch(recovery, /if \(!tab \|\| !urlFingerprint/);
+  assert.match(failureRecovery, /stage: 'FAILED'/);
+  assert.match(probeBlock, /type: 'CHECK_GENERATION'/);
+  assert.match(probeBlock, /recover: true/);
+  assert.doesNotMatch(probeBlock, /type: 'PREPARE_PAGE_CONTENT'|submitPreparedSlot\(|clickSendPrompt\(/);
+  assert.match(worker, /async function closeConversationRecoveryTabs\(/);
+  assert.match(worker, /initialRun && recoveryStage === 'INSPECTING'[\s\S]*?beginConversationLoadRecovery\(/);
+  assert.match(worker, /initialRun && \['WAITING', 'REOPENING'\]\.includes\(recoveryStage\)[\s\S]*?closeConversationRecoveryTabs\(/);
+  assert.match(reset, /\.\.\.conversationTabIds/);
+  assert.match(reset, /conversationRecovery\?\.closeTabs/);
+  assert.match(panel, /runtime\.stopBlocked/);
+  assert.match(panel, /function stopOrResetRun\(\)/);
+  assert.match(panel, /conversationRecoveryBusy = \['INSPECTING', 'WAITING', 'REOPENING'\]/);
+  assert.match(interrupted, /Восстанавливаю сессию после обновления расширения без сброса очереди/);
+  assert.doesNotMatch(interrupted, /buildChanged[\s\S]{0,180}resetRunAndRescan\(/);
 });

@@ -24,6 +24,7 @@ export const SLOT_PHASES = Object.freeze({
 
 export const AUTOMATION_ERROR_CLASSES = Object.freeze({
   RATE_LIMIT: 'RATE_LIMIT',
+  CONVERSATION_LOAD_ERROR: 'CONVERSATION_LOAD_ERROR',
   AUTH_REQUIRED: 'AUTH_REQUIRED',
   SECURITY_CHALLENGE: 'SECURITY_CHALLENGE',
   NETWORK: 'NETWORK',
@@ -39,6 +40,16 @@ export const AUTOMATION_ERROR_CLASSES = Object.freeze({
   TIMEOUT: 'TIMEOUT',
   UNKNOWN: 'UNKNOWN'
 });
+
+export const CONVERSATION_LOAD_RECOVERY_DELAY_MS = 2 * 60 * 1000;
+export const GENERATION_TRANSPORT_REFRESH_AFTER_MS = 4 * 60 * 1000;
+
+export function shouldRefreshUnresponsiveGeneration(slot, now = Date.now(), thresholdMs = GENERATION_TRANSPORT_REFRESH_AFTER_MS) {
+  if (!slot?.tabId || !slot?.generationId || !slot?.leaseId || !slot?.generationSubmittedAt || slot?.downloadId) return false;
+  if (String(slot.autoRefreshGenerationId || '') === String(slot.generationId)) return false;
+  const since = Date.parse(slot.noResponseSince || '');
+  return Number.isFinite(since) && since > 0 && Number(now) - since >= Number(thresholdMs);
+}
 
 // Defaults preserve roughly the previous 8–12 second Send spacing until the
 // user chooses their own base pause and spread in the side panel.
@@ -161,6 +172,9 @@ export function classifyAutomationError(error, context = {}) {
   }
   if (context.securityChallenge || /captcha|проверка\s+безопасности|security\s+check|challenge/.test(value)) {
     return AUTOMATION_ERROR_CLASSES.SECURITY_CHALLENGE;
+  }
+  if (/не\s+удалось\s+загрузить\s+этот\s+разговор\s+chatgpt/.test(value)) {
+    return AUTOMATION_ERROR_CLASSES.CONVERSATION_LOAD_ERROR;
   }
   if (/network|offline|fetch|connection|соединен|сеть|нет\s+ответа/.test(value)) {
     return AUTOMATION_ERROR_CLASSES.NETWORK;
