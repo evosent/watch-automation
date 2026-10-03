@@ -8,11 +8,16 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('GitHub installer verifies release assets and preserves an existing watch-photo folder', async () => {
   const installer = await readFile(path.join(root, 'Install_From_GitHub.ps1'), 'utf8');
+  const installerBytes = await readFile(path.join(root, 'Install_From_GitHub.ps1'));
   const bootstrap = await readFile(path.join(root, 'INSTALL_FROM_GITHUB.cmd'), 'utf8');
   const builder = await readFile(path.join(root, 'scripts/build-release-packages.mjs'), 'utf8');
 
+  assert.deepEqual(installerBytes.subarray(0, 3), Buffer.from([0xef, 0xbb, 0xbf]));
   assert.match(bootstrap, /releases\/latest\/download\/Install_From_GitHub\.ps1/);
   assert.match(installer, /api\.github\.com\/repos\//);
+  assert.match(installer, /\$matchingAssets = @\(/);
+  assert.match(installer, /return \$matchingAssets\[0\]/);
+  assert.doesNotMatch(installer, /\$matches\s*=\s*@\(/i);
   assert.match(installer, /Get-FileHash .*SHA256/);
   assert.match(installer, /browser_download_url/);
   assert.match(installer, /watch-photos-v1/);

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$InstallBase = (Join-Path $env:LOCALAPPDATA "WatchAutomation"),
     [switch]$NoLaunch,
@@ -34,14 +34,14 @@ function Get-Release([string]$Uri) {
 }
 
 function Find-ReleaseAsset($Release, [string]$Name) {
-    $matches = @($Release.assets | Where-Object { $_.name -ceq $Name -and $_.state -eq "uploaded" })
-    if ($matches.Count -ne 1) {
+    $matchingAssets = @($Release.assets | Where-Object { $_.name -ceq $Name -and $_.state -eq "uploaded" })
+    if ($matchingAssets.Count -ne 1) {
         throw "В релизе $($Release.tag_name) должен находиться ровно один файл $Name."
     }
-    if ($matches[0].digest -notmatch "^sha256:([0-9a-fA-F]{64})$") {
+    if ($matchingAssets[0].digest -notmatch "^sha256:([0-9a-fA-F]{64})$") {
         throw "GitHub не вернул SHA-256 для $Name. Повтори попытку позже."
     }
-    return $matches[0]
+    return $matchingAssets[0]
 }
 
 function Remove-PartialDownload([string]$Path) {
