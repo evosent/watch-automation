@@ -7,11 +7,11 @@
 ## Публикация новой версии
 
 1. Увеличить `version` в `extension/manifest.json`.
-2. Собрать ZIP командой `npm run build:update`. Результат появится в `dist/watch-automation-update.zip`.
-3. Создать стабильный GitHub Release с тегом `v<версия>` и приложить этот архив под точным именем `watch-automation-update.zip`. Удобная команда из PowerShell:
+2. Собрать файлы командой `npm run build:release`. Она также запускает `build:update`; в `dist` появятся обновляющий ZIP, полный установочный ZIP, скрипты установки, TAR фототеки и манифест.
+3. Создать стабильный GitHub Release с тегом `v<версия>`. Приложить `watch-automation-update.zip`, `watch-automation-bootstrap.zip`, `watch-automation-installer-package.zip`, `INSTALL_FROM_GITHUB.cmd` и `Install_From_GitHub.ps1`. Например:
 
    ```powershell
-   gh release create v0.3.32 dist/watch-automation-update.zip --title "WatchAutomation 0.3.32" --notes "Обновление расширения, промптов и референсов"
+   gh release create v0.3.33 dist/watch-automation-update.zip dist/watch-automation-bootstrap.zip dist/watch-automation-installer-package.zip INSTALL_FROM_GITHUB.cmd Install_From_GitHub.ps1 --title "WatchAutomation 0.3.33" --notes "Обновление приложения и установщика"
    ```
 
 Пользователям нужен доступ к публичному репозиторию. Если они уже используют сборку с кнопкой обновления, она скачает архив из последнего стабильного релиза. Для установки вручную запусти `UPDATE_WatchAutomation.cmd` после закрытия рабочего Chrome и подтверждения в консоли.
@@ -19,3 +19,18 @@
 Для старой сборки без кнопки и без скрипта обновления: один раз скачай `watch-automation-bootstrap.zip` из [последнего релиза](https://github.com/evosent/watch-automation/releases/latest), распакуй его в корневую папку WatchAutomation и запусти `UPDATE_WatchAutomation.cmd`. В стартовом пакете лежат только скрипт и два файла обновлятора; входные фото и референсы он не содержит.
 
 GitHub Releases поддерживает скачивание приложенного файла по стабильной ссылке на последний релиз: <https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases>.
+
+## Установка через GitHub
+
+Друзьям можно отправить прямую ссылку на командный установщик:
+https://github.com/evosent/watch-automation/releases/latest/download/INSTALL_FROM_GITHUB.cmd
+
+Он получает PowerShell-установщик из последнего стабильного релиза. Установщик загружает ZIP приложения через GitHub API, сверяет размер и SHA-256 с метаданными GitHub, затем скачивает фототеку из отдельного prerelease-релиза с тегом `watch-photos-v1`. В установочный ZIP входят исходники приложения и `input-ref-images/`, папка `input-watches-images/` исключена.
+
+Фототека опубликована отдельным TAR-файлом, так как GitHub ограничивает размер каждого release asset значением меньше 2 ГиБ. Тег данных остаётся prerelease, поэтому он не подменяет последний стабильный релиз приложения. Установщик скачивает TAR только тогда, когда локальная `input-watches-images/` отсутствует или пуста. Если папка уже содержит изображения, локальная фототека сохраняется. Кнопка обновления в расширении передаёт только код, промпты и референсы.
+
+После изменения состава фототеки выпусти новый тег данных и обнови его в `Install_From_GitHub.ps1`. Обычные обновления приложения не требуют публикации нового архива с часами.
+
+Архив фототеки публикуется один раз отдельным prerelease:
+
+   gh release create watch-photos-v1 dist/watch-photos-v1.tar dist/watch-photos-manifest.json --prerelease --title "WatchAutomation photo library v1" --notes "Первичная версия входной фототеки"
