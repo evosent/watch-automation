@@ -18,7 +18,9 @@ test('GitHub installer verifies release assets and preserves an existing watch-p
   assert.match(installer, /\$matchingAssets = @\(/);
   assert.match(installer, /return \$matchingAssets\[0\]/);
   assert.doesNotMatch(installer, /\$matches\s*=\s*@\(/i);
-  assert.match(installer, /Get-FileHash .*SHA256/);
+  assert.match(installer, /function Get-Sha256Hex/);
+  assert.match(installer, /\.ComputeHash\(\$stream\)/);
+  assert.doesNotMatch(installer, /Get-FileHash/);
   assert.match(installer, /browser_download_url/);
   assert.match(installer, /watch-photos-v1/);
   assert.match(installer, /if \(\$existing\.Count -gt 0\)/);

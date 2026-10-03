@@ -44,6 +44,18 @@ function Find-ReleaseAsset($Release, [string]$Name) {
     return $matchingAssets[0]
 }
 
+function Get-Sha256Hex([string]$Path) {
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $hash = $algorithm.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $algorithm.Dispose()
+    }
+}
+
 function Remove-PartialDownload([string]$Path) {
     if (Test-Path -LiteralPath $Path) {
         Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
@@ -86,7 +98,7 @@ function Download-VerifiedAsset($Asset, [string]$Destination) {
     }
 
     Write-Host "Проверка SHA-256..."
-    $actualDigest = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualDigest = Get-Sha256Hex -Path $Destination
     $expectedDigest = ([regex]::Match([string]$Asset.digest, "^sha256:([0-9a-fA-F]{64})$")).Groups[1].Value.ToLowerInvariant()
     if ($actualDigest -ne $expectedDigest) {
         Remove-PartialDownload $Destination
