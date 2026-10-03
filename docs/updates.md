@@ -16,4 +16,6 @@
 
 Пользователям нужен доступ к публичному репозиторию. Если они уже используют сборку с кнопкой обновления, она скачает архив из последнего стабильного релиза. Для установки вручную запусти `UPDATE_WatchAutomation.cmd` после закрытия рабочего Chrome и подтверждения в консоли.
 
+Для старой сборки без кнопки и без скрипта обновления: один раз скачай `watch-automation-bootstrap.zip` из [последнего релиза](https://github.com/evosent/watch-automation/releases/latest), распакуй его в корневую папку WatchAutomation и запусти `UPDATE_WatchAutomation.cmd`. В стартовом пакете лежат только скрипт и два файла обновлятора; входные фото и референсы он не содержит.
+
 GitHub Releases поддерживает скачивание приложенного файла по стабильной ссылке на последний релиз: <https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases>.

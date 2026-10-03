@@ -11,6 +11,11 @@ const UPDATE_FILES = [
   'dev/update-utils.mjs',
   'dev/update-watch-automation.mjs'
 ];
+const BOOTSTRAP_FILES = [
+  'UPDATE_WatchAutomation.cmd',
+  'dev/update-utils.mjs',
+  'dev/update-watch-automation.mjs'
+];
 const ROOT_IMAGE_EXTENSION = /\.(?:png|jpe?g|webp)$/i;
 const IGNORED_FILE_NAMES = new Set(['Thumbs.db', 'desktop.ini', '.DS_Store']);
 
@@ -68,14 +73,20 @@ async function main() {
   if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('В manifest.json требуется версия вида 0.3.32');
   const releaseTag = buildTag(version);
   const stageRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'watch-automation-update-build-'));
+  const bootstrapRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'watch-automation-bootstrap-build-'));
   const outputPath = path.join(PROJECT_ROOT, 'dist', 'watch-automation-update.zip');
+  const bootstrapOutputPath = path.join(PROJECT_ROOT, 'dist', 'watch-automation-bootstrap.zip');
 
   try {
     await fs.mkdir(path.join(stageRoot, 'dev'), { recursive: true });
+    await fs.mkdir(path.join(bootstrapRoot, 'dev'), { recursive: true });
     await copyTree(path.join(PROJECT_ROOT, 'extension'), path.join(stageRoot, 'extension'));
     await copyTree(path.join(PROJECT_ROOT, 'input-ref-images'), path.join(stageRoot, 'input-ref-images'), { imageOnly: true });
     for (const relative of UPDATE_FILES) {
       await fs.copyFile(path.join(PROJECT_ROOT, relative), path.join(stageRoot, ...relative.split('/')));
+    }
+    for (const relative of BOOTSTRAP_FILES) {
+      await fs.copyFile(path.join(PROJECT_ROOT, relative), path.join(bootstrapRoot, ...relative.split('/')));
     }
 
     const files = (await collectFiles(stageRoot)).sort((left, right) => left.path.localeCompare(right.path));
@@ -104,9 +115,22 @@ async function main() {
       '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psScript
     ], { stdio: 'inherit' });
 
+    const bootstrapPowerShell = [
+      '$ErrorActionPreference = "Stop"',
+      `$source = ${quotePowerShell(path.join(bootstrapRoot, '*'))}`,
+      `$destination = ${quotePowerShell(bootstrapOutputPath)}`,
+      'Compress-Archive -Path $source -DestinationPath $destination -CompressionLevel Optimal -Force'
+    ].join('\n');
+    execFileSync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', bootstrapPowerShell
+    ], { stdio: 'inherit' });
+
     const archive = await fs.readFile(outputPath);
     const digest = sha256(archive);
     await fs.writeFile(`${outputPath}.sha256`, `${digest}  ${path.basename(outputPath)}\n`, 'utf8');
+    const bootstrapArchive = await fs.readFile(bootstrapOutputPath);
+    const bootstrapDigest = sha256(bootstrapArchive);
+    await fs.writeFile(`${bootstrapOutputPath}.sha256`, `${bootstrapDigest}  ${path.basename(bootstrapOutputPath)}\n`, 'utf8');
     console.log(`Пакет: ${outputPath}`);
     console.log(`Тег GitHub Release: ${releaseTag}`);
     console.log(`Версия расширения: ${version}`);
@@ -114,8 +138,11 @@ async function main() {
     console.log(`Архив: ${(archive.length / 1024 / 1024).toFixed(1)} МБ`);
     console.log(`SHA-256: ${digest}`);
     console.log('input-watches-images в пакет не включается.');
+    console.log(`Стартовый пакет: ${bootstrapOutputPath}`);
+    console.log(`Стартовый пакет SHA-256: ${bootstrapDigest}`);
   } finally {
     await fs.rm(stageRoot, { recursive: true, force: true });
+    await fs.rm(bootstrapRoot, { recursive: true, force: true });
   }
 }
 
