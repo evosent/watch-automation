@@ -1,5 +1,6 @@
 ПРОФИЛЬ CASIO
 
+УТП: оба УТП формулируй только на русском языке, без английских слов. Это правило относится только к двум УТП; остальные элементы карточки оформляй по общим правилам и шаблону.
 ЗАКРЫТЫЙ СЛОВАРЬ СЕРИЙ И ЛИНЕЕК: Classic, G-SHOCK, BABY-G, EDIFICE, PRO TREK, OCEANUS, SHEEN, VINTAGE, COLLECTION, CASIOTRON, MR-G, MT-G, G-STEEL, MASTER OF G, G-SHOCK MOVE, G-MS, G-LIDE, LINEAGE, DATA BANK.
 ИСТОЧНИКИ: официальный сайт Casio, страница линейки и инструкция. Подлинейки ROUND, ICONIC, MINI и EDGY нормализуй к VINTAGE только при связи с конкретным кодом.
 ПРАВИЛО ПЕЧАТИ: в строке 1 пиши «Casio», во строке 2 — только токен серии из словаря. Для VINTAGE и COLLECTION не добавляй слово Casio во вторую строку; печатные формы этих токенов — «Vintage» и «Collection». Для BABY-G, G-SHOCK, EDIFICE и остальных серий также не повторяй бренд.

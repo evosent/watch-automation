@@ -181,9 +181,9 @@ const BRAND_PROFILE_META = Object.freeze({
     displayName: 'Pagani Design',
     promptPath: 'prompts/brands/pagani-design.txt',
     fallbackSeries: null,
-    // Pagani Design is handled as a fixed two-line brand lock. Product
-    // category words and homage references must never become a third title
-    // line, so this profile deliberately has no series vocabulary.
+    // Pagani Design uses two fixed brand lines followed by a smaller model
+    // line. Product category words and homage references are excluded, and
+    // this profile deliberately has no series vocabulary.
     series: Object.freeze([]),
     aliases: Object.freeze([])
   }),
@@ -552,8 +552,8 @@ export function buildTitleContract(modelName, options = {}) {
       'Этот контракт имеет приоритет над общими формулировками о заголовке. Это не рекомендация, а фиксированная разметка.',
       `Строка 1: «${spec.fixedLines[0]}»`,
       `Строка 2: «${spec.fixedLines[1]}»`,
-      `Строка 3: «${spec.fixedLines[2]}»`,
-      'Не объединяй строки, не удаляй строку 2 и не переносись в двухстрочный вариант. Если не хватает места, уменьши кегль, сохранив три отдельные базовые строки.',
+      `Строка 3: модель «${spec.fixedLines[2]}» меньшим кеглем, чем строки 1 и 2.`,
+      'Не добавляй серии. Не объединяй брендовые строки и не удаляй строку 2. Если не хватает места, уменьши кегль модели, сохранив три отдельные строки.',
       `Сохрани позиции, межстрочный ритм и ширину блока из ${templateRef}. Отсутствующая или объединённая строка считается ошибкой результата.`
     ].join('\n');
   }
@@ -623,11 +623,11 @@ function buildPaganiBrandInstruction(modelName, options = {}) {
   return [
     'ПРОФИЛЬ БРЕНДА PAGANI DESIGN — ФИКСИРОВАННАЯ РАЗМЕТКА',
     `— Бренд этой генерации: Pagani Design. Брендовый знак шапки уже зафиксирован в ${templateRef} и сохраняется без перерисовки.`,
-    '— Блок названия всегда состоит из двух брендовых строк и одной технической строки:',
-    '  1) «Pagani»; 2) «Design»; 3) полный технический код модели.',
-    `— Для этой модели технический код: ${codeLabel}. Выведи его один раз в третьей строке, без сокращений и дублей.`,
-    '— После строки «Design» ничего не добавляй: названия коллекций, категорий, механизмов, назначения и homage-моделей в блок названия не попадают.',
-    `— Сохрани межстрочный ритм, размеры, позицию и композицию текстового блока из ${templateRef}.`
+    '— Блок названия состоит из двух брендовых строк и строки модели меньшим кеглем:',
+    '  1) «Pagani»; 2) «Design»; 3) название модели с полным техническим кодом.',
+    `— Для этой модели технический код: ${codeLabel}. Выведи его один раз в третьей строке, без сокращений и дублей; строку модели сделай заметно меньше двух брендовых строк.`,
+    '— Серии для Pagani Design не используются. Между «Design» и моделью серию не вставляй. После строки модели ничего не добавляй: категории, механизмы, назначение и homage-модели исключены из блока названия.',
+    `— Сохрани межстрочный ритм, позицию и композицию текстового блока из ${templateRef}; визуальную иерархию соблюдай: Pagani / Design крупно, модель меньшим кеглем.`
   ].join('\n');
 }
 

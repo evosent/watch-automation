@@ -2,6 +2,8 @@ import './facts-json-utils.js';
 import {
   QUEUE_GROUP_IDS,
   REGENERATION_QUEUE_ID,
+  RUN_PART_SIZE,
+  WATCH_BRAND_FILTERS,
   applyGenerationHistory,
   applyGenerationMemory,
   filterFromQueueGroup,
@@ -18,6 +20,8 @@ import {
   normalizeRunLimit,
   normalizeWatchFilter,
   normalizeWorkerCount,
+  queuePartPlan,
+  queueEntriesForPart,
   pendingEntryIdsForFilter,
   parseFilterSelectionId,
   queueGroupsFromCatalog,
@@ -34,7 +38,7 @@ import {
   getGenerationRevision, getAllGenerationRevisions, getAllModelCatalog, upsertGenerationRevision,
   beginGenerationRevision, cancelUnsubmittedGenerationRevision,
   persistGenerationImageRevision, persistGenerationFactsRevision,
-  rejectGenerationRevision
+  rejectGenerationRevision, saveRunDiagnostics
 } from './idb.js';
 import { buildInputPlan, normalizeInputMode, DEFAULT_INPUT_MODE } from './input-plan.js';
 import { verifiedRevisionMatchesEvent, freshSlotRevisionFields, canAuditSlot } from './generation-revision-utils.js';
@@ -46,6 +50,7 @@ import {
   excludeRepairQueueEntries
 } from './repair-queue-utils.js';
 import { brandPromptPath, buildGenerationPrompt, detectBrandProfile, resolveTitleSpec } from './prompt-profiles.js';
+import { runDiagnosticHeader, sanitizeRunDiagnosticEvent } from './run-diagnostics-utils.js';
 import {
   AUTOMATION_ERROR_CLASSES,
   CONVERSATION_LOAD_RECOVERY_DELAY_MS,
@@ -64,7 +69,9 @@ import {
   retryDelayMs,
   scheduledRunRetries,
   stableHash,
-  shouldRefreshUnresponsiveGeneration
+  shouldRefreshUnresponsiveGeneration,
+  findStalledBatchRecoveryCandidate,
+  STALLED_BATCH_RECOVERY_DELAY_MS
 } from './reliability-utils.js';
 
 const DEFAULT_WORKERS = 4;
@@ -98,10 +105,14 @@ const MIN_RATE_LIMIT_PAUSE_MINUTES = 1;
 const MAX_RATE_LIMIT_PAUSE_MINUTES = 30;
 const RATE_LIMIT_RESUME_ALARM_NAME = 'watch-automation-rate-limit-resume';
 const CONVERSATION_LOAD_RECOVERY_ALARM_NAME = 'watch-automation-conversation-load-recovery';
+const STALLED_BATCH_RECOVERY_ALARM_NAME = 'watch-automation-stalled-batch-recovery';
 const REVISION_FACTS_RECOVERY_ALARM_NAME = 'watch-automation-revision-facts-recovery';
 const DEV_RELOAD_ALARM_NAME = 'watch-automation-dev-reload';
 const DEV_RELOAD_STATUS_URL = 'http://127.0.0.1:17321/status';
 const DEV_RELOAD_POLL_TIMEOUT_MS = 1200;
+const DEV_UPDATE_STATUS_URL = 'http://127.0.0.1:17321/update/status';
+const DEV_UPDATE_START_URL = 'http://127.0.0.1:17321/update';
+const DEV_UPDATE_APPLY_URL = 'http://127.0.0.1:17321/update/apply';
 const DEV_CONTROL_URL = 'http://127.0.0.1:17321/control';
 const DEV_LOCAL_INPUT_FILES_URL = 'http://127.0.0.1:17321/local-input-files';
 const DEV_LOCAL_INPUT_FILE_URL = 'http://127.0.0.1:17321/local-input-file';
@@ -120,7 +131,7 @@ const SLOT_PROBE_TIMEOUT_MS = 8000;
 const GLOBAL_NO_PROGRESS_WINDOW_MS = 300000;
 const MAX_RUN_EVENTS = 600;
 const OUTPUT_VERIFY_TIMEOUT_MS = 2000;
-const EXTENSION_BUILD_ID = '2026-09-28.1';
+const EXTENSION_BUILD_ID = '2026-10-03.1';
 const PROMPT_PIPELINE_VERSION = '6';
 const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
@@ -155,6 +166,7 @@ const imageLimitTasks = new Map();
 const activeFactsSendTasks = new Map();
 const revisionFactsRecoveryTasks = new Map();
 const conversationRecoveryRuns = new Set();
+const stalledBatchRecoveryRuns = new Set();
 // In-memory bridge between chrome.downloads.download() and the deferred state
 // write. It lets DOWNLOAD_GENERATED return immediately without risking a very
 // fast download completing before slot.downloadId reaches storage.
@@ -180,6 +192,7 @@ let logFlushChain = Promise.resolve();
 let automationWindowPromise = null;
 let automationWindowPromiseRunId = null;
 let interruptedRecoveryPromise = null;
+let resetRunPromise = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -288,8 +301,22 @@ async function rehydrateWorkerWake() {
   // manual PAUSED state. Recreate only the in-memory tasks that suspension can
   // lose; persisted slot/page ownership remains authoritative.
   const stored = await getStored();
+  if (stored.sessionResetIntent) {
+    void resumeInterruptedSessionReset(stored.sessionResetIntent).catch((error) => appendLog(
+      'Не удалось завершить запрошенный сброс после пробуждения расширения', { error: error.message }
+    ));
+    return;
+  }
   const run = stored.run;
   if (!run) return;
+  const batchRecoveryStage = String(run.stalledBatchRecovery?.stage || '').toUpperCase();
+  if (['CLOSING', 'WAITING', 'RESTARTING'].includes(batchRecoveryStage)) {
+    void restoreStalledBatchRecovery(run.operationId).catch((error) => appendLog(
+      'Ошибка восстановления отложенного перезапуска рабочих вкладок', { error: error.message }
+    ));
+    return;
+  }
+  if (batchRecoveryStage === 'FAILED') return;
   const conversationStage = String(run.conversationRecovery?.stage || '').toUpperCase();
   if (conversationStage === 'INSPECTING') {
     void beginConversationLoadRecovery(run.operationId, {
@@ -411,13 +438,110 @@ function ensureSlotGenerationIdentity(run, slot, entry, generationMemory = null)
 function recordRunEvent(run, type, data = {}) {
   if (!run) return;
   const events = Array.isArray(run.eventJournal) ? run.eventJournal : [];
+  let sequence = Number(run.eventSequence || 0);
+  if (events.some((event) => !Number(event?.sequence))) {
+    if (!events.length) sequence = Math.max(sequence, Number(run.eventCount || 0));
+    for (const event of events) {
+      if (!Number(event?.sequence)) {
+        event.sequence = ++sequence;
+        event.operationId = run.operationId || null;
+      } else {
+        sequence = Math.max(sequence, Number(event.sequence));
+      }
+    }
+  } else if (events.length) {
+    sequence = Math.max(sequence, Number(events.at(-1)?.sequence || 0));
+  } else {
+    sequence = Math.max(sequence, Number(run.eventCount || 0));
+  }
+  sequence += 1;
+  const at = new Date().toISOString();
+  const startedAtMs = Date.parse(run.startedAt || '');
+  const previousEventAtMs = Date.parse(events.at(-1)?.at || '');
   events.push({
-    at: new Date().toISOString(),
+    ...data,
+    at,
     type,
-    ...data
+    operationId: run.operationId || null,
+    sequence,
+    elapsedMs: Number.isFinite(startedAtMs) ? Math.max(0, Date.parse(at) - startedAtMs) : null,
+    sincePreviousEventMs: Number.isFinite(previousEventAtMs) ? Math.max(0, Date.parse(at) - previousEventAtMs) : null
   });
   run.eventJournal = events.slice(-MAX_RUN_EVENTS);
-  run.eventCount = run.eventJournal.length;
+  run.eventSequence = sequence;
+  run.eventCount = sequence;
+}
+
+async function persistRunDiagnostics(run, queue = null) {
+  if (!run?.operationId) return;
+  if (queue?.groups) {
+    const planned = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
+    const entries = queue.groups[run.groupId] || [];
+    run.diagnosticsLastKnownCompletedCount = entries
+      .filter((entry) => planned.has(entry.sourceId) && entry.status === 'done').length;
+    run.diagnosticsLastKnownPendingCount = Math.max(0, planned.size - run.diagnosticsLastKnownCompletedCount);
+  }
+  const events = Array.isArray(run.eventJournal) ? run.eventJournal : [];
+  let sequence = Number(run.eventSequence || 0);
+  if (events.some((event) => !Number(event?.sequence))) {
+    if (!events.length) sequence = Math.max(sequence, Number(run.eventCount || 0));
+    for (const event of events) {
+      if (!Number(event?.sequence)) {
+        event.sequence = ++sequence;
+        event.operationId = run.operationId;
+      } else {
+        sequence = Math.max(sequence, Number(event.sequence));
+        event.operationId ||= run.operationId;
+      }
+    }
+  } else if (events.length) {
+    sequence = Math.max(sequence, Number(events.at(-1)?.sequence || 0));
+  } else {
+    sequence = Math.max(sequence, Number(run.eventCount || 0));
+  }
+  run.eventSequence = sequence;
+  run.eventCount = sequence;
+
+  const persistedSequence = Math.max(0, Number(run.diagnosticsPersistedSequence || 0));
+  const pendingEvents = events
+    .filter((event) => Number(event.sequence) > persistedSequence)
+    .sort((left, right) => Number(left.sequence) - Number(right.sequence));
+  const header = runDiagnosticHeader(run, queue, chrome.runtime.getManifest?.().version || null);
+  const headerFingerprint = JSON.stringify(header);
+  if (!pendingEvents.length && headerFingerprint === run.diagnosticsHeaderFingerprint) return;
+
+  const records = [];
+  const firstSequence = Number(pendingEvents[0]?.sequence || 0);
+  if (firstSequence > persistedSequence + 1) {
+    records.push(sanitizeRunDiagnosticEvent({
+      operationId: run.operationId,
+      sequence: firstSequence - 1,
+      at: new Date().toISOString(),
+      type: 'diagnostics_gap',
+      missingFromSequence: persistedSequence + 1,
+      missingThroughSequence: firstSequence - 1,
+      reason: 'Earlier events left the live journal before they were archived.'
+    }));
+  }
+  records.push(...pendingEvents.map((event) => sanitizeRunDiagnosticEvent(event, {
+    operationId: run.operationId,
+    sequence: event.sequence
+  })));
+
+  await saveRunDiagnostics(header, records);
+  run.diagnosticsPersistedSequence = Math.max(persistedSequence, ...records.map((event) => Number(event.sequence || 0)));
+  run.diagnosticsHeaderFingerprint = headerFingerprint;
+  run.diagnosticsPersistenceError = null;
+}
+
+async function flushRunDiagnosticsSafely(run, queue) {
+  if (!run?.operationId) return;
+  try {
+    await persistRunDiagnostics(run, queue);
+  } catch (error) {
+    run.diagnosticsPersistenceError = String(error?.message || error).slice(0, 1200);
+    run.diagnosticsPersistenceFailedAt = new Date().toISOString();
+  }
 }
 
 async function setSlotPhase(runId, slotId, phase, extra = {}) {
@@ -586,6 +710,13 @@ function scheduleConversationLoadRecovery(operationId, dueAt) {
   })).catch(() => {});
 }
 
+function scheduleStalledBatchRecovery(operationId, dueAt) {
+  if (!operationId || !dueAt || !chrome.alarms?.create) return;
+  Promise.resolve(chrome.alarms.create(STALLED_BATCH_RECOVERY_ALARM_NAME, {
+    when: Math.max(Date.now() + 1000, Number(dueAt))
+  })).catch(() => {});
+}
+
 function chatTabFingerprint(value) {
   try {
     const url = new URL(String(value || ''));
@@ -594,6 +725,202 @@ function chatTabFingerprint(value) {
   } catch (_) {
     return null;
   }
+}
+
+async function captureStalledBatchTabTargets(run) {
+  const slots = Object.values(run?.slots || {}).filter((slot) => Number(slot?.tabId || 0) > 0);
+  const targets = await Promise.all(slots.map(async (slot) => {
+    const tabId = Number(slot.tabId);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const url = String(tab?.url || tab?.pendingUrl || '');
+    if (!tab || !/^https:\/\/chatgpt\.com\//i.test(url)) return null;
+    return {
+      tabId,
+      slotId: Number(slot.slotId),
+      entryId: slot.entryId || null,
+      windowId: Number(tab.windowId || 0) || null,
+      urlFingerprint: chatTabFingerprint(url)
+    };
+  }));
+  return targets.filter(Boolean);
+}
+
+async function closeStalledBatchRecoveryTabs(operationId) {
+  const { run } = await getStored();
+  if (!run || run.operationId !== operationId) return { closed: 0, failed: [] };
+  const recovery = run.stalledBatchRecovery;
+  const targets = Array.isArray(recovery?.closeTabs) ? recovery.closeTabs : [];
+  const failed = [];
+  const unsafe = [];
+  let closed = 0;
+  for (const target of targets) {
+    const tabId = Number(target?.tabId || 0);
+    if (!tabId) continue;
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) continue;
+    const url = String(tab.url || tab.pendingUrl || '');
+    if (!/^https:\/\/chatgpt\.com\//i.test(url)
+      || (target.windowId && Number(tab.windowId) !== Number(target.windowId))
+      || (target.urlFingerprint && chatTabFingerprint(url) !== target.urlFingerprint)) {
+      unsafe.push(tabId);
+      continue;
+    }
+    await sendTabMessage(tabId, { type: 'STOP' }, 1500).catch(() => null);
+    await chrome.tabs.remove(tabId).catch(() => null);
+    if (await chrome.tabs.get(tabId).catch(() => null)) failed.push(tabId);
+    else closed += 1;
+  }
+  return { closed, failed, unsafe };
+}
+
+async function activateStalledBatchRecoveryWait(operationId) {
+  let dueAt = 0;
+  await withStateLock(async () => {
+    const stored = await getStored();
+    const run = stored.run;
+    if (!run || run.operationId !== operationId
+      || String(run.stalledBatchRecovery?.stage || '').toUpperCase() !== 'CLOSING') return;
+    const now = Date.now();
+    dueAt = now + STALLED_BATCH_RECOVERY_DELAY_MS;
+    run.stalledBatchRecovery.stage = 'WAITING';
+    run.stalledBatchRecovery.waitStartedAt = new Date(now).toISOString();
+    run.stalledBatchRecovery.dueAt = dueAt;
+    run.currentAction = `Рабочие вкладки закрыты. Через 5 минут продолжу незавершённые модели (${clockTime(dueAt)})`;
+    run.lastActivityAt = new Date(now).toISOString();
+    recordRunEvent(run, 'stalled_batch_recovery_waiting', {
+      dueAt, returnedCount: run.stalledBatchRecovery.requeuedIds?.length || 0
+    });
+    await saveRunAndQueue(run, stored.queue);
+    await publishRun(run, stored.queue);
+  });
+  if (dueAt) scheduleStalledBatchRecovery(operationId, dueAt);
+  return dueAt;
+}
+
+async function failStalledBatchRecovery(operationId, error) {
+  const message = String(error?.message || error || 'Не удалось автоматически продолжить прогон').slice(0, 1200);
+  await withStateLock(async () => {
+    const stored = await getStored();
+    const run = stored.run;
+    if (!run || run.operationId !== operationId
+      || !['CLOSING', 'WAITING', 'RESTARTING'].includes(String(run.stalledBatchRecovery?.stage || '').toUpperCase())) return;
+    run.stalledBatchRecovery.stage = 'FAILED';
+    run.stalledBatchRecovery.failedAt = new Date().toISOString();
+    run.stalledBatchRecovery.error = message;
+    run.state = 'PAUSED';
+    run.status = 'PAUSED_ON_ERROR';
+    run.pauseReason = 'STALLED_BATCH';
+    run.unresolvedError = true;
+    run.error = { message };
+    run.currentAction = `Автоперезапуск не удался: ${message}. Прогресс сохранён; можно продолжить вручную.`;
+    run.lastActivityAt = new Date().toISOString();
+    recordRunEvent(run, 'stalled_batch_recovery_failed', {
+      failedAt: run.stalledBatchRecovery.failedAt,
+      stage: 'FAILED',
+      error: message,
+      returnedCount: run.stalledBatchRecovery.requeuedIds?.length || 0
+    });
+    await saveRunAndQueue(run, stored.queue);
+    await publishRun(run, stored.queue);
+  });
+  if (chrome.alarms?.clear) await chrome.alarms.clear(STALLED_BATCH_RECOVERY_ALARM_NAME).catch(() => {});
+  await appendLog('Автоматический перезапуск рабочего набора остановлен с ошибкой', { operationId, error: message });
+}
+
+async function resumeStalledBatchRecovery() {
+  const initial = await getStored();
+  const operationId = initial.run?.operationId;
+  if (!operationId) return { skipped: true };
+  if (stalledBatchRecoveryRuns.has(operationId)) {
+    const current = initial.run.stalledBatchRecovery || {};
+    scheduleStalledBatchRecovery(operationId, Number(current.dueAt || 0) || Date.now() + 5000);
+    return { skipped: true, inFlight: true };
+  }
+  stalledBatchRecoveryRuns.add(operationId);
+  try {
+    let run = initial.run;
+    let recovery = run.stalledBatchRecovery || {};
+    let stage = String(recovery.stage || '').toUpperCase();
+    if (!['CLOSING', 'WAITING', 'RESTARTING'].includes(stage)) return { skipped: true };
+
+    if (stage === 'CLOSING') {
+      const closed = await closeStalledBatchRecoveryTabs(operationId);
+      if (closed.unsafe.length) {
+        await failStalledBatchRecovery(operationId,
+          `Рабочие вкладки изменились и оставлены открытыми: ${closed.unsafe.join(', ')}.`);
+        return { failed: true, unsafeTabIds: closed.unsafe };
+      }
+      if (closed.failed.length) {
+        scheduleStalledBatchRecovery(operationId, Date.now() + 5000);
+        return { deferred: true, failedTabIds: closed.failed };
+      }
+      await activateStalledBatchRecoveryWait(operationId);
+      const refreshed = await getStored();
+      run = refreshed.run;
+      recovery = run?.stalledBatchRecovery || {};
+      stage = String(recovery.stage || '').toUpperCase();
+    } else if (stage === 'WAITING') {
+      const closed = await closeStalledBatchRecoveryTabs(operationId);
+      if (closed.unsafe.length) {
+        await failStalledBatchRecovery(operationId,
+          `Рабочие вкладки изменились во время паузы и оставлены открытыми: ${closed.unsafe.join(', ')}.`);
+        return { failed: true, unsafeTabIds: closed.unsafe };
+      }
+      if (closed.failed.length) {
+        scheduleStalledBatchRecovery(operationId, Date.now() + 5000);
+        return { deferred: true, failedTabIds: closed.failed };
+      }
+    }
+
+    if (!run || run.operationId !== operationId || !['WAITING', 'RESTARTING'].includes(stage)) return { skipped: true };
+    const dueAt = Number(recovery.dueAt || 0);
+    if (stage === 'WAITING' && dueAt > Date.now()) {
+      scheduleStalledBatchRecovery(operationId, dueAt);
+      return { waiting: true, dueAt };
+    }
+
+    if (stage === 'WAITING') {
+      await withStateLock(async () => {
+        const stored = await getStored();
+        const current = stored.run;
+        if (!current || current.operationId !== operationId
+          || String(current.stalledBatchRecovery?.stage || '').toUpperCase() !== 'WAITING'
+          || Number(current.stalledBatchRecovery?.dueAt || 0) > Date.now()) return;
+        current.stalledBatchRecovery.stage = 'RESTARTING';
+        current.stalledBatchRecovery.restartingAt = new Date().toISOString();
+        current.currentAction = 'Пятиминутный отдых завершён. Восстанавливаю очередь незавершённых моделей…';
+        current.lastActivityAt = new Date().toISOString();
+        await saveRunAndQueue(current, stored.queue);
+        await publishRun(current, stored.queue);
+      });
+      const refreshed = await getStored();
+      run = refreshed.run;
+      recovery = run?.stalledBatchRecovery || {};
+      stage = String(recovery.stage || '').toUpperCase();
+      if (stage === 'WAITING' && Number(recovery.dueAt || 0) > Date.now()) {
+        scheduleStalledBatchRecovery(operationId, Number(recovery.dueAt));
+        return { waiting: true, dueAt: Number(recovery.dueAt) };
+      }
+    }
+
+    await resumeRun({ stalledBatchRecoveryInternal: true });
+    if (chrome.alarms?.clear) await chrome.alarms.clear(STALLED_BATCH_RECOVERY_ALARM_NAME).catch(() => {});
+    await appendLog('Прогон автоматически продолжен после пятиминутного отдыха', { operationId });
+    return { resumed: true, operationId };
+  } catch (error) {
+    await failStalledBatchRecovery(operationId, error);
+    return { failed: true, error: error.message };
+  } finally {
+    stalledBatchRecoveryRuns.delete(operationId);
+  }
+}
+
+async function restoreStalledBatchRecovery(operationId) {
+  const { run } = await getStored();
+  if (!run || run.operationId !== operationId) return { skipped: true };
+  const stage = String(run.stalledBatchRecovery?.stage || '').toUpperCase();
+  if (!['CLOSING', 'WAITING', 'RESTARTING'].includes(stage)) return { skipped: true };
+  return resumeStalledBatchRecovery();
 }
 
 async function closeConversationRecoveryTabs(operationId) {
@@ -643,6 +970,13 @@ async function failConversationLoadRecovery(operationId, message, { attempt = nu
     run.error = { message: run.conversationRecovery.error };
     run.currentAction = `${run.conversationRecovery.error} Вкладки и задания сохранены; можно продолжить вручную или выполнить сброс.`;
     run.lastActivityAt = new Date().toISOString();
+    recordRunEvent(run, 'conversation_load_recovery_failed', {
+      failedAt: run.conversationRecovery.failedAt,
+      attempt: run.conversationRecovery.attempts,
+      error: run.conversationRecovery.error,
+      inspectedCount: run.conversationRecovery.inspectedCount || 0,
+      closedCount: run.conversationRecovery.closedCount || 0
+    });
     await saveRunAndQueue(run, stored.queue, stored.history, stored.generationMemory);
     await publishRun(run, stored.queue);
   });
@@ -1955,7 +2289,8 @@ function withStateLock(task) {
 
 async function getStored() {
   return chrome.storage.local.get([
-    'job', 'queue', 'run', 'runtime', 'logs', 'lastDiagnostic', 'history', 'generationMemory', 'lastPreflight', 'domDiagnosticsMode'
+    'job', 'queue', 'run', 'runtime', 'logs', 'lastDiagnostic', 'history', 'generationMemory', 'lastPreflight', 'domDiagnosticsMode',
+    'sessionResetIntent'
   ]);
 }
 
@@ -2187,12 +2522,14 @@ async function reconcilePersistedCurrentRevisions(queue, history, generationMemo
   const catalog = await getAllModelCatalog().catch(() => []);
   if (!catalog.length) return 0;
   const runFilter = normalizeWatchFilter(filterValue);
+  const excludedSourceIds = new Set((filterValue?.excludeSourceIds || []).map((id) => String(id)));
   const groupId = queue?.repairQueue && queue.repairQueue.length && filterValue?.runQueueMode === REGENERATION_QUEUE_ID
     ? REGENERATION_QUEUE_ID
     : groupIdForWatchFilter(runFilter);
   const selectedEntries = new Map(groupEntries(queue, groupId).map((entry) => [String(entry.sourceId), entry]));
   let restored = 0;
   for (const model of catalog) {
+    if (excludedSourceIds.has(String(model.skuKey || ''))) continue;
     const generationIdValue = String(model.currentGenerationId || '');
     if (!generationIdValue) continue;
     const revision = await getGenerationRevision(generationIdValue).catch(() => null);
@@ -2453,6 +2790,11 @@ async function waitForStartupReconciliation() {
 }
 
 async function recoverInterruptedRun(reason) {
+  const startupSnapshot = await getStored();
+  if (startupSnapshot.sessionResetIntent) {
+    await resumeInterruptedSessionReset(startupSnapshot.sessionResetIntent);
+    return;
+  }
   // A browser/worker restart may happen after chrome.downloads accepted the
   // artifact but before finishDownload persisted DONE. Reconcile those ids
   // before deciding that a missing ChatGPT tab means the source must retry.
@@ -2722,12 +3064,29 @@ async function recoverInterruptedRun(reason) {
 chrome.runtime.onStartup.addListener(() => {
   ensureDevReloadAlarm();
   scheduleRevisionFactsRecoveryAfterUpgrade().catch(() => {});
-  scheduleInterruptedRunRecovery('Браузер был перезапущен');
+  void (async () => {
+    const stored = await getStored();
+    if (stored.sessionResetIntent) {
+      await resumeInterruptedSessionReset(stored.sessionResetIntent);
+      return;
+    }
+    const { run } = stored;
+    const batchStage = String(run?.stalledBatchRecovery?.stage || '').toUpperCase();
+    if (['CLOSING', 'WAITING', 'RESTARTING', 'FAILED'].includes(batchStage)) {
+      await rehydrateWorkerWake();
+      return;
+    }
+    await scheduleInterruptedRunRecovery('Браузер был перезапущен');
+  })().catch((error) => appendLog('Ошибка восстановления после запуска браузера', { error: error.message }));
 });
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
   if (alarm.name === DEV_RELOAD_ALARM_NAME) {
-    Promise.all([pollDevReload('alarm'), pollDevControl('alarm')]).catch(() => {});
+    Promise.all([
+      pollDevReload('alarm'),
+      pollDevControl('alarm'),
+      reconcileManualExtensionUpdateLock().catch(() => {})
+    ]).catch(() => {});
     return;
   }
   if (alarm.name === RATE_LIMIT_RESUME_ALARM_NAME) {
@@ -2737,6 +3096,12 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
   if (alarm.name === CONVERSATION_LOAD_RECOVERY_ALARM_NAME) {
     resumeConversationLoadRecovery().catch((error) => appendLog(
       'Ошибка восстановления вкладок после ошибки загрузки разговора', { error: error.message }
+    ));
+    return;
+  }
+  if (alarm.name === STALLED_BATCH_RECOVERY_ALARM_NAME) {
+    resumeStalledBatchRecovery().catch((error) => appendLog(
+      'Ошибка автоматического продолжения после отдыха рабочих вкладок', { error: error.message }
     ));
     return;
   }
@@ -2804,16 +3169,23 @@ async function refreshChatGPTTabsAfterReload() {
 
 async function initializeDevReloadState() {
   const version = chrome.runtime.getManifest?.().version || 'unknown';
-  const stored = await chrome.storage.local.get('devAutoReload');
+  const stored = await chrome.storage.local.get(['devAutoReload', 'manualExtensionUpdateLock']);
   const marker = stored.devAutoReload || {};
+  const suppressTabRefresh = marker.suppressNextTabRefresh === true
+    || stored.manualExtensionUpdateLock?.active === true;
   if (marker.extensionVersion !== version) {
     await chrome.storage.local.set({
       devAutoReload: {
         ...marker,
         extensionVersion: version,
-        refreshTabsAfterReload: true,
+        refreshTabsAfterReload: !suppressTabRefresh,
+        suppressNextTabRefresh: false,
         initializedAt: marker.initializedAt || new Date().toISOString()
       }
+    });
+  } else if (marker.suppressNextTabRefresh) {
+    await chrome.storage.local.set({
+      devAutoReload: { ...marker, refreshTabsAfterReload: false, suppressNextTabRefresh: false }
     });
   }
   return refreshChatGPTTabsAfterReload();
@@ -2823,6 +3195,7 @@ async function initializeDevReloadState() {
 // profiles where Chrome did not emit onStartup after an extension reload.
 ensureDevReloadAlarm();
 initializeDevReloadState().catch(() => {});
+reconcileManualExtensionUpdateLock().catch(() => {});
 scheduleRevisionFactsRecoveryAfterUpgrade().catch(() => {});
 restoreRateLimitResumeAlarm().catch(() => {});
 // A cold MV3 worker wake is normal lifecycle, not an interrupted browser run.
@@ -2922,7 +3295,7 @@ async function pollDevReload(source = 'poll') {
         ...marker,
         revision,
         pendingRevision: null,
-        refreshTabsAfterReload: true,
+        refreshTabsAfterReload: marker.suppressNextTabRefresh !== true,
         reloadedAt: new Date().toISOString(),
         source
       }
@@ -2941,6 +3314,122 @@ async function pollDevReload(source = 'poll') {
     clearTimeout(timeoutId);
     devReloadPollInFlight = false;
   }
+}
+
+async function requestLocalExtensionUpdate(url, method = 'GET') {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 3500);
+  try {
+    const response = await fetch(url, {
+      method,
+      cache: 'no-store',
+      headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
+      body: method === 'POST' ? '{}' : undefined,
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload?.error || `Локальный сервис обновления ответил HTTP ${response.status}`);
+    return payload;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function clearManualExtensionUpdateLock({ clearRefreshSuppression = false } = {}) {
+  await chrome.storage.local.remove('manualExtensionUpdateLock');
+  if (clearRefreshSuppression) {
+    const stored = await chrome.storage.local.get('devAutoReload');
+    const marker = stored.devAutoReload || {};
+    await chrome.storage.local.set({
+      devAutoReload: { ...marker, refreshTabsAfterReload: false, suppressNextTabRefresh: false }
+    });
+  }
+}
+
+async function reconcileManualExtensionUpdateLock(status = null, installedState = null) {
+  const stored = await chrome.storage.local.get('manualExtensionUpdateLock');
+  if (!stored.manualExtensionUpdateLock?.active) return { ok: true, skipped: true };
+  let installed = installedState;
+  let updateStatus = status;
+  if (!updateStatus) {
+    const response = await requestLocalExtensionUpdate(DEV_UPDATE_STATUS_URL);
+    updateStatus = response?.status || null;
+    installed = response?.installed || null;
+  }
+  const installedTarget = String(stored.manualExtensionUpdateLock.targetVersion || '');
+  const matchingInstalledPackage = Boolean(installedTarget
+    && String(installed?.extensionVersion || '') === installedTarget);
+  if (['complete', 'current', 'error'].includes(String(updateStatus?.phase || ''))
+    || (updateStatus?.phase === 'idle' && matchingInstalledPackage)) {
+    await clearManualExtensionUpdateLock({ clearRefreshSuppression: updateStatus.phase === 'error' });
+    return { ok: true, cleared: true, phase: updateStatus.phase };
+  }
+  return { ok: true, pending: true, phase: updateStatus?.phase || 'unknown' };
+}
+
+async function assertManualExtensionUpdateNotApplying() {
+  const stored = await chrome.storage.local.get('manualExtensionUpdateLock');
+  if (!stored.manualExtensionUpdateLock?.active) return;
+  try {
+    const response = await requestLocalExtensionUpdate(DEV_UPDATE_STATUS_URL);
+    const status = response?.status || null;
+    if (status && ['complete', 'current', 'error', 'idle'].includes(String(status.phase || ''))) {
+      await reconcileManualExtensionUpdateLock(status);
+      return;
+    }
+  } catch (_) {}
+  throw new Error('Установка обновления расширения ещё выполняется. Дождись её завершения в разделе «Сервис».');
+}
+
+async function startManualExtensionUpdate() {
+  const { run } = await getStored();
+  if (runHasActiveAutomationWork(run)) throw new Error('Перед обновлением дождись завершения прогона или останови его.');
+  const response = await requestLocalExtensionUpdate(DEV_UPDATE_START_URL, 'POST');
+  return response.status || {};
+}
+
+async function applyManualExtensionUpdate(targetVersion = '') {
+  const { run } = await getStored();
+  if (runHasActiveAutomationWork(run)) return { deferred: true, reason: 'Рабочие вкладки ещё заняты.' };
+  const state = await chrome.storage.local.get('manualExtensionUpdateLock');
+  if (state.manualExtensionUpdateLock?.active) return { deferred: true, reason: 'Установка уже выполняется.' };
+
+  await chrome.storage.local.set({
+    manualExtensionUpdateLock: {
+      active: true,
+      targetVersion: String(targetVersion || ''),
+      startedAt: new Date().toISOString()
+    }
+  });
+  const reloadState = await chrome.storage.local.get('devAutoReload');
+  const marker = reloadState.devAutoReload || {};
+  await chrome.storage.local.set({
+    devAutoReload: { ...marker, refreshTabsAfterReload: false, suppressNextTabRefresh: true }
+  });
+  const rechecked = await getStored();
+  if (runHasActiveAutomationWork(rechecked.run)) {
+    await clearManualExtensionUpdateLock({ clearRefreshSuppression: true });
+    return { deferred: true, reason: 'Пока загружался пакет, начался прогон.' };
+  }
+  try {
+    const response = await requestLocalExtensionUpdate(DEV_UPDATE_APPLY_URL, 'POST');
+    return { started: true, status: response.status || {} };
+  } catch (error) {
+    await clearManualExtensionUpdateLock({ clearRefreshSuppression: true });
+    throw error;
+  }
+}
+
+async function getManualExtensionUpdateStatus() {
+  const response = await requestLocalExtensionUpdate(DEV_UPDATE_STATUS_URL);
+  const status = response?.status || {};
+  if (status.phase === 'ready') {
+    const applyResult = await applyManualExtensionUpdate(status.latestVersion || '');
+    if (applyResult.deferred) return { status, installed: response?.installed || null, deferred: true, reason: applyResult.reason };
+    return { status: applyResult.status || status, installed: response?.installed || null, applying: applyResult.started === true };
+  }
+  await reconcileManualExtensionUpdateLock(status, response?.installed || null).catch(() => {});
+  return { status, installed: response?.installed || null };
 }
 
 function runHasActiveAutomationWork(run) {
@@ -2980,7 +3469,7 @@ async function applyControlJobPatch(payload = {}) {
   const filterKeys = ['saleStatus', 'quality', 'brand'];
   const hasFilterPatch = Boolean(payload.filters && typeof payload.filters === 'object')
     || filterKeys.some((key) => payload[key] != null);
-  const keys = ['queueGroup', 'runLimit', 'workerCount', 'coverageMode', 'generationPauseMinutes', 'generationJitterSeconds', 'runQueueMode'];
+  const keys = ['queueGroup', 'runLimit', 'workerCount', 'coverageMode', 'generationPauseMinutes', 'generationJitterSeconds', 'runQueueMode', 'runPart', 'runPartSignature'];
   if (!keys.some((key) => payload[key] != null) && !hasFilterPatch) return;
   const stored = await chrome.storage.local.get('job');
   if (!stored.job) throw new Error('Сохранённая конфигурация прогона отсутствует');
@@ -3007,13 +3496,23 @@ async function applyControlJobPatch(payload = {}) {
   } else {
     nextJob.filters = filter;
   }
-  if (payload.runLimit != null) nextJob.runLimit = normalizeRunLimit(payload.runLimit, nextJob.runLimit || 1);
+  if (payload.runLimit != null) nextJob.runLimit = Math.min(RUN_PART_SIZE, normalizeRunLimit(payload.runLimit, nextJob.runLimit || RUN_PART_SIZE));
   if (payload.workerCount != null) nextJob.workerCount = normalizeWorkerCount(payload.workerCount, nextJob.workerCount || DEFAULT_WORKERS);
   if (payload.coverageMode != null) nextJob.coverageMode = normalizeCoverageMode(payload.coverageMode);
   if (payload.runQueueMode != null) {
     const mode = String(payload.runQueueMode);
     if (!['regular', REGENERATION_QUEUE_ID].includes(mode)) throw new Error(`Неизвестная очередь: ${mode}`);
     nextJob.runQueueMode = mode;
+  }
+  if (payload.runPart != null) {
+    const runPart = Number(payload.runPart);
+    if (!Number.isSafeInteger(runPart) || runPart < 1) throw new Error('Номер части очереди должен быть положительным целым числом');
+    nextJob.runPart = runPart;
+  }
+  if (payload.runPartSignature != null) nextJob.runPartSignature = String(payload.runPartSignature || '');
+  if ((hasFilterPatch || payload.queueGroup != null || payload.runQueueMode != null) && payload.runPart == null) {
+    nextJob.runPart = null;
+    nextJob.runPartSignature = '';
   }
   if (payload.generationPauseMinutes != null) nextJob.generationPauseMinutes = normalizeGenerationPauseMinutes(payload.generationPauseMinutes);
   if (payload.generationJitterSeconds != null) nextJob.generationJitterSeconds = normalizeGenerationJitterSeconds(payload.generationJitterSeconds);
@@ -3036,6 +3535,8 @@ async function executeControlCommand(command) {
         filters: stored.job.filters || filterFromQueueGroup(stored.job.queueGroup),
         coverageMode: normalizeCoverageMode(stored.job.coverageMode),
         runQueueMode: stored.job.runQueueMode === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular',
+        runPart: stored.job.runPart || null,
+        runPartSignature: stored.job.runPartSignature || null,
         runLimit: stored.job.runLimit || null,
         workerCount: stored.job.workerCount || null
       } : null,
@@ -3510,6 +4011,8 @@ function clearResolvedRunError(run, queue) {
 
 function finalizeDrainingRun(run, queue = null) {
   if (!run || !['RUNNING', 'DRAINING'].includes(run.state) || hasLiveSlotWork(run)) return false;
+  const previousState = run.state;
+  const previousStatus = run.status;
   const hasPending = Array.isArray(run.pendingIds) && run.pendingIds.length > 0;
   const scheduledRetries = queue ? scheduledRetriesForRun(run, queue) : [];
   if (!hasPending && scheduledRetries.length) {
@@ -3518,6 +4021,13 @@ function finalizeDrainingRun(run, queue = null) {
     run.status = 'RETRY_BACKOFF';
     run.finishedAt = null;
     run.currentAction = `Ожидаю безопасный повтор через ${clockTime(nextRetry.retryAt)}`;
+    if (run.state !== previousState || run.status !== previousStatus) {
+      recordRunEvent(run, 'run_retry_backoff_scheduled', {
+        retryAt: nextRetry.retryAt,
+        retryCount: scheduledRetries.length,
+        pendingCount: Number(run.pendingIds?.length || 0)
+      });
+    }
     return true;
   }
   if (hasUnresolvedSlotErrors(run) || hasPending) {
@@ -3527,6 +4037,13 @@ function finalizeDrainingRun(run, queue = null) {
     run.currentAction = hasPending
       ? 'Рабочие вкладки завершились с ошибками. Ожидается продолжение очереди.'
       : 'Проверка запущенных генераций завершена. Ожидается продолжение.';
+    if (run.state !== previousState || run.status !== previousStatus) {
+      recordRunEvent(run, 'run_paused_on_error', {
+        pendingCount: Number(run.pendingIds?.length || 0),
+        unresolvedError: Boolean(hasUnresolvedSlotErrors(run)),
+        failedSlotCount: Object.values(run.slots || {}).filter((slot) => slot.failed && slot.entryId).length
+      });
+    }
   } else {
     const factsErrors = Object.values(run.factsProgress || {})
       .filter((facts) => String(facts?.stage || '').toUpperCase() === 'ERROR').length;
@@ -3540,6 +4057,16 @@ function finalizeDrainingRun(run, queue = null) {
     run.currentAction = factsErrors
       ? `Фото скачаны. Ошибок спецификации: ${factsErrors}. Повторное чтение доступно в галерее.`
       : 'Все запущенные генерации скачаны, спецификации сохранены.';
+    const planned = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
+    const completedCount = (queue?.groups?.[run.groupId] || [])
+      .filter((entry) => planned.has(entry.sourceId) && entry.status === 'done').length;
+    recordRunEvent(run, 'run_completed', {
+      plannedCount: planned.size,
+      completedCount,
+      pendingCount: Math.max(0, planned.size - completedCount),
+      factsErrorCount: factsErrors,
+      finishedAt: run.finishedAt
+    });
   }
   return true;
 }
@@ -3691,6 +4218,15 @@ function runSummary(run, queue) {
     status: run?.status || null,
     pauseReason: run?.pauseReason || null,
     imageLimitDetected: run?.imageLimitDetected === true,
+    stalledBatchRecovery: run?.stalledBatchRecovery ? {
+      stage: run.stalledBatchRecovery.stage || null,
+      attempts: Number(run.stalledBatchRecovery.attempts || 0),
+      triggeredAt: run.stalledBatchRecovery.triggeredAt || null,
+      dueAt: Number(run.stalledBatchRecovery.dueAt || 0) || null,
+      requeuedCount: Number(run.stalledBatchRecovery.requeuedCount
+        || run.stalledBatchRecovery.requeuedIds?.length || 0),
+      error: run.stalledBatchRecovery.error || null
+    } : null,
     conversationRecovery: run?.conversationRecovery ? {
       stage: run.conversationRecovery.stage || null,
       attempts: Number(run.conversationRecovery.attempts || 0),
@@ -3719,6 +4255,9 @@ function runSummary(run, queue) {
     runCompleted: planned.filter((entry) => entry.status === 'done').length,
     runRemaining: planned.filter((entry) => entry.status !== 'done').length,
     runLimit: run?.runLimit ?? null,
+    runPart: run?.runPart ?? null,
+    runPartCount: run?.runPartCount ?? null,
+    runPartCandidateCount: run?.runPartCandidateCount ?? null,
     workerCount: normalizeWorkerCount(run?.workerCount, DEFAULT_WORKERS),
     inputMode: normalizeInputMode(run?.inputMode, DEFAULT_INPUT_MODE),
     rateLimitPauseMinutes: normalizeRateLimitPauseMinutes(run?.rateLimitPauseMinutes),
@@ -3745,6 +4284,7 @@ function runSummary(run, queue) {
 }
 
 async function publishRun(run, queue) {
+  await flushRunDiagnosticsSafely(run, queue);
   await updateRuntime({
     state: run.state,
     status: run.status || run.state,
@@ -3903,34 +4443,60 @@ async function requestInputFileFromCandidates(sourceKeys) {
   throw new Error(`Файл недоступен: ${sourceKeys.join(' или ')}. Выбери папку референсов заново.`);
 }
 
-async function runPreflight({ selectedIds = [], queueMode = null } = {}) {
+async function runPreflight({ selectedIds = [], queueMode = null, partNumber = null, validateLaunchSelection = true } = {}) {
   const stored = await getStored();
   const job = stored.job || {};
   const queue = stored.queue || {};
   const inputPlan = buildInputPlan(job.inputMode);
   const requested = new Set((Array.isArray(selectedIds) ? selectedIds : [])
     .map((value) => String(value || '').trim()).filter(Boolean));
-  const filter = normalizeWatchFilter(
-    job.filters || parseFilterSelectionId(job.queueGroup) || filterFromQueueGroup(job.queueGroup)
-  );
+  const rawFilter = job.filters || parseFilterSelectionId(job.queueGroup) || filterFromQueueGroup(job.queueGroup);
+  const filter = normalizeWatchFilter(rawFilter);
   const groupId = groupIdForWatchFilter(filter);
-  const runQueueMode = queueMode === REGENERATION_QUEUE_ID
-    ? REGENERATION_QUEUE_ID
-    : (queueMode === 'regular' ? 'regular' : (job.runQueueMode === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular'));
+  const rawQueueMode = queueMode == null ? String(job.runQueueMode || '') : String(queueMode || '');
+  const runQueueMode = rawQueueMode === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular';
+  const selectedPartNumber = partNumber == null ? Number(job.runPart || 0) : Number(partNumber || 0);
+  const filterIsExact = ['in_sale', 'not_in_sale'].includes(String(rawFilter?.saleStatus || ''))
+    && ['good', 'bad'].includes(String(rawFilter?.quality || ''))
+    && WATCH_BRAND_FILTERS.some((item) => item.id === String(rawFilter?.brand || '') && item.id !== 'all');
+  const queueModeIsExact = ['regular', REGENERATION_QUEUE_ID].includes(rawQueueMode);
+  const requestedRunLimit = Number(job.runLimit);
+  const runLimitIsExact = Number.isSafeInteger(requestedRunLimit)
+    && requestedRunLimit >= 1
+    && requestedRunLimit <= RUN_PART_SIZE;
   const allEntries = [...new Map(QUEUE_GROUP_IDS.flatMap((id) => groupEntries(queue, id))
     .map((entry) => [entry.sourceId, entry])).values()];
   const filteredEntries = groupEntries(queue, groupId);
   const repairIds = new Set(normalizedRepairQueue(queue)
     .filter((item) => item.status !== 'completed')
     .map((item) => item.sourceId));
-  const filteredRepairEntries = filteredEntries.filter((entry) => repairIds.has(String(entry.sourceId)));
-  const scopeEntries = (requested.size
-    ? allEntries.filter((entry) => requested.has(entry.sourceId)
-      && (runQueueMode === REGENERATION_QUEUE_ID
-        ? repairIds.has(String(entry.sourceId))
-        : !repairIds.has(String(entry.sourceId))))
-    : runQueueMode === REGENERATION_QUEUE_ID ? filteredRepairEntries : filteredEntries.filter((entry) => !repairIds.has(String(entry.sourceId))))
-    .filter((entry) => runQueueMode !== REGENERATION_QUEUE_ID || requested.size > 0 || entry.status !== 'running');
+  const partitionUniverse = runQueueMode === REGENERATION_QUEUE_ID
+    ? filteredEntries.filter((entry) => repairIds.has(String(entry.sourceId)))
+    : filteredEntries;
+  const partitionContext = `${runQueueMode}|${filter.saleStatus}|${filter.quality}|${filter.brand}`;
+  const partPlan = queuePartPlan(partitionUniverse, RUN_PART_SIZE, partitionContext);
+  const selectedPart = partPlan.parts.find((part) => part.partNumber === selectedPartNumber) || null;
+  const partSelectionIsExact = Number.isSafeInteger(selectedPartNumber)
+    && selectedPartNumber > 0
+    && Boolean(selectedPart)
+    && String(job.runPartSignature || '') === partPlan.signature;
+  const launchSelectionIsValid = validateLaunchSelection === true
+    ? (filterIsExact && queueModeIsExact && partSelectionIsExact && runLimitIsExact)
+    : (partNumber == null || partSelectionIsExact);
+  const usePart = validateLaunchSelection === true || partNumber != null;
+  const pool = usePart
+    ? (selectedPart?.entries || [])
+    : (requested.size ? allEntries : filteredEntries);
+  const scopeEntries = pool.filter((entry) => {
+    const sourceId = String(entry.sourceId || '');
+    if (requested.size && !requested.has(sourceId)) return false;
+    if (runQueueMode === REGENERATION_QUEUE_ID) {
+      if (!repairIds.has(sourceId)) return false;
+      return !validateLaunchSelection || requested.size > 0 || entry.status !== 'running';
+    }
+    if (repairIds.has(sourceId)) return false;
+    return !validateLaunchSelection || entry.status !== 'running';
+  });
 
   const recipeHashes = new Map();
   for (const entry of scopeEntries) {
@@ -3954,6 +4520,15 @@ async function runPreflight({ selectedIds = [], queueMode = null } = {}) {
   const watchKeys = new Set(await getAssetKeys('watch:').catch(() => []));
   const checks = [];
   const add = (id, label, ok, blocking = true, details = '') => checks.push({ id, label, ok: Boolean(ok), blocking, details });
+  add(
+    'launch-selection',
+    'Очередь, фильтры и часть выбраны точно',
+    launchSelectionIsValid,
+    true,
+    validateLaunchSelection !== true && partNumber == null
+      ? 'продолжение ранее сохранённого прогона'
+      : `очередь ${queueModeIsExact ? runQueueMode : 'не выбрана'} · ${filterIsExact ? watchFilterLabel(filter) : 'точная категория и бренд обязательны'} · часть ${selectedPartNumber || 'не выбрана'} из ${partPlan.partCount || 0} · фото за запуск ${runLimitIsExact ? requestedRunLimit : 'укажи 1–100'}`
+  );
   const promptText = String(job.prompt || '');
   add('prompt', 'Промпт загружен', Boolean(promptText.trim()), true, 'Base Prompt v5.txt');
   add(
@@ -4015,6 +4590,13 @@ async function runPreflight({ selectedIds = [], queueMode = null } = {}) {
     checkedAt: new Date().toISOString(),
     filter,
     groupId,
+    runQueueMode,
+    runPart: selectedPartNumber || null,
+    runPartCount: partPlan.partCount,
+    runPartSize: partPlan.partSize,
+    runPartSignature: partPlan.signature,
+    partCandidates: selectedPart?.count || 0,
+    queueCandidates: partPlan.total,
     inputMode: inputPlan.mode,
     inputRoles: [...inputPlan.roles],
     selectedIds: [...requested],
@@ -4187,6 +4769,7 @@ async function saveRunAndQueue(run, queue, history = undefined, generationMemory
   const value = { run, queue };
   if (history !== undefined) value.history = history;
   if (generationMemory !== undefined) value.generationMemory = generationMemory;
+  await flushRunDiagnosticsSafely(run, queue);
   await chrome.storage.local.set(value);
 }
 
@@ -4715,6 +5298,213 @@ async function reconcileActiveDownloads() {
   }
 }
 
+async function beginStalledBatchRecovery(operationId, candidate) {
+  if (!operationId || !candidate || stalledBatchRecoveryRuns.has(operationId)) {
+    return { skipped: true };
+  }
+  stalledBatchRecoveryRuns.add(operationId);
+  try {
+    let snapshot = await getStored();
+    if (snapshot.run?.operationId !== operationId
+      || !findStalledBatchRecoveryCandidate(snapshot.run, Date.now())) return { skipped: true };
+
+    // A page may have rendered an image just before it stopped answering.
+    // Trigger the normal download path first and wait for Chrome to settle it
+    // before returning any still-incomplete source to the queue.
+    await quickProbeReadyResultsBeforeReset(snapshot.run).catch(() => {});
+    const downloadDeadline = Date.now() + 30000;
+    while (Date.now() < downloadDeadline) {
+      await reconcileActiveDownloads().catch(() => {});
+      snapshot = await getStored();
+      if (snapshot.run?.operationId !== operationId) return { skipped: true };
+      const hasActiveDownload = Object.values(snapshot.run.slots || {}).some((slot) => slot.downloadId);
+      if (!hasActiveDownload) break;
+      await sleep(500);
+    }
+    snapshot = await getStored();
+    if (snapshot.run?.operationId !== operationId) return { skipped: true };
+    if (Object.values(snapshot.run.slots || {}).some((slot) => slot.downloadId)) {
+      scheduleStalledBatchRecovery(operationId, Date.now() + 5000);
+      await appendLog('Перезапуск набора отложен: ожидаю завершения активного PNG', { operationId });
+      return { deferred: true, downloadsPending: true };
+    }
+
+    const closeTabs = await captureStalledBatchTabTargets(snapshot.run);
+    const referencedTabIds = [...new Set(Object.values(snapshot.run.slots || {})
+      .map((slot) => Number(slot.tabId || 0))
+      .filter((tabId) => tabId > 0))];
+    if (closeTabs.length !== referencedTabIds.length) {
+      await appendLog('Автоперезапуск отложен: рабочая вкладка изменила адрес, поэтому её оставляю открытой', {
+        operationId,
+        referencedTabIds
+      });
+      return { skipped: true, unsafeTabs: true };
+    }
+
+    const prepared = await withStateLock(async () => {
+      const stored = await getStored();
+      const run = stored.run;
+      if (!run || run.operationId !== operationId) return { skipped: true };
+      const currentCandidate = findStalledBatchRecoveryCandidate(run, Date.now());
+      if (!currentCandidate) return { skipped: true };
+      if (Object.values(run.slots || {}).some((slot) => slot.downloadId)) {
+        return { deferred: true, downloadsPending: true };
+      }
+      const tabIds = new Set(closeTabs.map((item) => Number(item.tabId)));
+      if (Object.values(run.slots || {}).some((slot) => Number(slot.tabId || 0) > 0
+        && !tabIds.has(Number(slot.tabId)))) return { skipped: true, unsafeTabs: true };
+
+      const history = normalizeHistory(stored.history);
+      const generationMemory = normalizeGenerationMemory(stored.generationMemory);
+      const entries = groupEntries(stored.queue, run.groupId);
+      const plannedIds = Array.isArray(run.plannedIds) ? [...run.plannedIds] : [];
+      const excludedFromCatalogReconcile = plannedIds.filter((entryId) => (
+        entries.some((entry) => entry.sourceId === entryId && entry.status !== 'done')
+      ));
+      await reconcileRunVerifiedRevisions(run, stored.queue, history, generationMemory);
+      await reconcilePersistedCurrentRevisions(stored.queue, history, generationMemory, {
+        ...(run.filter || parseFilterSelectionId(run.groupId) || filterFromQueueGroup(run.groupId)),
+        runQueueMode: run.groupId === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular',
+        excludeSourceIds: excludedFromCatalogReconcile
+      });
+
+      const refreshedEntries = groupEntries(stored.queue, run.groupId);
+      const returnedIds = plannedIds.filter((entryId) => {
+        const entry = refreshedEntries.find((item) => item.sourceId === entryId);
+        return entry && entry.status !== 'done';
+      });
+      if (!returnedIds.length) {
+        run.pendingIds = [];
+        finalizeDrainingRun(run, stored.queue);
+        await saveRunAndQueue(run, stored.queue, history, generationMemory);
+        await publishRun(run, stored.queue);
+        return { completed: true };
+      }
+
+      const now = new Date().toISOString();
+      const retryCountById = new Map();
+      for (const entryId of returnedIds) {
+        const entry = refreshedEntries.find((item) => item.sourceId === entryId);
+        if (!entry) continue;
+        retryCountById.set(entryId, Number(entry.retryCount || 0));
+        entry.status = 'pending';
+        entry.autoRetryPending = false;
+        entry.lastError = null;
+        entry.errorClass = null;
+        entry.nextRetryAt = null;
+        entry.generationStartedAt = null;
+        delete history.items[entryId];
+        history.ignored[entryId] = true;
+        setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.NOT_READY, {
+          statusSource: 'automatic',
+          generationStartedAt: null,
+          lastError: null,
+          lastRunId: operationId,
+          retryCount: Number(entry.retryCount || 0),
+          errorClass: null,
+          nextRetryAt: null
+        });
+      }
+
+      for (const slot of Object.values(run.slots || {})) {
+        const slotId = Number(slot.slotId);
+        const releasedEntryId = slot.entryId || null;
+        Object.assign(slot, freshSlotRevisionFields(), {
+          tabId: null,
+          entryId: null,
+          leaseId: null,
+          status: 'IDLE',
+          phase: SLOT_PHASES.IDLE,
+          preparedForSubmit: false,
+          downloadId: null,
+          launchWaitUntil: null,
+          finalCheckPending: false,
+          finalCheckDeadlineAt: null,
+          finalCheckAttempts: 0,
+          failed: false,
+          lastCheckState: null,
+          lastCheckError: null,
+          checkFailures: 0,
+          rateLimitRetryNeeded: false,
+          lastResult: null,
+          lastEntryName: null,
+          lastModelName: null,
+          generationSubmittedAt: null,
+          lastActivityAt: now
+        });
+        recordRunEvent(run, 'stalled_batch_slot_released', {
+          slotId,
+          entryId: releasedEntryId,
+          retryCount: releasedEntryId ? (retryCountById.get(releasedEntryId) ?? null) : null
+        });
+      }
+
+      run.pendingIds = returnedIds;
+      run.stalledBatchRecovery = {
+        stage: 'CLOSING',
+        attempts: Number(run.stalledBatchRecovery?.attempts || 0) + 1,
+        triggeredAt: now,
+        dueAt: null,
+        triggerSlotId: currentCandidate.slotId,
+        triggerEntryId: currentCandidate.entryId,
+        noResponseSince: currentCandidate.noResponseSince,
+        abnormalSlotIds: currentCandidate.abnormalSlotIds,
+        requeuedIds: returnedIds,
+        requeuedCount: returnedIds.length,
+        closeTabs
+      };
+      run.state = 'PAUSED';
+      run.status = 'STALLED_BATCH_RECOVERY';
+      run.pauseReason = 'STALLED_BATCH';
+      run.unresolvedError = false;
+      run.error = null;
+      run.stopBlocked = null;
+      run.noProgressSince = null;
+      run.noProgressCycles = 0;
+      run.lastProgressAt = now;
+      run.currentAction = `Вкладка ${currentCandidate.slotId + 1} молчит 15 минут; возвращаю ${returnedIds.length} незавершённых моделей в очередь и закрываю рабочие вкладки.`;
+      run.lastActivityAt = now;
+      recordRunEvent(run, 'stalled_batch_recovery_started', {
+        triggerSlotId: currentCandidate.slotId,
+        triggerEntryId: currentCandidate.entryId,
+        abnormalSlotIds: currentCandidate.abnormalSlotIds,
+        returnedIds
+      });
+      await saveRunAndQueue(run, stored.queue, history, generationMemory);
+      await publishRun(run, stored.queue);
+      return { triggered: true, requeuedCount: returnedIds.length };
+    });
+
+    if (!prepared?.triggered) return prepared || { skipped: true };
+    stopAuditMonitor();
+    const closed = await closeStalledBatchRecoveryTabs(operationId);
+    if (closed.unsafe.length) {
+      await failStalledBatchRecovery(operationId,
+        `Рабочие вкладки изменились и оставлены открытыми: ${closed.unsafe.join(', ')}.`);
+      return { triggered: true, failed: true, unsafeTabIds: closed.unsafe };
+    }
+    if (closed.failed.length) {
+      scheduleStalledBatchRecovery(operationId, Date.now() + 5000);
+      await appendLog('Не все рабочие вкладки закрылись; повторю закрытие через несколько секунд', {
+        operationId,
+        tabIds: closed.failed
+      });
+      return { triggered: true, deferred: true, failedTabIds: closed.failed };
+    }
+    await closeAutomationWindowIfEmpty(operationId);
+    await activateStalledBatchRecoveryWait(operationId);
+    await appendLog('Незавершённые модели возвращены в очередь; рабочие вкладки закрыты на 5 минут', {
+      operationId,
+      triggerSlotId: candidate.slotId,
+      triggerEntryId: candidate.entryId,
+      returnedCount: prepared.requeuedCount || 0
+    });
+    return { triggered: true, requeuedCount: prepared.requeuedCount || 0 };
+  } finally {
+    stalledBatchRecoveryRuns.delete(operationId);
+  }
+}
+
 function auditActiveRun() {
   if (auditInFlight) return auditInFlight;
   auditInFlight = (async () => {
@@ -4892,7 +5682,6 @@ function auditActiveRun() {
           if (shouldRefreshUnresponsiveGeneration(slot)) {
             slot.autoRefreshGenerationId = slot.generationId;
             slot.autoRefreshAt = checkedAt;
-            slot.noResponseSince = null;
             slot.checkFailures = 0;
             transportRefreshes.push({ slotId: slot.slotId, entryId: slot.entryId, tabId: slot.tabId });
           }
@@ -5014,6 +5803,14 @@ function auditActiveRun() {
         terminalResponse: ['TEXT_ONLY', 'CLARIFICATION_REQUIRED', 'MODEL_REFUSAL', 'TOOL_UNAVAILABLE'].includes(String(failure.errorClass || '').toUpperCase())
       });
     }
+
+    const latest = await getStored();
+    const stalledCandidate = findStalledBatchRecoveryCandidate(latest.run, Date.now());
+    if (stalledCandidate) {
+      const recovery = await beginStalledBatchRecovery(latest.run.operationId, stalledCandidate);
+      if (recovery?.triggered || recovery?.deferred || recovery?.completed) return;
+    }
+
     if (globalNoProgress) {
       await Promise.all(candidates.map((slot) => captureDiagnosticsFromTab(slot.tabId, {
         operationId: run.operationId,
@@ -5837,17 +6634,22 @@ async function runDry() {
 }
 
 async function startRun(options = {}) {
+  await assertManualExtensionUpdateNotApplying();
   await waitForStartupReconciliation();
   const requestedIds = Array.isArray(options?.selectedIds)
     ? [...new Set(options.selectedIds.map((value) => String(value || '').trim()).filter(Boolean))]
     : [];
   const preferredWindowId = Number(options?.preferredWindowId || 0) || null;
-  const preflight = await runPreflight({ selectedIds: requestedIds });
+  const preflight = await runPreflight({ selectedIds: requestedIds, validateLaunchSelection: true });
   if (!preflight.ok) {
     const failed = preflight.checks.filter((check) => check.blocking && !check.ok).map((check) => check.label).join(', ');
     throw new Error(`Предварительная проверка не пройдена: ${failed || 'проверь входные данные'}`);
   }
   const assignments = await withStateLock(async () => {
+    const updateLock = await chrome.storage.local.get('manualExtensionUpdateLock');
+    if (updateLock.manualExtensionUpdateLock?.active) {
+      throw new Error('Установка обновления расширения началась. Дождись её завершения.');
+    }
     const stored = await getStored();
     const { job, run: oldRun } = stored;
     let { queue, history, generationMemory } = stored;
@@ -5856,10 +6658,17 @@ async function startRun(options = {}) {
       queue = { ...(queue || {}), groups: queueGroupsFromCatalog(persistedCatalog, queue?.groups || {}) };
     }
     if (!job?.prompt) throw new Error('Промпт не сохранён');
-    const filter = normalizeWatchFilter(
-      job.filters || parseFilterSelectionId(job.queueGroup) || filterFromQueueGroup(job.queueGroup)
-    );
+    const rawFilter = job.filters || parseFilterSelectionId(job.queueGroup) || filterFromQueueGroup(job.queueGroup);
+    const filter = normalizeWatchFilter(rawFilter);
     const groupId = groupIdForWatchFilter(filter);
+    const runQueueMode = String(job.runQueueMode || '');
+    const runPart = Number(job.runPart || 0);
+    const filterIsExact = ['in_sale', 'not_in_sale'].includes(String(rawFilter?.saleStatus || ''))
+      && ['good', 'bad'].includes(String(rawFilter?.quality || ''))
+      && WATCH_BRAND_FILTERS.some((item) => item.id === String(rawFilter?.brand || '') && item.id !== 'all');
+    if (!filterIsExact || !['regular', REGENERATION_QUEUE_ID].includes(runQueueMode)) {
+      throw new Error('Выбери точную категорию, один бренд и список запуска');
+    }
     if (!queue?.groups || !QUEUE_GROUP_IDS.some((groupKey) => Array.isArray(queue.groups[groupKey]))) {
       throw new Error('Очередь не просканирована');
     }
@@ -5870,23 +6679,34 @@ async function startRun(options = {}) {
       generationMemory,
       oldRun
     ));
-    const runQueueMode = job.runQueueMode === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular';
     await reconcilePersistedCurrentRevisions(queue, history, generationMemory, {
       ...filter,
       runQueueMode
     });
     const repairItems = normalizedRepairQueue(queue).filter((item) => item.status !== 'completed');
-    const allEntries = [...new Map(QUEUE_GROUP_IDS.flatMap((groupKey) => groupEntries(queue, groupKey))
-      .map((entry) => [entry.sourceId, entry])).values()];
     const configuredEntries = groupEntries(queue, groupId);
+    const repairIdsForPartition = new Set(repairItems.map((item) => String(item.sourceId)));
+    const partitionUniverse = runQueueMode === REGENERATION_QUEUE_ID
+      ? configuredEntries.filter((entry) => repairIdsForPartition.has(String(entry.sourceId)))
+      : configuredEntries;
+    const partitionContext = `${runQueueMode}|${filter.saleStatus}|${filter.quality}|${filter.brand}`;
+    const partPlan = queuePartPlan(partitionUniverse, RUN_PART_SIZE, partitionContext);
+    const selectedPart = partPlan.parts.find((part) => part.partNumber === runPart) || null;
+    if (!Number.isSafeInteger(runPart) || runPart < 1 || !selectedPart
+      || String(job.runPartSignature || '') !== partPlan.signature) {
+      throw new Error('Выбранная часть очереди устарела. Обнови список и выбери часть заново.');
+    }
+    const assignedEntries = queueEntriesForPart(partPlan, runPart);
     const explicitSelection = requestedIds.length > 0;
     const runGroupId = runQueueMode === REGENERATION_QUEUE_ID
       ? REGENERATION_QUEUE_ID
       : groupId;
     let entries = explicitSelection
-      ? requestedIds.map((sourceId) => configuredEntries.find((entry) => entry.sourceId === sourceId)
-        || allEntries.find((entry) => entry.sourceId === sourceId)).filter(Boolean)
-      : groupEntries(queue, groupId);
+      ? requestedIds.map((sourceId) => assignedEntries.find((entry) => entry.sourceId === sourceId)).filter(Boolean)
+      : assignedEntries;
+    if (explicitSelection && entries.length !== requestedIds.length) {
+      throw new Error('Выбранные модели не входят в назначенную часть очереди');
+    }
     if (runQueueMode === REGENERATION_QUEUE_ID) {
       entries = selectRepairQueueEntries(entries, repairItems);
       for (const entry of entries) {
@@ -5946,13 +6766,17 @@ async function startRun(options = {}) {
       });
     }
 
-    const runLimit = normalizeRunLimit(job.runLimit, 1);
+    const runLimitValue = Number(job.runLimit);
+    if (!Number.isSafeInteger(runLimitValue) || runLimitValue < 1 || runLimitValue > RUN_PART_SIZE) {
+      throw new Error(`Количество фото за запуск должно быть от 1 до ${RUN_PART_SIZE}`);
+    }
+    const runLimit = runLimitValue;
     const workerCount = normalizeWorkerCount(job.workerCount, DEFAULT_WORKERS);
     const rateLimitPauseMinutes = normalizeRateLimitPauseMinutes(job.rateLimitPauseMinutes);
     const rateLimitIgnoreMinutes = normalizeRateLimitIgnoreMinutes(job.rateLimitIgnoreMinutes);
     const generationPauseMinutes = normalizeGenerationPauseMinutes(job.generationPauseMinutes);
     const generationJitterSeconds = normalizeGenerationJitterSeconds(job.generationJitterSeconds);
-    const coverageMode = normalizeCoverageMode(job.coverageMode);
+    const coverageMode = 'queue';
     const plannedIds = runQueueMode === REGENERATION_QUEUE_ID
       ? entries.filter((entry) => entry.status !== 'running').slice(0, runLimit).map((entry) => entry.sourceId)
       : (explicitSelection
@@ -5971,6 +6795,11 @@ async function startRun(options = {}) {
         : (explicitSelection ? 'Выбранные модели' : watchFilterLabel(filter)),
       coverageMode: explicitSelection ? 'queue' : coverageMode,
       runQueueMode,
+      runPart,
+      runPartSize: partPlan.partSize,
+      runPartCount: partPlan.partCount,
+      runPartSignature: partPlan.signature,
+      runPartCandidateCount: selectedPart.count,
       runLimit,
       workerCount,
       inputMode,
@@ -6012,10 +6841,30 @@ async function startRun(options = {}) {
       noProgressSince: null,
       noProgressCycles: 0,
       eventJournal: [],
+      eventSequence: 0,
       eventCount: 0,
+      diagnosticsPersistedSequence: 0,
       recipeHash: preflight.recipeHash || stableHash({ pipelineVersion: PROMPT_PIPELINE_VERSION, inputMode, prompt: job.prompt, filter, coverageMode, workerCount, runLimit }),
       buildId: EXTENSION_BUILD_ID
     };
+    recordRunEvent(run, 'run_started', {
+      plannedCount: plannedIds.length,
+      workerCount,
+      runLimit,
+      groupId: run.groupId,
+      filterLabel: run.filterLabel,
+      runQueueMode,
+      runPart,
+      runPartCount: partPlan.partCount,
+      runPartCandidateCount: selectedPart.count,
+      coverageMode: run.coverageMode,
+      inputMode,
+      generationPauseMinutes,
+      generationJitterSeconds,
+      rateLimitPauseMinutes,
+      preflightOk: true,
+      buildId: EXTENSION_BUILD_ID
+    });
     const assignments = [];
     for (let slotId = 0; slotId < workerCount; slotId += 1) {
       const entryId = run.pendingIds.shift();
@@ -6078,7 +6927,8 @@ async function startRun(options = {}) {
       recordRunEvent(run, 'slot_claimed', { slotId, entryId, leaseId: slot.leaseId, attempt: slot.attempt });
       assignments.push({ entry, slot });
     }
-    await chrome.storage.local.set({ run, queue, history, generationMemory, logs: [] });
+    await chrome.storage.local.set({ logs: [] });
+    await saveRunAndQueue(run, queue, history, generationMemory);
     await publishRun(run, queue);
     await appendLog(`Запуск очереди: ${watchFilterLabel(filter)}`);
     return { runId: run.operationId, assignments, active: ['RUNNING', 'STARTING', 'DRAINING'].includes(run.state) };
@@ -6099,6 +6949,13 @@ async function pauseRun(reason = 'USER') {
     const history = normalizeHistory(stored.history);
     const generationMemory = normalizeGenerationMemory(stored.generationMemory);
     if (!run) return { runId: null, cancelTabIds: [], cancelRevisions: [], observing: false };
+
+    const stateBeforePause = run.state;
+    recordRunEvent(run, 'run_pause_requested', {
+      requestedReason: String(reason || 'USER'),
+      stateBefore: stateBeforePause,
+      activeSlotsBefore: activeSlots(run)
+    });
 
     const repairedCompleted = await reconcileRunVerifiedRevisions(run, queue, history, generationMemory);
     if (repairedCompleted) recordRunEvent(run, 'verified_revision_state_repaired', { count: repairedCompleted, reason: 'user-pause' });
@@ -6195,6 +7052,17 @@ async function pauseRun(reason = 'USER') {
       .filter((entry) => plannedIds.has(entry.sourceId) && entry.status !== 'done' && !protectedIds.has(entry.sourceId))
       .map((entry) => entry.sourceId);
     run.status = observing ? 'PAUSED_RECOVERING' : 'PAUSED';
+    recordRunEvent(run, 'run_pause_applied', {
+      requestedReason: String(reason || 'USER'),
+      pauseReason: run.pauseReason,
+      stateBefore: stateBeforePause,
+      stateAfter: run.state,
+      observing,
+      submittedSlots: Object.values(run.slots || {}).filter(slotGenerationSubmitted).length,
+      requeuedUnsubmittedSlots: cancelTabIds.length,
+      pendingCount: run.pendingIds.length,
+      preservedRateLimitUntil: activeRateLimitUntil || null
+    });
 
     await saveRunAndQueue(run, queue, history, generationMemory);
     await appendLog('Пауза пользователя', { observing, cancelledUnsubmittedTabs: cancelTabIds.length });
@@ -6217,7 +7085,21 @@ async function pauseRun(reason = 'USER') {
 async function stopRun() {
   await setUserStopReloadBoundary(true).catch(() => {});
   try {
-  const { run, queue } = await getStored();
+  const snapshot = await withStateLock(async () => {
+    const stored = await getStored();
+    if (stored.run) {
+      recordRunEvent(stored.run, 'run_stop_requested', {
+        stateBefore: stored.run.state,
+        submittedUnfinishedCount: Object.values(stored.run.slots || {}).filter((slot) => (
+          slot.entryId && slotGenerationSubmitted(slot)
+        )).length
+      });
+      await saveRunAndQueue(stored.run, stored.queue);
+      await publishRun(stored.run, stored.queue);
+    }
+    return { run: stored.run, queue: stored.queue };
+  });
+  const { run, queue } = snapshot;
   const entries = run ? groupEntries(queue, run.groupId) : [];
   const plannedIds = new Set(Array.isArray(run?.plannedIds) ? run.plannedIds : []);
   const runTotal = plannedIds.size;
@@ -6239,11 +7121,27 @@ async function stopRun() {
       if (!stored.run || stored.run.operationId !== run?.operationId) return;
       stored.run.stopBlocked = { count: unsaved.length, at: new Date().toISOString(), message };
       stored.run.currentAction = message;
+      recordRunEvent(stored.run, 'run_stop_blocked', {
+        unsavedSubmittedCount: unsaved.length,
+        slotIds: unsaved.map((slot) => Number(slot.slotId)),
+        reason: 'submitted_generations_missing_verified_png'
+      });
       await saveRunAndQueue(stored.run, stored.queue);
       await publishRun(stored.run, stored.queue);
     });
     throw new Error(message);
   }
+  await withStateLock(async () => {
+    const stored = await getStored();
+    if (!stored.run || stored.run.operationId !== run?.operationId) return;
+    recordRunEvent(stored.run, 'run_stop_accepted', {
+      plannedCount: runTotal,
+      completedCount: runCompleted,
+      pendingCount: Math.max(0, runTotal - runCompleted),
+      salvageReady: true
+    });
+    await saveRunAndQueue(stored.run, stored.queue);
+  });
   const result = await resetRunAndRescan({
     reason: 'Пользователь остановил генерацию',
     automatic: false,
@@ -6286,6 +7184,7 @@ async function setUserStopReloadBoundary(pending) {
 }
 
 async function startOrResumeRun(options = {}) {
+  await assertManualExtensionUpdateNotApplying();
   await waitForStartupReconciliation();
   const intent = String(options.intent || '').toLowerCase();
   const { run } = await getStored();
@@ -6530,13 +7429,53 @@ async function quickProbeReadyResultsBeforeReset(run) {
   return { checked: slots.length, downloadsStarted };
 }
 
-async function resetRunAndRescan(options = {}) {
+function resetRunAndRescan(options = {}) {
+  if (resetRunPromise) return resetRunPromise;
+  resetRunPromise = performResetRunAndRescan(options).finally(() => {
+    resetRunPromise = null;
+  });
+  return resetRunPromise;
+}
+
+async function resumeInterruptedSessionReset(intent = {}) {
+  if (!intent || typeof intent !== 'object') return { skipped: true };
+  return resetRunAndRescan({
+    reason: `Завершаю прерванный сброс: ${String(intent.reason || 'Сброс сессии')}`,
+    automatic: intent.automatic === true,
+    salvageReady: intent.salvageReady !== false,
+    preserveLogs: intent.preserveLogs === true,
+    cleanupTabIds: Array.isArray(intent.cleanupTabIds) ? intent.cleanupTabIds : [],
+    cleanupWindowId: Number(intent.cleanupWindowId || 0),
+    cleanupWindowOwned: intent.cleanupWindowOwned === true
+  });
+}
+
+async function performResetRunAndRescan(options = {}) {
   const {
     reason = 'Сессия генерации сброшена пользователем',
     automatic = false,
     salvageReady = true,
-    preserveLogs = false
+    preserveLogs = false,
+    cleanupTabIds = [],
+    cleanupWindowId = 0,
+    cleanupWindowOwned = false
   } = options;
+
+  // Store the reset request before page probing or state-lock waits. If Chrome
+  // reloads the extension mid-reset, startup must finish clearing this run
+  // rather than treating the previous snapshot as work to resume.
+  await chrome.storage.local.set({
+    sessionResetIntent: {
+      requestedAt: new Date().toISOString(),
+      reason,
+      automatic,
+      salvageReady,
+      preserveLogs,
+      cleanupTabIds: [...new Set(cleanupTabIds.map((value) => Number(value || 0)).filter((value) => value > 0))],
+      cleanupWindowId: Number(cleanupWindowId || 0),
+      cleanupWindowOwned
+    }
+  });
 
   stopAuditMonitor();
   await updateRuntime({
@@ -6553,6 +7492,15 @@ async function resetRunAndRescan(options = {}) {
 
   const initial = await getStored();
   const initialRun = initial.run;
+  if (initialRun?.operationId) {
+    recordRunEvent(initialRun, 'session_reset_requested', {
+      reason: String(reason),
+      automatic: automatic === true,
+      salvageReady: salvageReady !== false,
+      stateBefore: initialRun.state
+    });
+    await saveRunAndQueue(initialRun, initial.queue);
+  }
   await Promise.all(Object.values(initialRun?.slots || {})
     .filter((slot) => slot.entryId && slot.generationId && !slotGenerationSubmitted(slot))
     .map((slot) => cancelUnsubmittedGenerationRevision(
@@ -6561,8 +7509,10 @@ async function resetRunAndRescan(options = {}) {
       generationId: slot.generationId, sourceId: slot.entryId, error: error.message
     }))));
   const initialRunId = initialRun?.operationId || null;
-  const automationWindowId = Number(initialRun?.automationWindowId || 0);
-  const automationWindowOwned = initialRun?.automationWindowOwned === true;
+  const persistedResetIntent = initial.sessionResetIntent || {};
+  const automationWindowId = Number(initialRun?.automationWindowId || persistedResetIntent.cleanupWindowId || 0);
+  const automationWindowOwned = initialRun?.automationWindowOwned === true
+    || persistedResetIntent.cleanupWindowOwned === true;
   const slotTabIds = Object.values(initialRun?.slots || {})
     .map((slot) => Number(slot.tabId || 0))
     .filter((tabId) => tabId > 0);
@@ -6577,19 +7527,35 @@ async function resetRunAndRescan(options = {}) {
     .concat((initialRun?.conversationRecovery?.closeTabs || []).map((item) => item.tabId))
     .map((tabId) => Number(tabId || 0))
     .filter((tabId) => tabId > 0);
+  const stalledBatchTabIds = (initialRun?.stalledBatchRecovery?.closeTabs || [])
+    .map((item) => Number(item?.tabId || 0))
+    .filter((tabId) => tabId > 0);
   const windowTabs = automationWindowOwned && automationWindowId
     ? await chrome.tabs.query({ windowId: automationWindowId }).catch(() => [])
     : [];
   const ownedTabIds = [...new Set([
+    ...(Array.isArray(persistedResetIntent.cleanupTabIds) ? persistedResetIntent.cleanupTabIds : []),
     ...slotTabIds,
     ...postprocessTabIds,
     ...recoveryTabIds,
     ...conversationTabIds,
+    ...stalledBatchTabIds,
     ...windowTabs
       .filter((tab) => /^https:\/\/chatgpt\.com\//i.test(tab.url || tab.pendingUrl || ''))
       .map((tab) => Number(tab.id || 0))
       .filter((tabId) => tabId > 0)
   ])];
+
+  // Keep exact cleanup targets durable too. If the worker is terminated after
+  // clearing `run` but before closing tabs, its restart can still finish cleanup.
+  await chrome.storage.local.set({
+    sessionResetIntent: {
+      ...persistedResetIntent,
+      cleanupTabIds: ownedTabIds,
+      cleanupWindowId: automationWindowId,
+      cleanupWindowOwned: automationWindowOwned
+    }
+  });
 
 
   let probe = { checked: 0, downloadsStarted: 0 };
@@ -6707,6 +7673,28 @@ async function resetRunAndRescan(options = {}) {
       }
     }
 
+    if (run?.operationId) {
+      const planned = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
+      const completedCount = allQueueEntries(queue).filter((entry) => planned.has(entry.sourceId) && entry.status === 'done').length;
+      const previousState = run.state;
+      run.state = 'RESET';
+      run.status = automatic ? 'RESET_AUTOMATICALLY' : 'RESET_BY_USER';
+      run.pauseReason = 'RESET';
+      run.finishedAt = new Date().toISOString();
+      run.currentAction = String(reason);
+      recordRunEvent(run, 'session_reset_completed', {
+        reason: String(reason),
+        automatic: automatic === true,
+        stateBefore: previousState,
+        completedCount,
+        plannedCount: planned.size,
+        returnedToQueueCount: resetRecords,
+        restoredFromRevisions,
+        downloadsStartedBeforeReset: probe.downloadsStarted
+      });
+      await flushRunDiagnosticsSafely(run, queue);
+    }
+
     await chrome.storage.local.set({
       queue,
       history,
@@ -6722,6 +7710,7 @@ async function resetRunAndRescan(options = {}) {
     await chrome.tabs.remove(tabId).catch(() => null);
   }));
   if (chrome.alarms?.clear) await chrome.alarms.clear(CONVERSATION_LOAD_RECOVERY_ALARM_NAME).catch(() => {});
+  if (chrome.alarms?.clear) await chrome.alarms.clear(STALLED_BATCH_RECOVERY_ALARM_NAME).catch(() => {});
   if (automationWindowOwned && automationWindowId) await chrome.windows.remove(automationWindowId).catch(() => {});
 
   await updateRuntime({
@@ -6739,6 +7728,7 @@ async function resetRunAndRescan(options = {}) {
     error: null,
     buildId: EXTENSION_BUILD_ID
   });
+  await chrome.storage.local.remove('sessionResetIntent');
   await appendLog(automatic ? 'Автосброс состояния после обновления расширения' : 'Сессия сброшена и ревизии сверены с памятью приложения', {
     reason,
     oldRunId: initialRunId,
@@ -7367,7 +8357,9 @@ async function recoverVisibleResults(run, { forceReload = false } = {}) {
 }
 
 async function resumeRun(options = {}) {
-  if (options?.conversationRecoveryInternal !== true) await waitForStartupReconciliation();
+  if (options?.conversationRecoveryInternal !== true && options?.stalledBatchRecoveryInternal !== true) {
+    await waitForStartupReconciliation();
+  }
   const preferredWindowId = Number(options?.preferredWindowId || 0);
   if (preferredWindowId) {
     const host = await chrome.windows.get(preferredWindowId).catch(() => null);
@@ -7379,17 +8371,51 @@ async function resumeRun(options = {}) {
       await saveRunAndQueue(stored.run, stored.queue);
     });
   }
-  const current = await getStored();
+  const current = await withStateLock(async () => {
+    const stored = await getStored();
+    if (stored.run && ['PAUSED', 'STOPPED'].includes(stored.run.state)) {
+      recordRunEvent(stored.run, 'run_resume_requested', {
+        stateBefore: stored.run.state,
+        source: options?.conversationRecoveryInternal === true ? 'conversation_recovery'
+          : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery' : 'user_or_ui'
+      });
+      await saveRunAndQueue(stored.run, stored.queue);
+    }
+    return stored;
+  });
   if (!current.run || !['PAUSED', 'STOPPED'].includes(current.run.state)) throw new Error('Нет запуска, который можно продолжить');
+  const stalledBatchStage = String(current.run.stalledBatchRecovery?.stage || '').toUpperCase();
+  if (['CLOSING', 'WAITING'].includes(stalledBatchStage)) {
+    recordRunEvent(current.run, 'run_resume_blocked', { reason: 'stalled_batch_recovery_in_progress', recoveryStage: stalledBatchStage });
+    await saveRunAndQueue(current.run, current.queue);
+    throw new Error('Автовосстановление набора уже выполняется. Дождись окончания пятиминутной паузы.');
+  }
+  if (stalledBatchStage === 'RESTARTING' && options?.stalledBatchRecoveryInternal !== true) {
+    recordRunEvent(current.run, 'run_resume_blocked', { reason: 'stalled_batch_restart_in_progress', recoveryStage: stalledBatchStage });
+    await saveRunAndQueue(current.run, current.queue);
+    throw new Error('Идёт автоматический перезапуск очереди. Дождись его завершения.');
+  }
   if (['INSPECTING', 'WAITING', 'REOPENING'].includes(String(current.run.conversationRecovery?.stage || '').toUpperCase())) {
+    recordRunEvent(current.run, 'run_resume_blocked', {
+      reason: 'conversation_recovery_in_progress',
+      recoveryStage: current.run.conversationRecovery?.stage || null
+    });
+    await saveRunAndQueue(current.run, current.queue);
     throw new Error('Идёт безопасное восстановление разговоров ChatGPT. Дождись его завершения.');
   }
   if (current.run.imageLimitDetected === true && Number(current.run.rateLimitPauseUntil || 0) > Date.now()) {
+    recordRunEvent(current.run, 'run_resume_blocked', {
+      reason: 'image_limit_cooldown',
+      resumeAt: current.run.rateLimitPauseUntil
+    });
+    await saveRunAndQueue(current.run, current.queue);
     throw new Error(`Лимит создания изображений действует до ${clockTime(current.run.rateLimitPauseUntil)}. Очередь продолжится автоматически.`);
   }
   const resumePreflight = await runPreflight({
     selectedIds: Array.isArray(current.run.plannedIds) ? current.run.plannedIds : [],
-    queueMode: current.run.groupId === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular'
+    queueMode: current.run.groupId === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular',
+    partNumber: current.run.runPart || null,
+    validateLaunchSelection: false
   });
   if (!resumePreflight.ok) {
     const failed = (resumePreflight.checks || [])
@@ -7397,6 +8423,11 @@ async function resumeRun(options = {}) {
       .map((check) => check.label)
       .filter(Boolean)
       .join(', ');
+    recordRunEvent(current.run, 'run_resume_blocked', {
+      reason: 'preflight_failed',
+      failedChecks: (resumePreflight.checks || []).filter((check) => check.blocking && !check.ok).map((check) => check.label).filter(Boolean)
+    });
+    await saveRunAndQueue(current.run, current.queue);
     throw new Error(`Продолжение невозможно: ${failed || 'проверь входные данные'}`);
   }
   await ensureAutomationWindow(current.run.operationId);
@@ -7431,7 +8462,10 @@ async function resumeRun(options = {}) {
     run.coverageMode = normalizeCoverageMode(run.coverageMode);
     await reconcilePersistedCurrentRevisions(queue, history, generationMemory, {
       ...(run.filter || parseFilterSelectionId(run.groupId) || filterFromQueueGroup(run.groupId)),
-      runQueueMode: run.groupId === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular'
+      runQueueMode: run.groupId === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular',
+      excludeSourceIds: ['RESTARTING', 'FAILED'].includes(stalledBatchStage)
+        ? (run.stalledBatchRecovery?.requeuedIds || [])
+        : []
     });
     const entries = groupEntries(queue, run.groupId);
     const plannedIds = Array.isArray(run.plannedIds) && run.plannedIds.length
@@ -7526,8 +8560,20 @@ async function resumeRun(options = {}) {
       run.conversationRecovery.stage = 'MANUAL_RESUME';
       run.conversationRecovery.manualResumeAt = new Date().toISOString();
     }
+    if (['RESTARTING', 'FAILED'].includes(String(run.stalledBatchRecovery?.stage || '').toUpperCase())) {
+      run.stalledBatchRecovery.stage = 'RESUMED';
+      run.stalledBatchRecovery.resumedAt = new Date().toISOString();
+      run.stalledBatchRecovery.dueAt = null;
+    }
     run.currentAction = 'Продолжаю незавершённые генерации';
     run.lastActivityAt = new Date().toISOString();
+    recordRunEvent(run, 'run_resumed', {
+      source: options?.conversationRecoveryInternal === true ? 'conversation_recovery'
+        : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery' : 'user_or_ui',
+      pendingCount: run.pendingIds.length,
+      activeObservedSlots: Object.values(run.slots || {}).filter((slot) => slot.entryId && slotGenerationSubmitted(slot)).length,
+      rateLimitPausePreserved: recoveredRateLimit || preservedRateLimitUntil > Date.now()
+    });
     run.generationPauseMinutes = normalizeGenerationPauseMinutes(run.generationPauseMinutes);
     run.generationJitterSeconds = normalizeGenerationJitterSeconds(run.generationJitterSeconds);
     if (recoveredRateLimit || preservedRateLimitUntil > Date.now()) {
@@ -8209,13 +9255,15 @@ async function recoverGalleryFacts(generationIds = []) {
 
 async function scheduleRevisionFactsRecoveryAfterUpgrade() {
   if (!chrome.alarms?.create) return { scheduled: false };
-  const { run } = await getStored();
+  const stored = await getStored();
+  if (stored.sessionResetIntent) return { scheduled: false, reason: 'session_reset_pending' };
+  const { run } = stored;
   if (!run || !['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)) {
     return { scheduled: false, reason: 'no_active_run' };
   }
   const key = 'revisionFactsRecoveryMigration';
-  const stored = await chrome.storage.local.get(key);
-  const marker = stored[key] || {};
+  const storedMigration = await chrome.storage.local.get(key);
+  const marker = storedMigration[key] || {};
   if (marker.buildId === EXTENSION_BUILD_ID && marker.completedAt) {
     return { scheduled: false, duplicate: true };
   }
@@ -9281,6 +10329,7 @@ async function handleStateEvent(message, sender) {
       });
     }
     run.lastActivityAt = slot.lastActivityAt || run.lastActivityAt;
+    await flushRunDiagnosticsSafely(run, null);
     await chrome.storage.local.set({ run });
     await publishRun(run, null);
   });
@@ -9357,6 +10406,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
+  if (message?.type === 'START_EXTENSION_UPDATE') {
+    startManualExtensionUpdate()
+      .then((status) => sendResponse({ ok: true, status }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+  if (message?.type === 'GET_EXTENSION_UPDATE_STATUS') {
+    getManualExtensionUpdateStatus()
+      .then((value) => sendResponse({ ok: true, ...value }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
   if (message?.type === 'DOM_OBSERVATION_BATCH') {
     addDomObservations(Array.isArray(message.observations) ? message.observations : [message.observation])
       .then((value) => sendResponse({ ok: true, value }))
@@ -9396,12 +10457,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'RESET_RUN_RESCAN') {
-    waitForStartupReconciliation()
-      .then(() => resetRunAndRescan({
+    // Reset performs its own quick result/download salvage and serializes the
+    // destructive state change under the state lock. Waiting for startup
+    // reconciliation here can make an emergency reset appear to do nothing
+    // when a background ChatGPT tab never answers that reconciliation pass.
+    resetRunAndRescan({
         reason: message.reason || 'Ручной сброс сессии и повторное сканирование результатов',
         automatic: false,
         salvageReady: message.salvageReady !== false
-      }))
+      })
       .then((value) => sendResponse({ ok: true, value }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;

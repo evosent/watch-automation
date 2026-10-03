@@ -43,12 +43,62 @@ export const AUTOMATION_ERROR_CLASSES = Object.freeze({
 
 export const CONVERSATION_LOAD_RECOVERY_DELAY_MS = 2 * 60 * 1000;
 export const GENERATION_TRANSPORT_REFRESH_AFTER_MS = 4 * 60 * 1000;
+export const STALLED_BATCH_RECOVERY_AFTER_MS = 15 * 60 * 1000;
+export const STALLED_BATCH_RECOVERY_DELAY_MS = 5 * 60 * 1000;
 
 export function shouldRefreshUnresponsiveGeneration(slot, now = Date.now(), thresholdMs = GENERATION_TRANSPORT_REFRESH_AFTER_MS) {
   if (!slot?.tabId || !slot?.generationId || !slot?.leaseId || !slot?.generationSubmittedAt || slot?.downloadId) return false;
   if (String(slot.autoRefreshGenerationId || '') === String(slot.generationId)) return false;
   const since = Date.parse(slot.noResponseSince || '');
   return Number.isFinite(since) && since > 0 && Number(now) - since >= Number(thresholdMs);
+}
+
+function isActiveSubmittedGeneration(slot) {
+  if (!slot?.entryId || !slot?.tabId || !slot?.generationSubmittedAt || slot?.downloadId) return false;
+  return !['DONE', 'STOPPED', 'IDLE'].includes(String(slot.status || '').toUpperCase());
+}
+
+function isOffStandardGenerationSlot(slot) {
+  const status = String(slot?.status || '').toUpperCase();
+  const phase = String(slot?.phase || '').toUpperCase();
+  const checkState = String(slot?.lastCheckState || '').toUpperCase();
+  return Boolean(slot?.failed || slot?.finalCheckPending)
+    || ['OBSERVING', 'ERROR', 'PAUSED', 'RETRY_BACKOFF', 'TAB_LOST', 'NEEDS_ATTENTION'].includes(status)
+    || ['OBSERVING', 'ERROR', 'RETRY_BACKOFF', 'TAB_LOST', 'NEEDS_ATTENTION'].includes(phase)
+    || ['ERROR', 'NO_RESPONSE', 'CONVERSATION_LOAD_ERROR', 'TAB_CLOSED'].includes(checkState);
+}
+
+export function findStalledBatchRecoveryCandidate(
+  run,
+  now = Date.now(),
+  thresholdMs = STALLED_BATCH_RECOVERY_AFTER_MS
+) {
+  const activeRun = ['RUNNING', 'STARTING', 'DRAINING'].includes(String(run?.state || '').toUpperCase())
+    || (String(run?.state || '').toUpperCase() === 'PAUSED'
+      && String(run?.pauseReason || '').toUpperCase() === 'ERROR');
+  if (!activeRun || run?.imageLimitDetected === true
+    || String(run?.status || '').toUpperCase() === 'RATE_LIMIT_PAUSE'
+    || Number(run?.rateLimitPauseUntil || 0) > Number(now)) return null;
+
+  const active = Object.values(run?.slots || {})
+    .filter(isActiveSubmittedGeneration)
+    .sort((a, b) => (Date.parse(a.generationSubmittedAt || '') || 0)
+      - (Date.parse(b.generationSubmittedAt || '') || 0));
+  if (active.length < 2) return null;
+
+  const oldest = active[0];
+  const noResponseSince = Date.parse(oldest.noResponseSince || '');
+  if (!Number.isFinite(noResponseSince) || noResponseSince <= 0
+    || Number(now) - noResponseSince < Number(thresholdMs)) return null;
+
+  const abnormalSiblings = active.slice(1).filter(isOffStandardGenerationSlot);
+  if (!abnormalSiblings.length) return null;
+  return {
+    slotId: Number(oldest.slotId),
+    entryId: String(oldest.entryId),
+    noResponseSince: new Date(noResponseSince).toISOString(),
+    abnormalSlotIds: abnormalSiblings.map((slot) => Number(slot.slotId))
+  };
 }
 
 // Defaults preserve roughly the previous 8–12 second Send spacing until the

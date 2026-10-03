@@ -1,10 +1,12 @@
 export const DB_NAME = 'watch-card-automation';
-export const DB_VERSION = 6;
+export const DB_VERSION = 7;
 export const STORE = 'assets';
 export const HANDLE_STORE = 'handles';
 export const FACTS_STORE = 'generationFacts';
 export const REVISION_STORE = 'generationRevisions';
 export const MODEL_STORE = 'modelCatalog';
+export const RUN_DIAGNOSTICS_STORE = 'runDiagnostics';
+export const RUN_DIAGNOSTIC_EVENTS_STORE = 'runDiagnosticEvents';
 export const OUTPUT_DIRECTORY_HANDLE_KEY = 'output-directory';
 export const GALLERY_DIRECTORY_HANDLE_KEY = 'gallery-directory';
 // A folder can contain several thousand high-resolution source images. Keep
@@ -26,6 +28,14 @@ export function openDb() {
         revisions.createIndex('completedAt', 'completedAt', { unique: false });
       }
       if (!db.objectStoreNames.contains(MODEL_STORE)) db.createObjectStore(MODEL_STORE, { keyPath: 'skuKey' });
+      if (!db.objectStoreNames.contains(RUN_DIAGNOSTICS_STORE)) {
+        const diagnostics = db.createObjectStore(RUN_DIAGNOSTICS_STORE, { keyPath: 'operationId' });
+        diagnostics.createIndex('startedAt', 'startedAt', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(RUN_DIAGNOSTIC_EVENTS_STORE)) {
+        const events = db.createObjectStore(RUN_DIAGNOSTIC_EVENTS_STORE, { keyPath: ['operationId', 'sequence'] });
+        events.createIndex('operationId', 'operationId', { unique: false });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -41,6 +51,66 @@ function transactionResult(db, stores, run, errorLabel) {
     tx.onerror = () => reject(tx.error || new Error(`${errorLabel} failed`));
     tx.onabort = () => reject(tx.error || new Error(`${errorLabel} aborted`));
   });
+}
+
+export async function saveRunDiagnostics(header, events = []) {
+  if (!header?.operationId) throw new Error('Run diagnostics require an operationId');
+  const db = await openDb();
+  try {
+    const records = (Array.isArray(events) ? events : []).filter((event) => (
+      event?.operationId === header.operationId && Number(event.sequence) > 0
+    ));
+    const savedHeader = { ...header, updatedAt: new Date().toISOString() };
+    return await transactionResult(db, [RUN_DIAGNOSTICS_STORE, RUN_DIAGNOSTIC_EVENTS_STORE], (tx) => {
+      tx.objectStore(RUN_DIAGNOSTICS_STORE).put(savedHeader);
+      const store = tx.objectStore(RUN_DIAGNOSTIC_EVENTS_STORE);
+      for (const event of records) store.put(event);
+      return { eventCount: records.length, header: savedHeader };
+    }, 'Run diagnostics write');
+  } finally { db.close(); }
+}
+
+export async function listRunDiagnostics({ limit = 200 } = {}) {
+  const db = await openDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(RUN_DIAGNOSTICS_STORE, 'readonly');
+      const request = tx.objectStore(RUN_DIAGNOSTICS_STORE).getAll();
+      let rows = [];
+      request.onsuccess = () => {
+        rows = request.result || [];
+      };
+      request.onerror = () => reject(request.error || new Error('Run diagnostics read failed'));
+      tx.onerror = () => reject(tx.error || new Error('Run diagnostics read failed'));
+      tx.oncomplete = () => {
+        rows.sort((left, right) => (
+          String(right.startedAt || right.updatedAt || '').localeCompare(String(left.startedAt || left.updatedAt || ''))
+        ));
+        resolve(rows.slice(0, Math.max(1, Number(limit) || 200)));
+      };
+      tx.onabort = () => reject(tx.error || new Error('Run diagnostics read aborted'));
+    });
+  } finally { db.close(); }
+}
+
+export async function getRunDiagnostic(operationId) {
+  if (!operationId) return null;
+  const db = await openDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction([RUN_DIAGNOSTICS_STORE, RUN_DIAGNOSTIC_EVENTS_STORE], 'readonly');
+      const headerRequest = tx.objectStore(RUN_DIAGNOSTICS_STORE).get(String(operationId));
+      const eventsRequest = tx.objectStore(RUN_DIAGNOSTIC_EVENTS_STORE)
+        .index('operationId').getAll(String(operationId));
+      tx.oncomplete = () => resolve({
+        run: headerRequest.result || null,
+        events: (eventsRequest.result || []).sort((left, right) => Number(left.sequence) - Number(right.sequence))
+      });
+      tx.onerror = () => reject(tx.error || new Error('Run diagnostics read failed'));
+      tx.onabort = () => reject(tx.error || new Error('Run diagnostics read aborted'));
+      headerRequest.onerror = eventsRequest.onerror = () => reject(headerRequest.error || eventsRequest.error);
+    });
+  } finally { db.close(); }
 }
 
 function catalogWithVariantState(model, sourceVariantId, patch) {
@@ -604,7 +674,7 @@ export async function getAssetMetadata(prefix = '') {
   }
 }
 
-export async function replaceAssets(prefix, entries = []) {
+export async function replaceAssets(prefix, entries = [], { force = false } = {}) {
   const existing = await getAssetMetadata(prefix);
   const desired = new Map(entries.map((entry) => [String(entry.key), entry]));
   const changed = [];
@@ -614,7 +684,7 @@ export async function replaceAssets(prefix, entries = []) {
     const file = entry.file;
     const previous = existing.get(key);
     const relativePath = entry.relativePath || file?.webkitRelativePath || file?.name || '';
-    const unchanged = previous
+    const unchanged = !force && previous
       && previous.name === String(file?.name || '')
       && previous.type === String(file?.type || 'application/octet-stream')
       && previous.size === Number(file?.size || 0)

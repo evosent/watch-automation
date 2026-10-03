@@ -9,6 +9,7 @@ export const QUEUE_GROUPS = Object.freeze({
 
 export const QUEUE_GROUP_IDS = Object.freeze(Object.keys(QUEUE_GROUPS));
 export const REGENERATION_QUEUE_ID = 'regeneration';
+export const RUN_PART_SIZE = 100;
 export const IMAGE_EXTENSIONS = Object.freeze(new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff']));
 
 // Persistent generation memory is intentionally separate from the transient
@@ -59,7 +60,8 @@ export const WATCH_BRAND_FILTERS = Object.freeze([
   { id: 'pagani_design', label: 'Pagani Design' },
   { id: 'q_and_q', label: 'Q&Q' },
   { id: 'seiko', label: 'Seiko' },
-  { id: 'tissot', label: 'Tissot' }
+  { id: 'tissot', label: 'Tissot' },
+  { id: 'generic', label: 'Другие / не распознано' }
 ]);
 
 const REFERENCE_NAMES = Object.freeze({
@@ -821,6 +823,63 @@ export function pendingEntryIdsForFilter(entries = [], runLimit = 0, coverageMod
     : pending;
   const limit = normalizeRunLimit(runLimit, 0);
   return limit > 0 ? selected.slice(0, limit).map((entry) => entry.sourceId) : selected.map((entry) => entry.sourceId);
+}
+
+function stableQueueEntries(entries = []) {
+  const bySourceId = new Map();
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const sourceId = String(entry?.skuKey || entry?.sourceId || '').trim();
+    if (sourceId && !bySourceId.has(sourceId)) bySourceId.set(sourceId, entry);
+  }
+  return [...bySourceId.entries()]
+    .sort(([left], [right]) => (left < right ? -1 : (left > right ? 1 : 0)))
+    .map(([, entry]) => entry);
+}
+
+function queuePartSignature(sourceIds, context = '') {
+  let hash = 2166136261;
+  const value = `${String(context)}\u0000${sourceIds.join('\u0000')}`;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `v1:${sourceIds.length}:${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+export function queuePartPlan(entries = [], partSize = RUN_PART_SIZE, context = '') {
+  const parsedSize = Number(partSize);
+  const size = Number.isFinite(parsedSize) && parsedSize > 0
+    ? Math.floor(parsedSize)
+    : RUN_PART_SIZE;
+  const orderedEntries = stableQueueEntries(entries);
+  const sourceIds = orderedEntries.map((entry) => String(entry?.skuKey || entry?.sourceId || '').trim());
+  const partCount = Math.ceil(orderedEntries.length / size);
+  const parts = [];
+  for (let start = 0; start < orderedEntries.length; start += size) {
+    const partEntries = orderedEntries.slice(start, start + size);
+    parts.push({
+      partNumber: parts.length + 1,
+      start,
+      end: start + partEntries.length,
+      count: partEntries.length,
+      sourceIds: partEntries.map((entry) => String(entry?.skuKey || entry?.sourceId || '').trim()),
+      entries: partEntries
+    });
+  }
+  return {
+    total: orderedEntries.length,
+    partSize: size,
+    partCount,
+    signature: queuePartSignature(sourceIds, context),
+    sourceIds,
+    parts
+  };
+}
+
+export function queueEntriesForPart(plan, partNumber) {
+  const number = Number(partNumber);
+  if (!Number.isSafeInteger(number) || number < 1) return [];
+  return plan?.parts?.find((part) => part.partNumber === number)?.entries || [];
 }
 
 export function historyRecordFromEntry(entry, overrides = {}) {

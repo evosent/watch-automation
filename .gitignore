@@ -1,5 +1,6 @@
 node_modules/
 diagnostics/
+dist/
 input-ref-images/
 input-watches-images/
 reference-prompts/
@@ -10,3 +11,6 @@ docs/*.pdf
 *.jsonl
 Thumbs.db
 desktop.ini
+.watch-automation-update-state.json
+.watch-automation-update-stage-*/
+.watch-automation-update-backup-*/

@@ -2,7 +2,7 @@
 
 АВТОУСТАНОВКА (рекомендуется)
 
-1. Передайте на компьютер файл WatchAutomation_0.3.23_FULL.zip и файл INSTALL_WatchAutomation.cmd из одной папки.
+1. Передайте на компьютер файл WatchAutomation_0.3.31_FULL.zip и файл INSTALL_WatchAutomation.cmd из одной папки.
 2. Дважды нажмите INSTALL_WatchAutomation.cmd.
 3. Скрипт распакует комплект в %LOCALAPPDATA%\WatchAutomation\WatchAutomation,
    установит Node.js LTS, Chrome for Testing и проверит зависимости.

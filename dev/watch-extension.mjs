@@ -5,13 +5,14 @@ import { createReadStream, promises as fs, watch as watchFiles } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
+import { createUpdateManager, UPDATE_STATE_FILE } from './update-utils.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXTENSION_ROOT = path.join(PROJECT_ROOT, 'extension');
 const HOST = process.env.WATCH_AUTOMATION_HOST || '127.0.0.1';
 const PORT = Number(process.env.WATCH_AUTOMATION_PORT || 17321);
-const WATCHER_API_VERSION = 8;
-const WATCHER_BUILD_ID = '2026-09-25.6';
+const WATCHER_API_VERSION = 9;
+const WATCHER_BUILD_ID = '2026-10-03.1';
 const DEBOUNCE_MS = Number(process.env.WATCH_AUTOMATION_DEBOUNCE_MS || 650);
 const POLL_MS = Number(process.env.WATCH_AUTOMATION_POLL_MS || 5000);
 const DOM_LIBRARY_ROOT = path.join(PROJECT_ROOT, 'diagnostics', 'dom-library');
@@ -50,6 +51,7 @@ let server = null;
 let closing = false;
 let domWriteChain = Promise.resolve();
 let diagnosticWriteChain = Promise.resolve();
+let updateApplying = false;
 const recentDomKeys = new Set();
 const recentDomKeyOrder = [];
 const domSessionsSeen = new Set();
@@ -57,6 +59,14 @@ const controlCommands = [];
 // Use a restart-safe numeric ID. The extension persists the last consumed ID,
 // while this development server may be restarted during code changes.
 let nextControlId = Date.now() * 1000 + 1;
+
+const updateManager = createUpdateManager(PROJECT_ROOT, {
+  onApplyStart: async () => { updateApplying = true; },
+  onApplyEnd: async () => {
+    updateApplying = false;
+    await rescan('manual-update');
+  }
+});
 
 function relativePath(filePath) {
   return path.relative(EXTENSION_ROOT, filePath).split(path.sep).join('/');
@@ -398,7 +408,7 @@ async function snapshotExtension() {
 }
 
 async function rescan(reason) {
-  if (closing) return;
+  if (closing || updateApplying) return;
   try {
     const next = await snapshotExtension();
     const initialized = state.revision !== null;
@@ -767,6 +777,52 @@ function stopStaleWindowsWatcherOnPort() {
 function startHttpServer() {
   server = createServer((request, response) => {
     const requestUrl = new URL(request.url || '/', `http://${HOST}:${PORT}`);
+    if (requestUrl.pathname.startsWith('/update')) {
+      const origin = String(request.headers.origin || '');
+      if (!/^chrome-extension:\/\/[a-p]{32}$/i.test(origin)) {
+        jsonResponse(response, 403, { ok: false, error: 'Обновление разрешено только из интерфейса расширения' });
+        return;
+      }
+      if (request.method === 'OPTIONS') {
+        response.writeHead(204, {
+          'Access-Control-Allow-Origin': origin,
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+          'Vary': 'Origin'
+        });
+        response.end();
+        return;
+      }
+      if (request.method === 'GET' && requestUrl.pathname === '/update/status') {
+        fs.readFile(path.join(PROJECT_ROOT, UPDATE_STATE_FILE), 'utf8')
+          .then((contents) => JSON.parse(contents))
+          .catch(() => null)
+          .then((installed) => jsonResponse(response, 200, {
+            ok: true,
+            status: updateManager.getStatus(),
+            installed
+          }));
+        return;
+      }
+      if (request.method === 'POST' && requestUrl.pathname === '/update') {
+        if (!updateManager.startPrepare()) {
+          jsonResponse(response, 409, { ok: false, error: 'Проверка или установка обновления уже идёт', status: updateManager.getStatus() });
+          return;
+        }
+        jsonResponse(response, 202, { ok: true, started: true, status: updateManager.getStatus() });
+        return;
+      }
+      if (request.method === 'POST' && requestUrl.pathname === '/update/apply') {
+        if (!updateManager.startApply()) {
+          jsonResponse(response, 409, { ok: false, error: 'Нет подготовленного обновления для установки', status: updateManager.getStatus() });
+          return;
+        }
+        jsonResponse(response, 202, { ok: true, started: true, status: updateManager.getStatus() });
+        return;
+      }
+      jsonResponse(response, 404, { ok: false, error: 'Неизвестный маршрут обновления' });
+      return;
+    }
     if (request.method === 'OPTIONS') {
       response.writeHead(204, {
         'Access-Control-Allow-Origin': '*',

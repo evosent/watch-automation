@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "watch:extension": "node dev/watch-extension.mjs"
+    "watch:extension": "node dev/watch-extension.mjs",
+    "build:update": "node scripts/build-update-package.mjs"
   },
   "devDependencies": {
     "fake-indexeddb": "^6.2.5"

@@ -16,10 +16,13 @@ import {
   mergeScannedGroups,
   modelCatalogRecordsFromGroups,
   queueGroupsFromCatalog,
+  queuePartPlan,
+  queueEntriesForPart,
   normalizeRelativePath,
   normalizeRunLimit,
   normalizeWatchFilter,
   normalizeWorkerCount,
+  RUN_PART_SIZE,
   GENERATION_MEMORY_STATUS_LABELS,
   GENERATION_MEMORY_STATUSES,
   parseFilterSelectionId,
@@ -32,7 +35,7 @@ import {
 } from './queue-utils.js';
 import {
   getAsset, getAssetKeys, replaceAssets, replaceModelCatalog, getAllModelCatalog, adoptLegacyGenerationRevisions,
-  getOutputDirectoryHandle, putOutputDirectoryHandle
+  getOutputDirectoryHandle, putOutputDirectoryHandle, listRunDiagnostics, getRunDiagnostic
 } from './idb.js';
 import { buildInputPlan, normalizeInputMode, DEFAULT_INPUT_MODE } from './input-plan.js';
 import { selectFactsProgressForSlot } from './facts-progress-utils.js';
@@ -58,6 +61,17 @@ let promptText = '';
 let generationMemory = { version: 1, items: {} };
 let lastPreflight = null;
 let lastMemoryRenderKey = '';
+let diagnosticsObservedOperationId = '';
+let diagnosticsObservedRunState = 'IDLE';
+let desiredRunPart = '';
+let desiredRunPartSignature = '';
+let currentLaunchPartPlan = null;
+let currentLaunchSelectionExact = false;
+let extensionUpdateStatus = { phase: 'idle', message: 'Проверка запускается вручную из этого раздела.' };
+let extensionUpdatePollTimer = null;
+let extensionUpdatePollInFlight = false;
+let referenceSyncInFlight = false;
+const EXTENSION_UPDATE_ACTIVE_PHASES = new Set(['checking', 'downloading', 'validating', 'ready', 'applying', 'syncing-references']);
 const DOM_DIAGNOSTICS_MODE_LABELS = {
   off: 'Постоянный сбор выключен.',
   errors: 'DOM сохраняется только при ошибках и зависании.',
@@ -225,9 +239,9 @@ function memoryFilterState() {
 
 function setFilterInputs(filterValue = {}, memoryFilters = {}) {
   const filter = normalizeWatchFilter(filterValue);
-  const legacyGroup = groupIdForWatchFilter(filter);
-  const group = QUEUE_GROUP_IDS.includes(legacyGroup) ? legacyGroup : 'all';
-  const brand = filter.brand;
+  const groupId = `${filter.saleStatus}_${filter.quality}`;
+  const group = QUEUE_GROUP_IDS.includes(groupId) ? groupId : '';
+  const brand = filter.brand !== 'all' ? filter.brand : '';
   if ($('runGroupFilter')) $('runGroupFilter').value = group;
   if ($('runBrandFilter')) $('runBrandFilter').value = brand;
   const catalogGroup = QUEUE_GROUP_IDS.includes(String(memoryFilters.group || ''))
@@ -266,25 +280,103 @@ function repairQueueSourceIds(queueValue = queue) {
 }
 
 function launchQueueMode() {
-  return $('runQueueMode')?.value === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular';
+  const value = String($('runQueueMode')?.value || '');
+  return ['regular', REGENERATION_QUEUE_ID].includes(value) ? value : '';
 }
 
-function launchQueueEntries() {
+function launchSelectionIsExact() {
+  const groupId = String($('runGroupFilter')?.value || '');
+  const brand = String($('runBrandFilter')?.value || '');
+  return ['regular', REGENERATION_QUEUE_ID].includes(launchQueueMode())
+    && QUEUE_GROUP_IDS.includes(groupId)
+    && WATCH_BRAND_FILTERS.some((item) => item.id === brand && item.id !== 'all');
+}
+
+function launchQueueCandidates() {
+  if (!launchSelectionIsExact()) return [];
   const repairs = repairQueueSourceIds();
   const filtered = filterEntries();
   if (launchQueueMode() === REGENERATION_QUEUE_ID) {
-    return filtered.filter((entry) => repairs.has(String(entry.sourceId)) && entry.status !== 'running');
+    return filtered.filter((entry) => repairs.has(String(entry.sourceId)));
   }
-  return filtered.filter((entry) => !repairs.has(String(entry.sourceId)) && !['done', 'running'].includes(entry.status));
+  return filtered;
+}
+
+function launchQueuePartPlan() {
+  if (!launchSelectionIsExact()) return null;
+  const filter = filterFromInputs();
+  const context = `${launchQueueMode()}|${filter.saleStatus}|${filter.quality}|${filter.brand}`;
+  return queuePartPlan(launchQueueCandidates(), RUN_PART_SIZE, context);
+}
+
+function launchQueueEntries(plan = launchQueuePartPlan()) {
+  const partNumber = Number($('runPart')?.value || 0);
+  const selectedEntries = queueEntriesForPart(plan, partNumber);
+  if (!selectedEntries.length) return [];
+  const repairs = repairQueueSourceIds();
+  if (launchQueueMode() === REGENERATION_QUEUE_ID) {
+    return selectedEntries.filter((entry) => repairs.has(String(entry.sourceId)) && entry.status !== 'running');
+  }
+  return selectedEntries.filter((entry) => !repairs.has(String(entry.sourceId)) && !['done', 'running'].includes(entry.status));
+}
+
+function resetRunPartSelection() {
+  desiredRunPart = '';
+  desiredRunPartSignature = '';
+  const select = $('runPart');
+  if (!select) return;
+  select.dataset.partitionSignature = '';
+  select.value = '';
 }
 
 function updateLaunchQueueSummary() {
   const node = $('launchQueueSummary');
   if (!node) return;
-  const count = launchQueueEntries().length;
-  node.textContent = launchQueueMode() === REGENERATION_QUEUE_ID
-    ? `${count} моделей в очереди брака`
-    : `${count} моделей · ${filterLabel()}`;
+  const select = $('runPart');
+  const selectionExact = launchSelectionIsExact();
+  const plan = selectionExact ? launchQueuePartPlan() : null;
+  currentLaunchPartPlan = plan;
+  currentLaunchSelectionExact = selectionExact;
+  if (select) {
+    const previousPart = String(select.value || '');
+    const previousSignature = String(select.dataset.partitionSignature || '');
+    const keepPrevious = Boolean(plan && previousPart && previousSignature === plan.signature);
+    const restoreSaved = Boolean(plan && desiredRunPart && desiredRunPartSignature === plan.signature);
+    select.replaceChildren(new Option(
+      selectionExact ? (plan?.partCount ? 'Выберите часть' : 'Очередь пуста') : 'Сначала задайте фильтры',
+      ''
+    ));
+    if (plan) {
+      for (const part of plan.parts) {
+        select.add(new Option(`Часть ${part.partNumber} из ${plan.partCount} · ${part.count} моделей`, String(part.partNumber)));
+      }
+      const wanted = keepPrevious ? previousPart : (restoreSaved ? desiredRunPart : '');
+      if (wanted && plan.parts.some((part) => String(part.partNumber) === wanted)) select.value = wanted;
+      select.dataset.partitionSignature = plan.signature;
+      if (!restoreSaved && desiredRunPart) {
+        desiredRunPart = '';
+        desiredRunPartSignature = '';
+      }
+    } else {
+      select.dataset.partitionSignature = '';
+      select.value = '';
+    }
+  }
+  const count = launchQueueEntries(plan).length;
+  if (!selectionExact) {
+    node.textContent = 'Выберите очередь, точную категорию и один бренд';
+    return;
+  }
+  if (!plan?.total) {
+    node.textContent = launchQueueMode() === REGENERATION_QUEUE_ID
+      ? 'В очереди брака нет подходящих моделей'
+      : 'По этим фильтрам моделей нет';
+    return;
+  }
+  const selectedNumber = Number(select?.value || 0);
+  const selectedPart = plan.parts.find((part) => part.partNumber === selectedNumber);
+  const tail = selectedPart ? ` · часть ${selectedPart.partNumber}/${plan.partCount} · к запуску ${count}` : ` · ${plan.partCount} частей`;
+  node.textContent = `${plan.total} моделей${tail} · ${filterLabel()}`;
 }
 
 function filterLabel(filterValue = filterFromInputs()) {
@@ -292,15 +384,18 @@ function filterLabel(filterValue = filterFromInputs()) {
 }
 
 function populateBrandFilter() {
-  for (const id of ['runBrandFilter', 'memoryBrandFilter']) {
-    const select = $(id);
-    if (!select) continue;
-    select.replaceChildren();
+  const runBrand = $('runBrandFilter');
+  if (runBrand) {
+    runBrand.replaceChildren(new Option('Выберите один бренд', ''));
+    for (const item of WATCH_BRAND_FILTERS.filter((item) => item.id !== 'all')) {
+      runBrand.add(new Option(item.label, item.id));
+    }
+  }
+  const memoryBrand = $('memoryBrandFilter');
+  if (memoryBrand) {
+    memoryBrand.replaceChildren();
     for (const item of WATCH_BRAND_FILTERS) {
-      const option = document.createElement('option');
-      option.value = item.id;
-      option.textContent = item.label;
-      select.append(option);
+      memoryBrand.add(new Option(item.label, item.id));
     }
   }
 }
@@ -628,11 +723,15 @@ async function loadQueue() {
     setFilterInputs(
       savedJob.filters
       || parseFilterSelectionId(savedJob.queueGroup)
-      || filterFromQueueGroup(savedJob.queueGroup || 'in_sale_good'),
+      || filterFromQueueGroup(savedJob.queueGroup || ''),
       savedJob.memoryFilters || {}
     );
-    if ($('runQueueMode')) $('runQueueMode').value = savedJob.runQueueMode === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular';
-    $('runLimit').value = String(normalizeRunLimit(savedJob.runLimit, 1) || 1);
+    if ($('runQueueMode')) $('runQueueMode').value = ['regular', REGENERATION_QUEUE_ID].includes(savedJob.runQueueMode) ? savedJob.runQueueMode : '';
+    desiredRunPart = Number.isSafeInteger(Number(savedJob.runPart)) && Number(savedJob.runPart) > 0
+      ? String(Number(savedJob.runPart))
+      : '';
+    desiredRunPartSignature = String(savedJob.runPartSignature || '');
+    $('runLimit').value = String(Math.min(RUN_PART_SIZE, normalizeRunLimit(savedJob.runLimit, RUN_PART_SIZE) || RUN_PART_SIZE));
     $('workerCount').value = String(normalizeWorkerCount(savedJob.workerCount, 4));
     if ($('inputMode')) $('inputMode').value = normalizeInputMode(savedJob.inputMode, DEFAULT_INPUT_MODE);
     $('rateLimitPauseMinutes').value = String(normalizeRateLimitPauseMinutes(savedJob.rateLimitPauseMinutes));
@@ -640,8 +739,9 @@ async function loadQueue() {
     $('generationPauseMinutes').value = String(normalizeGenerationPauseMinutes(savedJob.generationPauseMinutes));
     $('generationJitterSeconds').value = String(normalizeGenerationJitterSeconds(savedJob.generationJitterSeconds));
   } else {
-    setFilterInputs({ saleStatus: 'in_sale', quality: 'good', brand: 'all' });
-    if ($('runQueueMode')) $('runQueueMode').value = 'regular';
+    setFilterInputs({ saleStatus: 'all', quality: 'all', brand: 'all' });
+    if ($('runQueueMode')) $('runQueueMode').value = '';
+    $('runLimit').value = String(RUN_PART_SIZE);
     if ($('inputMode')) $('inputMode').value = DEFAULT_INPUT_MODE;
     $('rateLimitPauseMinutes').value = String(DEFAULT_RATE_LIMIT_PAUSE_MINUTES);
     $('rateLimitIgnoreMinutes').value = String(DEFAULT_RATE_LIMIT_IGNORE_MINUTES);
@@ -669,7 +769,7 @@ async function saveDraft() {
   const stored = await chrome.storage.local.get('job');
   const { coverageMode: _legacyCoverageMode, ...previous } = stored.job || {};
   const filter = filterFromInputs();
-  const runLimit = normalizeRunLimit($('runLimit').value, 1);
+  const runLimit = Math.min(RUN_PART_SIZE, normalizeRunLimit($('runLimit').value, RUN_PART_SIZE));
   const workerCount = normalizeWorkerCount($('workerCount').value, 4);
   const rateLimitPauseMinutes = normalizeRateLimitPauseMinutes($('rateLimitPauseMinutes')?.value);
   const rateLimitIgnoreMinutes = normalizeRateLimitIgnoreMinutes($('rateLimitIgnoreMinutes')?.value);
@@ -684,8 +784,10 @@ async function saveDraft() {
       queueGroup: groupIdForWatchFilter(filter),
       filters: filter,
       runQueueMode,
+      runPart: $('runPart')?.value ? Number($('runPart').value) : null,
+      runPartSignature: $('runPart')?.value ? String($('runPart')?.dataset.partitionSignature || '') : '',
       memoryFilters: memoryFilterState(),
-      runLimit: runLimit > 0 ? runLimit : 1,
+      runLimit: runLimit > 0 ? runLimit : RUN_PART_SIZE,
       workerCount,
       inputMode,
       rateLimitPauseMinutes,
@@ -931,6 +1033,7 @@ function renderAll() {
   renderSlotGrid();
   renderPreflight(lastPreflight);
   updateLaunchQueueSummary();
+  updateActionButtons();
 }
 
 function renderPreflight(result) {
@@ -948,7 +1051,7 @@ function renderPreflight(result) {
   node.className = `preflight-summary ${failed.length ? 'is-error' : 'is-ok'}`;
   node.textContent = failed.length
     ? `Проверка остановлена: ${failed.map((check) => check.label).join(', ')}`
-    : `Проверка OK · ${result.candidates || 0} моделей${warnings.length ? ` · предупреждение: ${warnings.map((check) => check.label).join(', ')}` : ''}`;
+    : `Проверка OK · ${result.candidates || 0} моделей${result.runPart ? ` · часть ${result.runPart}/${result.runPartCount}` : ''}${warnings.length ? ` · предупреждение: ${warnings.map((check) => check.label).join(', ')}` : ''}`;
   const dock = $('dockCopy');
   if (dock) dock.textContent = failed.length
     ? `Нужно исправить: ${failed.map((check) => check.label).join(', ')}`
@@ -958,8 +1061,7 @@ function renderPreflight(result) {
 async function saveJob({ requireQueue = false } = {}) {
   const filter = filterFromInputs();
   const queueGroup = groupIdForWatchFilter(filter);
-  const selectedEntries = launchQueueEntries();
-  const runLimit = normalizeRunLimit($('runLimit').value, 1);
+  const runLimit = Math.min(RUN_PART_SIZE, normalizeRunLimit($('runLimit').value, RUN_PART_SIZE));
   const workerCount = normalizeWorkerCount($('workerCount').value, 4);
   const rateLimitPauseMinutes = normalizeRateLimitPauseMinutes($('rateLimitPauseMinutes')?.value);
   const rateLimitIgnoreMinutes = normalizeRateLimitIgnoreMinutes($('rateLimitIgnoreMinutes')?.value);
@@ -969,11 +1071,22 @@ async function saveJob({ requireQueue = false } = {}) {
   const runQueueMode = launchQueueMode();
   const inputPlan = buildInputPlan(inputMode);
   if (!promptText.trim()) throw new Error('Промпт Base Prompt v5.txt не загружен');
-  if (runLimit < 1) throw new Error('Укажи положительное количество фото');
-  if (requireQueue && !selectedEntries.length) {
+  if (!['regular', REGENERATION_QUEUE_ID].includes(runQueueMode)) throw new Error('Выбери список запуска');
+  if (!QUEUE_GROUP_IDS.includes(String($('runGroupFilter')?.value || ''))) throw new Error('Выбери точный статус и качество модели');
+  if (!WATCH_BRAND_FILTERS.some((item) => item.id === String($('runBrandFilter')?.value || '') && item.id !== 'all')) {
+    throw new Error('Выбери один конкретный бренд');
+  }
+  if (runLimit < 1) throw new Error('Укажи количество фото от 1 до 100');
+  const partPlan = launchQueuePartPlan();
+  const runPart = Number($('runPart')?.value || 0);
+  const selectedPart = partPlan?.parts?.find((part) => part.partNumber === runPart);
+  if (!selectedPart || String($('runPart')?.dataset.partitionSignature || '') !== partPlan.signature) {
+    throw new Error('Выбери часть очереди. Если список изменился, выбери часть заново.');
+  }
+  if (requireQueue && !selectedPart.count) {
     throw new Error(runQueueMode === REGENERATION_QUEUE_ID
       ? 'В очереди перегенерации брака пока нет моделей'
-      : 'В выбранной обычной очереди нет доступных моделей');
+      : 'В выбранной обычной очереди нет моделей');
   }
   const referenceKeys = new Set([
     ...referenceFiles.keys(),
@@ -997,6 +1110,9 @@ async function saveJob({ requireQueue = false } = {}) {
       queueGroup,
       filters: filter,
       runQueueMode,
+      runPart,
+      runPartSignature: partPlan.signature,
+      runPartCount: partPlan.partCount,
       memoryFilters: memoryFilterState(),
       runLimit,
       workerCount,
@@ -1024,6 +1140,7 @@ async function refreshRuntimeFast() {
   if (!response?.ok) return;
   const value = response.value || {};
   runtime = { ...runtime, ...(value.runtime || {}), run: value.run ?? null };
+  refreshRunDiagnosticsAtBoundary();
   const pause = ['RUNNING', 'STARTING', 'DRAINING', 'PAUSED'].includes(runtime.state) ? countdown(runtime.rateLimitPauseUntil) : '';
   renderHealth(pause);
   renderRunStatus(pause);
@@ -1069,10 +1186,16 @@ function formatDuration(milliseconds) {
 function renderRunStatus(pause = countdown(runtime.rateLimitPauseUntil)) {
   const state = String(runtime.state || 'IDLE').toUpperCase();
   const stateLabel = RUN_STATE_LABELS[state] || runtime.status || state;
+  const stalledBatchStage = String(runtime.stalledBatchRecovery?.stage || '').toUpperCase();
+  const stalledBatchWait = stalledBatchStage === 'WAITING' ? countdown(runtime.stalledBatchRecovery?.dueAt) : '';
   const recoveryStage = String(runtime.conversationRecovery?.stage || '').toUpperCase();
   const conversationWait = recoveryStage === 'WAITING' ? countdown(runtime.conversationRecovery?.dueAt) : '';
   let badgeLabel = stateLabel;
-  if (recoveryStage === 'INSPECTING') badgeLabel = 'ПРОВЕРЯЮ ЧАТЫ';
+  if (stalledBatchStage === 'CLOSING') badgeLabel = 'ЗАКРЫВАЮ ВКЛАДКИ';
+  else if (stalledBatchStage === 'WAITING') badgeLabel = `ОТДЫХ · ${stalledBatchWait || 'скоро'}`;
+  else if (stalledBatchStage === 'RESTARTING') badgeLabel = 'ВОЗОБНОВЛЯЮ ПРОГОН';
+  else if (stalledBatchStage === 'FAILED') badgeLabel = 'АВТОВОССТАНОВЛЕНИЕ ОСТАНОВЛЕНО';
+  else if (recoveryStage === 'INSPECTING') badgeLabel = 'ПРОВЕРЯЮ ЧАТЫ';
   else if (recoveryStage === 'WAITING') badgeLabel = `ВОССТАНОВЛЕНИЕ · ${conversationWait || 'скоро'}`;
   else if (recoveryStage === 'REOPENING') badgeLabel = 'ВОССТАНОВЛЕНИЕ ЧАТОВ';
   else if (recoveryStage === 'FAILED') badgeLabel = 'ВОССТАНОВЛЕНИЕ ОСТАНОВЛЕНО';
@@ -1081,7 +1204,15 @@ function renderRunStatus(pause = countdown(runtime.rateLimitPauseUntil)) {
   else if (runtime.status === 'DONE_WITH_FACTS_ERRORS') badgeLabel = 'ЗАВЕРШЕНО · ОШИБКИ OCR';
   $('stateBadge').textContent = badgeLabel;
   let actionText = runtime.currentAction || (state === 'IDLE' ? 'Ожидание запуска.' : 'Состояние обновляется.');
-  if (recoveryStage === 'INSPECTING') {
+  if (stalledBatchStage === 'CLOSING') {
+    actionText = runtime.currentAction || 'Закрываю зависшие рабочие вкладки; завершённые PNG и прогресс сохранены.';
+  } else if (stalledBatchStage === 'WAITING') {
+    actionText = `${runtime.currentAction || `Незавершённые модели вернутся в очередь через 5 минут.`} · осталось ${stalledBatchWait || 'меньше секунды'}`;
+  } else if (stalledBatchStage === 'RESTARTING') {
+    actionText = runtime.currentAction || 'Пятиминутный отдых завершён. Восстанавливаю рабочие вкладки…';
+  } else if (stalledBatchStage === 'FAILED') {
+    actionText = runtime.currentAction || runtime.stalledBatchRecovery?.error || 'Автоматическое восстановление не завершилось; прогресс сохранён.';
+  } else if (recoveryStage === 'INSPECTING') {
     actionText = runtime.currentAction || 'Приостанавливаю новые отправки и проверяю сохранённые разговоры ChatGPT…';
   } else if (recoveryStage === 'WAITING') {
     actionText = `${runtime.currentAction || 'Разговоры ChatGPT будут открыты повторно.'} · осталось ${conversationWait || 'меньше секунды'}`;
@@ -1376,6 +1507,9 @@ function renderGenerationMemory() {
 
 function updateActionButtons() {
   const canContinue = runtime.state === 'PAUSED' && runtime.run;
+  const stalledBatchStage = String(runtime.stalledBatchRecovery?.stage || '').toUpperCase();
+  const stalledBatchBusy = ['CLOSING', 'WAITING', 'RESTARTING'].includes(stalledBatchStage);
+  const stalledBatchCountdown = countdown(runtime.stalledBatchRecovery?.dueAt);
   const conversationRecoveryStage = String(runtime.conversationRecovery?.stage || '').toUpperCase();
   const conversationRecoveryBusy = ['INSPECTING', 'WAITING', 'REOPENING'].includes(conversationRecoveryStage);
   const recoveryCountdown = countdown(runtime.conversationRecovery?.dueAt);
@@ -1383,14 +1517,24 @@ function updateActionButtons() {
     && Number(runtime.rateLimitPauseUntil || 0) > Date.now();
   const isRunning = ['RUNNING', 'STARTING', 'DRAINING'].includes(runtime.state);
   const isReconciling = runtime.state === 'RECONCILING';
+  const launchPlan = currentLaunchPartPlan;
+  const selectedLaunchPart = launchPlan?.parts?.find((part) => part.partNumber === Number($('runPart')?.value || 0));
+  const launchSelectionReady = currentLaunchSelectionExact
+    && Boolean(selectedLaunchPart)
+    && String($('runPart')?.dataset.partitionSignature || '') === String(launchPlan?.signature || '');
   let startLabel = canContinue ? 'ПРОДОЛЖИТЬ' : 'СТАРТ';
   if (actionBusy) startLabel = 'ПРОВЕРКА…';
+  else if (stalledBatchStage === 'CLOSING') startLabel = 'ЗАКРЫВАЮ ВКЛАДКИ…';
+  else if (stalledBatchStage === 'WAITING') startLabel = `ОТДЫХ · ${stalledBatchCountdown || '5:00'}`;
+  else if (stalledBatchStage === 'RESTARTING') startLabel = 'ВОЗОБНОВЛЯЮ…';
   else if (conversationRecoveryStage === 'INSPECTING') startLabel = 'ПРОВЕРЯЮ ЧАТЫ…';
   else if (conversationRecoveryStage === 'WAITING') startLabel = `ВОССТАНОВЛЕНИЕ ${recoveryCountdown ? `· ${recoveryCountdown}` : ''}`.trim();
   else if (conversationRecoveryStage === 'REOPENING') startLabel = 'ОТКРЫВАЮ ЧАТЫ…';
   else if (waitingImageLimit) startLabel = 'ОЖИДАНИЕ ЛИМИТА';
   $('start').querySelector('span:last-child').textContent = startLabel;
-  $('start').disabled = isRunning || isReconciling || actionBusy || waitingImageLimit || conversationRecoveryBusy;
+  $('start').disabled = isRunning || isReconciling || actionBusy || waitingImageLimit || conversationRecoveryBusy || stalledBatchBusy
+    || ['applying', 'syncing-references'].includes(extensionUpdateStatus.phase)
+    || (!canContinue && !launchSelectionReady);
   $('pauseRun').disabled = !isRunning || isReconciling || actionBusy;
   const stopButton = $('stop');
   const stopLabel = stopButton?.querySelector('span:last-child');
@@ -1406,9 +1550,21 @@ function updateActionButtons() {
   }
   if ($('resetRunRescan')) $('resetRunRescan').disabled = actionBusy;
   if ($('exportDiagnostics')) $('exportDiagnostics').disabled = actionBusy;
+  const updateButton = $('updateExtension');
+  if (updateButton) {
+    const updateBusy = EXTENSION_UPDATE_ACTIVE_PHASES.has(extensionUpdateStatus.phase);
+    updateButton.disabled = updateBusy || isRunning || isReconciling || actionBusy || Boolean(canContinue);
+    updateButton.textContent = extensionUpdateStatus.phase === 'applying'
+      ? 'Устанавливаю обновление…'
+      : extensionUpdateStatus.phase === 'syncing-references'
+        ? 'Синхронизирую референсы…'
+      : updateBusy
+        ? (extensionUpdateStatus.phase === 'ready' ? 'Ожидаю свободные вкладки…' : 'Проверяю и скачиваю…')
+        : 'Проверить и обновить';
+  }
   const controlsLocked = isRunning || isReconciling || actionBusy || Boolean(canContinue);
   $('workerCount').disabled = controlsLocked;
-  ['runQueueMode', 'runGroupFilter', 'runBrandFilter', 'runLimit', 'inputMode', 'rateLimitPauseMinutes'].forEach((id) => {
+  ['runQueueMode', 'runGroupFilter', 'runBrandFilter', 'runPart', 'runLimit', 'inputMode', 'rateLimitPauseMinutes'].forEach((id) => {
     if ($(id)) $(id).disabled = controlsLocked;
   });
 }
@@ -1420,6 +1576,7 @@ function renderHealth(pause = countdown(runtime.rateLimitPauseUntil)) {
   const warning = runtime.status === 'RUNNING_WITH_ERRORS'
     || runtime.status === 'PAUSED_ON_ERROR'
     || runtime.status === 'DONE_WITH_FACTS_ERRORS'
+    || String(runtime.stalledBatchRecovery?.stage || '').toUpperCase() === 'FAILED'
     || runtime.state === 'ERROR'
     || Boolean(runtime.error);
   const rateLimited = Boolean(pause) || runtime.status === 'RATE_LIMIT_PAUSE';
@@ -1474,6 +1631,7 @@ async function refreshRuntime() {
   };
   $('meta').textContent = [
     `Фильтр: ${runtime.filterLabel || filterLabel(appliedFilter)}`,
+    Number(runtime.runPart || 0) > 0 ? `Часть очереди: ${runtime.runPart}/${runtime.runPartCount || '—'} · назначено ${runtime.runPartCandidateCount || 0}` : '',
     `Прогон: ${runtime.runCompleted ?? 0}/${runtime.runTotal ?? '—'} · осталось ${runtime.runRemaining ?? '—'}`,
     `Выбранный список: ${selected.done}/${selected.total}`,
     runtime.error ? `Ошибка: ${compact(runtime.error, 160)}` : ''
@@ -1661,6 +1819,60 @@ function downloadJson(filename, payload) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function runDiagnosticOptionLabel(run) {
+  const date = run.startedAt && Number.isFinite(Date.parse(run.startedAt))
+    ? new Date(run.startedAt).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+    : 'Время неизвестно';
+  const state = run.status || run.state || 'UNKNOWN';
+  return `${date} · ${state} · ${Number(run.completedCount || 0)}/${Number(run.plannedCount || 0)} · ${Number(run.eventCount || 0)} событий`;
+}
+
+async function refreshRunDiagnosticsList() {
+  const select = $('runDiagnosticsSelect');
+  if (!select) return;
+  const selectedId = select.value;
+  const runs = await listRunDiagnostics({ limit: 500 });
+  select.replaceChildren(new Option(runs.length ? 'Выберите прогон…' : 'Архив прогонов пуст', ''));
+  for (const run of runs) select.add(new Option(runDiagnosticOptionLabel(run), run.operationId));
+  select.value = runs.some((run) => run.operationId === selectedId)
+    ? selectedId
+    : (runs[0]?.operationId || '');
+  $('exportRunDiagnostics').disabled = !select.value;
+  $('runDiagnosticsStatus').textContent = runs.length
+    ? `Сохранено прогонов: ${runs.length}. События каждого прогона хранятся отдельно.`
+    : 'После запуска здесь появится отдельная диагностика с временной шкалой событий.';
+}
+
+function refreshRunDiagnosticsAtBoundary() {
+  const operationId = String(runtime.operationId || runtime.run?.operationId || '');
+  const state = String(runtime.state || 'IDLE');
+  const startedNewRun = Boolean(operationId && operationId !== diagnosticsObservedOperationId);
+  const completedRun = Boolean(operationId && ['DONE', 'STOPPED'].includes(state)
+    && state !== diagnosticsObservedRunState);
+  const resetOrStopped = Boolean(!operationId && diagnosticsObservedOperationId
+    && ['IDLE', 'STOPPED', 'RECONCILING'].includes(state));
+  diagnosticsObservedOperationId = operationId;
+  diagnosticsObservedRunState = state;
+  if (startedNewRun || completedRun || resetOrStopped) refreshRunDiagnosticsList().catch(() => {});
+}
+
+async function exportSelectedRunDiagnostic() {
+  const operationId = $('runDiagnosticsSelect')?.value;
+  if (!operationId) throw new Error('Выбери прогон для экспорта');
+  const archive = await getRunDiagnostic(operationId);
+  if (!archive?.run) throw new Error('Диагностика прогона не найдена. Обнови список и повтори экспорт.');
+  const payload = {
+    schemaVersion: 1,
+    exportedAt: new Date().toISOString(),
+    extensionVersion: chrome.runtime.getManifest?.().version || null,
+    run: archive.run,
+    events: archive.events
+  };
+  const stamp = String(archive.run.startedAt || new Date().toISOString()).replace(/[:.]/g, '-');
+  downloadJson(`watch-automation-run-${stamp}-${String(operationId).slice(0, 8)}.json`, payload);
+  showFeedback(`Диагностика прогона сохранена: ${archive.events.length} событий.`, { type: 'success', autoHide: true });
+}
+
 async function exportDiagnosticSnapshot() {
   const response = await chrome.runtime.sendMessage({ type: 'GET_RUNTIME' });
   if (!response?.ok) throw new Error(response?.error || 'Не удалось получить состояние расширения');
@@ -1736,6 +1948,209 @@ function showError(error) {
   showFeedback(error?.message || String(error), { type: 'error' });
 }
 
+function renderExtensionUpdateStatus(status, { deferred = false, reason = '', applying = false } = {}) {
+  extensionUpdateStatus = { ...(status || {}), phase: applying ? 'applying' : (status?.phase || 'idle') };
+  const version = $('extensionVersion');
+  const message = $('updateStatus');
+  if (version) {
+    const current = String(status?.currentVersion || chrome.runtime.getManifest?.().version || '—');
+    version.textContent = status?.latestVersion && status.latestVersion !== current
+      ? `${current} → ${status.latestVersion}`
+      : current;
+  }
+  if (message) {
+    message.dataset.state = extensionUpdateStatus.phase;
+    if (applying) {
+      message.textContent = 'Обновление готово. Устанавливаю код и референсы; входные фото часов остаются на месте.';
+    } else if (deferred) {
+      message.textContent = `Пакет готов. Установка начнётся после завершения прогона.${reason ? ` ${reason}` : ''}`;
+    } else {
+      message.textContent = String(status?.message || 'Проверка обновления запускается вручную.');
+    }
+  }
+  updateActionButtons();
+}
+
+function scheduleExtensionUpdatePoll(delayMs = 5000) {
+  if (extensionUpdatePollTimer) clearTimeout(extensionUpdatePollTimer);
+  extensionUpdatePollTimer = setTimeout(() => {
+    extensionUpdatePollTimer = null;
+    refreshExtensionUpdateStatus().catch(() => {});
+  }, delayMs);
+}
+
+async function syncUpdatedReferenceAssetsIfNeeded(installed, status = {}) {
+  const packageId = String(installed?.packageId || '');
+  if (!packageId || referenceSyncInFlight) return false;
+  const stored = await chrome.storage.local.get('manualReferenceSyncPackageId');
+  if (String(stored.manualReferenceSyncPackageId || '') === packageId) return false;
+
+  referenceSyncInFlight = true;
+  renderExtensionUpdateStatus({
+    ...status,
+    phase: 'syncing-references',
+    message: 'Код обновлён. Загружаю свежие референсы в локальную библиотеку расширения…'
+  });
+  try {
+    const listResponse = await fetch('http://127.0.0.1:17321/local-input-files?kind=references', { cache: 'no-store' });
+    if (!listResponse.ok) throw new Error(`Локальный сервис референсов ответил HTTP ${listResponse.status}`);
+    const listed = await listResponse.json();
+    const sourceFiles = (Array.isArray(listed?.files) ? listed.files : [])
+      .filter((item) => item?.path && referenceDescriptorForPath(item.path));
+    if (!sourceFiles.length) throw new Error('В папке input-ref-images не найдены файлы референсов для этой версии.');
+
+    const nextAssets = [];
+    const nextMetadata = [];
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(3, sourceFiles.length) }, async () => {
+      while (cursor < sourceFiles.length) {
+        const item = sourceFiles[cursor++];
+        const descriptor = referenceDescriptorForPath(item.path);
+        const url = `http://127.0.0.1:17321/local-input-file?path=${encodeURIComponent(item.path)}`;
+        const fileResponse = await fetch(url, { cache: 'no-store' });
+        if (!fileResponse.ok) throw new Error(`Не удалось прочитать референс ${item.name}: HTTP ${fileResponse.status}`);
+        const blob = await fileResponse.blob();
+        const file = new File([blob], item.name || pathBasename(item.path), {
+          type: blob.type || 'image/png',
+          lastModified: Number(item.modifiedAt || Date.now())
+        });
+        nextAssets.push({
+          key: `ref:${descriptor.storageKey}`,
+          file,
+          relativePath: item.path
+        });
+        nextMetadata.push([descriptor.storageKey, {
+          name: file.name,
+          size: file.size,
+          lastModified: Number(file.lastModified || 0),
+          fingerprint: fingerprintForFile(file),
+          contentHash: await sha256File(file)
+        }]);
+      }
+    });
+    await Promise.all(workers);
+    const uniqueAssets = new Map(nextAssets.map((entry) => [entry.key, entry]));
+    if (uniqueAssets.size !== nextAssets.length) throw new Error('В обновлённых референсах повторяются ключи файлов.');
+    await replaceAssets('ref:', [...uniqueAssets.values()], { force: true });
+    referenceFiles.clear();
+    for (const asset of uniqueAssets.values()) {
+      const key = asset.key.slice('ref:'.length);
+      referenceFiles.set(key, {
+        storedKey: asset.key,
+        name: asset.file.name,
+        type: asset.file.type || 'image/png',
+        size: asset.file.size
+      });
+    }
+    queue = { ...queue, refs: Object.fromEntries(nextMetadata) };
+    folderSelections = {
+      ...folderSelections,
+      references: {
+        pathHint: 'input-ref-images',
+        fileCount: uniqueAssets.size,
+        selectedFileCount: sourceFiles.length,
+        recognizedFileCount: uniqueAssets.size,
+        storageStatus: 'ready',
+        savedAt: new Date().toISOString()
+      }
+    };
+    await chrome.storage.local.set({
+      queue,
+      folderSelections,
+      manualReferenceSyncPackageId: packageId
+    });
+    renderAll();
+    renderExtensionUpdateStatus({
+      ...status,
+      phase: 'complete',
+      message: `Обновление установлено; синхронизировано референсов: ${uniqueAssets.size}. Папка входных фото часов сохранена.`
+    });
+    return true;
+  } catch (error) {
+    renderExtensionUpdateStatus({
+      ...status,
+      phase: 'error',
+      message: `Код обновлён, но референсы не синхронизировались: ${error?.message || error}. Нажми кнопку ещё раз после запуска локального сервиса.`
+    });
+    return false;
+  } finally {
+    referenceSyncInFlight = false;
+  }
+}
+
+function pathBasename(value) {
+  return String(value || '').replaceAll('\\', '/').split('/').filter(Boolean).at(-1) || 'reference.png';
+}
+
+async function refreshExtensionUpdateStatus() {
+  if (extensionUpdatePollInFlight) return;
+  extensionUpdatePollInFlight = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'GET_EXTENSION_UPDATE_STATUS' });
+    if (!response?.ok) throw new Error(response?.error || 'Не удалось получить состояние обновления');
+    const status = response.status || {};
+    const installed = response.installed || null;
+    renderExtensionUpdateStatus(status, {
+      deferred: response.deferred === true,
+      reason: response.reason || '',
+      applying: response.applying === true || status.phase === 'applying'
+    });
+    const currentVersion = String(chrome.runtime.getManifest?.().version || '');
+    const installedVersionMatches = String(installed?.extensionVersion || '') === currentVersion;
+    const packageInstallationInProgress = ['checking', 'downloading', 'validating', 'ready', 'applying'].includes(String(status.phase || ''));
+    if (installed?.packageId && installedVersionMatches && !packageInstallationInProgress) {
+      await syncUpdatedReferenceAssetsIfNeeded(installed, status);
+    }
+    if (EXTENSION_UPDATE_ACTIVE_PHASES.has(extensionUpdateStatus.phase)) scheduleExtensionUpdatePoll(5000);
+    else if (extensionUpdatePollTimer) {
+      clearTimeout(extensionUpdatePollTimer);
+      extensionUpdatePollTimer = null;
+    }
+  } catch (error) {
+    const message = String(error?.message || error);
+    renderExtensionUpdateStatus({
+      phase: 'error',
+      currentVersion: chrome.runtime.getManifest?.().version || null,
+      message: message.includes('Could not establish connection') || message.includes('Failed to fetch')
+        ? 'Локальный сервис обновления не отвечает. Перезапусти WatchAutomation и повтори проверку.'
+        : message
+    });
+    if (extensionUpdatePollTimer) {
+      clearTimeout(extensionUpdatePollTimer);
+      extensionUpdatePollTimer = null;
+    }
+  } finally {
+    extensionUpdatePollInFlight = false;
+  }
+}
+
+async function startExtensionUpdateFromUi() {
+  const button = $('updateExtension');
+  if (button) button.disabled = true;
+  renderExtensionUpdateStatus({
+    phase: 'checking',
+    currentVersion: chrome.runtime.getManifest?.().version || null,
+    message: 'Проверяю GitHub. Фотографии часов останутся на месте.'
+  });
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'START_EXTENSION_UPDATE' });
+    if (!response?.ok) throw new Error(response?.error || 'Не удалось начать проверку обновления');
+    renderExtensionUpdateStatus(response.status || {
+      phase: 'checking',
+      currentVersion: chrome.runtime.getManifest?.().version || null,
+      message: 'Проверяю доступное обновление…'
+    });
+    scheduleExtensionUpdatePoll(400);
+  } catch (error) {
+    renderExtensionUpdateStatus({
+      phase: 'error',
+      currentVersion: chrome.runtime.getManifest?.().version || null,
+      message: error?.message || String(error)
+    });
+    throw error;
+  }
+}
+
 // Selecting the same directory twice does not emit `change` unless the native
 // input value is cleared first. This is especially important after a failed
 // large-folder scan, where the user needs to retry the same folder.
@@ -1745,7 +2160,13 @@ function showError(error) {
 $('refFolder').addEventListener('change', () => scanReferenceFolder().catch(showError));
 $('watchFolder').addEventListener('change', () => scanWatchFolder().catch(showError));
 $('workerCount').addEventListener('change', () => { renderSlotGrid(); saveDraft().catch(showError); });
-$('runLimit').addEventListener('change', () => { renderAll(); saveDraft().catch(showError); });
+$('runLimit').addEventListener('change', () => {
+  const value = Math.max(1, Math.min(RUN_PART_SIZE, normalizeRunLimit($('runLimit').value, RUN_PART_SIZE)));
+  $('runLimit').value = String(value);
+  renderAll();
+  updateActionButtons();
+  saveDraft().catch(showError);
+});
 $('inputMode')?.addEventListener('change', () => { renderAll(); saveDraft().catch(showError); });
 $('rateLimitPauseMinutes')?.addEventListener('change', () => saveDraft().catch(showError));
 $('rateLimitIgnoreMinutes')?.addEventListener('change', () => saveDraft().catch(showError));
@@ -1754,6 +2175,12 @@ $('generationJitterSeconds')?.addEventListener('change', () => saveDraft().catch
 $('domDiagnosticsMode')?.addEventListener('change', () => setDomDiagnosticsModeFromUi().catch(showError));
 $('clearDomDiagnostics')?.addEventListener('click', () => clearDomDiagnosticsFromUi().catch(showError));
 $('exportDiagnostics')?.addEventListener('click', () => exportDiagnosticSnapshot().catch(showError));
+$('updateExtension')?.addEventListener('click', () => startExtensionUpdateFromUi().catch(showError));
+$('refreshRunDiagnostics')?.addEventListener('click', () => refreshRunDiagnosticsList().catch(showError));
+$('runDiagnosticsSelect')?.addEventListener('change', () => {
+  $('exportRunDiagnostics').disabled = !$('runDiagnosticsSelect').value;
+});
+$('exportRunDiagnostics')?.addEventListener('click', () => exportSelectedRunDiagnostic().catch(showError));
 $('start').addEventListener('click', () => setWorkspaceView('run'));
 $('start').addEventListener('click', () => startOrResume().catch(showError));
 $('stop').addEventListener('click', () => stopOrResetRun().catch(showError));
@@ -1795,9 +2222,18 @@ $('memorySearch')?.addEventListener('input', () => {
 });
 ['runQueueMode', 'runGroupFilter', 'runBrandFilter'].forEach((id) => {
   $(id)?.addEventListener('change', () => {
+    resetRunPartSelection();
     renderAll();
+    updateActionButtons();
     saveDraft().catch(showError);
   });
+});
+$('runPart')?.addEventListener('change', () => {
+  desiredRunPart = String($('runPart').value || '');
+  desiredRunPartSignature = desiredRunPart ? String($('runPart').dataset.partitionSignature || '') : '';
+  renderAll();
+  updateActionButtons();
+  saveDraft().catch(showError);
 });
 
 $('feedbackAction')?.addEventListener('click', () => {
@@ -1870,7 +2306,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 initWorkspaceUi();
 populateBrandFilter();
-loadQueue().catch(showError);
+loadQueue()
+  .then(async () => {
+    await refreshRunDiagnosticsList();
+    await refreshExtensionUpdateStatus();
+  })
+  .catch(showError);
 // Fast status refresh is intentionally lightweight: GET_RUNTIME_FAST never
 // synchronizes the 3000-item queue. A separate slow full refresh keeps queue
 // and memory views coherent without creating a state-lock backlog.

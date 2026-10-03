@@ -65,8 +65,8 @@
                 <option value="6">6</option>
               </select>
             </label>
-            <label class="field"><span>Фото</span>
-              <input type="number" id="runLimit" min="1" step="1" value="1" inputmode="numeric">
+            <label class="field"><span>Фото за запуск · максимум 100</span>
+              <input type="number" id="runLimit" min="1" max="100" step="1" value="100" inputmode="numeric">
             </label>
             <label class="field field-wide"><span>Референсы</span>
               <select id="inputMode" title="Сколько изображений прикладывать к генерации">
@@ -87,21 +87,31 @@
             </div>
             <label class="field"><span>Список запуска</span>
               <select id="runQueueMode">
+                <option value="">Выберите очередь</option>
                 <option value="regular">Обычная очередь</option>
                 <option value="regeneration">Перегенерация брака</option>
               </select>
             </label>
             <div class="filter-grid launch-filters">
-              <select id="runGroupFilter" aria-label="Категория очереди">
-                <option value="all">Все категории</option>
-                <option value="in_sale_good">В продаже · хорошее</option>
-                <option value="in_sale_bad">В продаже · плохое</option>
-                <option value="not_in_sale_good">Не в продаже · хорошее</option>
-                <option value="not_in_sale_bad">Не в продаже · плохое</option>
-              </select>
-              <select id="runBrandFilter" aria-label="Бренд для запуска">
-                <option value="all">Все бренды</option>
-              </select>
+              <label class="field"><span>Статус и качество</span>
+                <select id="runGroupFilter" aria-label="Статус и качество модели">
+                  <option value="">Выберите точную категорию</option>
+                  <option value="in_sale_good">В продаже · хорошее</option>
+                  <option value="in_sale_bad">В продаже · плохое</option>
+                  <option value="not_in_sale_good">Не в продаже · хорошее</option>
+                  <option value="not_in_sale_bad">Не в продаже · плохое</option>
+                </select>
+              </label>
+              <label class="field"><span>Бренд</span>
+                <select id="runBrandFilter" aria-label="Бренд для запуска">
+                  <option value="">Выберите один бренд</option>
+                </select>
+              </label>
+              <label class="field"><span>Часть очереди</span>
+                <select id="runPart" aria-label="Часть очереди">
+                  <option value="">Сначала задайте фильтры</option>
+                </select>
+              </label>
             </div>
           </section>
 
@@ -194,6 +204,23 @@
       </section>
 
       <section class="workspace-view" data-workspace-view="service" hidden>
+        <details class="panel-card disclosure" id="updateDisclosure" open>
+          <summary>
+            <span class="summary-copy">
+              <span class="eyebrow">ОБНОВЛЕНИЕ</span>
+              <strong>Версия расширения</strong>
+            </span>
+            <span id="extensionVersion" class="summary-meta">проверяю…</span>
+          </summary>
+          <div class="disclosure-body">
+            <p class="service-copy">Обновляются код, промпты и референсы. Папка с входными фото часов остаётся на этом компьютере. Установка ждёт завершения прогона.</p>
+            <div class="service-actions">
+              <button id="updateExtension" class="secondary" type="button">Проверить и обновить</button>
+            </div>
+            <p id="updateStatus" class="update-status" role="status" aria-live="polite">Проверка запускается вручную из этого раздела.</p>
+          </div>
+        </details>
+
         <details class="panel-card disclosure" id="timingDisclosure" open>
           <summary>
             <span class="summary-copy">
@@ -302,6 +329,16 @@
               <button id="exportDiagnostics" class="secondary" type="button">Скачать диагностику JSON</button>
               <button id="clearDomDiagnostics" class="secondary muted" type="button">Очистить DOM-архив</button>
             </div>
+            <label class="field"><span>Отдельные прогоны</span>
+              <select id="runDiagnosticsSelect" aria-label="Выбрать прогон для экспорта">
+                <option value="">Загрузка архива…</option>
+              </select>
+            </label>
+            <div class="service-actions">
+              <button id="refreshRunDiagnostics" class="secondary muted" type="button">Обновить список</button>
+              <button id="exportRunDiagnostics" class="secondary" type="button" disabled>Скачать прогон JSON</button>
+            </div>
+            <p id="runDiagnosticsStatus" class="service-copy" aria-live="polite">Каждый запуск хранится отдельно.</p>
           </div>
         </details>
 

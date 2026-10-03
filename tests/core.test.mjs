@@ -24,6 +24,9 @@ import {
   coalescedPauseDeadline,
   CONVERSATION_LOAD_RECOVERY_DELAY_MS,
   GENERATION_TRANSPORT_REFRESH_AFTER_MS,
+  STALLED_BATCH_RECOVERY_AFTER_MS,
+  STALLED_BATCH_RECOVERY_DELAY_MS,
+  findStalledBatchRecoveryCandidate,
   imageLimitResumeAt,
   normalizeGenerationJitterSeconds,
   normalizeGenerationPauseMinutes,
@@ -42,7 +45,12 @@ import {
   generatedFileName,
   generationOutputFileName,
   ensureGenerationOutputFileName,
-  brandIdFromModelName
+  brandIdFromModelName,
+  filteredWatchEntries,
+  queuePartPlan,
+  queueEntriesForPart,
+  RUN_PART_SIZE,
+  WATCH_BRAND_FILTERS
 } from '../extension/queue-utils.js';
 import {
   latestGenerationRevisions,
@@ -189,7 +197,21 @@ test('2-input prompt contains explicit no-map/no-extra-logo guidance', async () 
   const prompt = buildGenerationPrompt(basePrompt, representativeModels.casio, brandPrompt, { inputMode: '2' });
   assert.match(prompt, /Отдельной карты слепых зон Ozon нет/);
   assert.match(prompt, /Отдельного референса Watches World нет/);
+  assert.match(prompt, /оба УТП формулируй только на русском языке, без английских слов/);
+  assert.match(prompt, /Это правило относится только к двум УТП/);
   assert.doesNotMatch(prompt, /@3\b|@4\b/);
+});
+
+test('Pagani Design title uses two brand lines and a smaller model line with no series', async () => {
+  const meta = getBrandProfile('pagani_design');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const prompt = buildGenerationPrompt(basePrompt, representativeModels.pagani_design, brandPrompt, { inputMode: '2' });
+  assert.match(prompt, /два брендовых строки|две брендовые строки/);
+  assert.match(prompt, /«Pagani»/);
+  assert.match(prompt, /«Design»/);
+  assert.match(prompt, /третьей строке.*меньшим кеглем|Строка 3: модель.*меньшим кеглем/);
+  assert.match(prompt, /Серии для Pagani Design не используются/);
+  assert.doesNotMatch(prompt, /NO-SERIES MODE обязан быть ровно таким/);
 });
 
 test('reference path parser accepts current reference layout', () => {
@@ -219,6 +241,47 @@ test('brand and generated filename helpers remain deterministic', () => {
   assert.notEqual(firstAttempt, generationOutputFileName('Casio MDV-107D-1A3.png', 'revision-b'));
   assert.equal(ensureGenerationOutputFileName(slot, { outputFileName: 'other-name.png' }, 'revision-b'), firstAttempt,
     'retrying the same slot keeps its already reserved filename');
+});
+
+test('queue part plan uses stable, disjoint chunks of 100 models', () => {
+  const makeEntries = (count, status = 'pending') => Array.from({ length: count }, (_, index) => ({
+    sourceId: `watch-${String(index + 1).padStart(4, '0')}`,
+    skuKey: `watch-${String(index + 1).padStart(4, '0')}`,
+    status
+  })).reverse();
+
+  for (const [count, expectedParts] of [[0, 0], [1, 1], [100, 1], [101, 2], [200, 2], [201, 3]]) {
+    const plan = queuePartPlan(makeEntries(count), RUN_PART_SIZE, 'regular|in_sale|good|casio');
+    assert.equal(plan.total, count);
+    assert.equal(plan.partCount, expectedParts);
+    assert.equal(plan.parts.reduce((sum, part) => sum + part.count, 0), count);
+    assert.deepEqual(plan.parts.map((part) => part.count), count
+      ? Array.from({ length: expectedParts }, (_, index) => Math.min(RUN_PART_SIZE, count - index * RUN_PART_SIZE))
+      : []);
+    const allIds = plan.parts.flatMap((part) => part.sourceIds);
+    assert.equal(new Set(allIds).size, count);
+    assert.deepEqual(allIds, [...allIds].sort());
+  }
+
+  const first = queuePartPlan(makeEntries(205), RUN_PART_SIZE, 'regular|in_sale|good|casio');
+  const afterProgress = queuePartPlan(makeEntries(205, 'done'), RUN_PART_SIZE, 'regular|in_sale|good|casio');
+  assert.equal(afterProgress.signature, first.signature, 'completion state does not move models between parts');
+  assert.deepEqual(queueEntriesForPart(first, 2).map((entry) => entry.sourceId), first.parts[1].sourceIds);
+  assert.deepEqual(queueEntriesForPart(first, 0), []);
+  assert.deepEqual(queueEntriesForPart(first, 4), []);
+});
+
+test('generic brand is an exact filter instead of aliasing all brands', () => {
+  assert.ok(WATCH_BRAND_FILTERS.some((item) => item.id === 'generic'));
+  const groups = {
+    in_sale_good: [
+      { sourceId: 'casio:ae1000', skuKey: 'casio:ae1000', modelName: 'Casio AE-1000', groupId: 'in_sale_good' },
+      { sourceId: 'generic:unknown', skuKey: 'generic:unknown', modelName: 'Unknown Brand X1', groupId: 'in_sale_good' }
+    ],
+    in_sale_bad: [], not_in_sale_good: [], not_in_sale_bad: []
+  };
+  const selected = filteredWatchEntries(groups, { saleStatus: 'in_sale', quality: 'good', brand: 'generic' });
+  assert.deepEqual(selected.map((entry) => entry.sourceId), ['generic:unknown']);
 });
 
 test('error classifier separates terminal text states from rate limit and transport failures', () => {
@@ -830,7 +893,8 @@ test('custom output directory uses persisted File System Access handle with Down
   const panel = await readFile(path.join(extensionDir, 'sidepanel.js'), 'utf8');
   const html = await readFile(path.join(extensionDir, 'sidepanel.html'), 'utf8');
 
-  assert.match(idb, /DB_VERSION = 6/);
+  assert.match(idb, /DB_VERSION = 7/);
+  assert.match(idb, /RUN_DIAGNOSTIC_EVENTS_STORE/);
   assert.match(idb, /HANDLE_STORE = 'handles'/);
   assert.match(idb, /REVISION_STORE = 'generationRevisions'/);
   assert.match(idb, /keyPath: 'generationId'/);
@@ -1171,6 +1235,96 @@ test('submitted generation refresh is bounded to one reload after four minutes w
   assert.equal(shouldRefreshUnresponsiveGeneration({ ...base, generationSubmittedAt: null }, now), false);
 });
 
+test('stalled batch recovery requires the oldest submitted slot to be silent for 15 minutes and an abnormal sibling', () => {
+  const now = 2_000_000_000_000;
+  const base = {
+    state: 'RUNNING',
+    operationId: 'run-1',
+    slots: {
+      0: {
+        slotId: 0, tabId: 10, entryId: 'sku-oldest', generationId: 'gen-oldest',
+        generationSubmittedAt: new Date(now - 25 * 60_000).toISOString(),
+        noResponseSince: new Date(now - STALLED_BATCH_RECOVERY_AFTER_MS).toISOString(),
+        status: 'GENERATING'
+      },
+      1: {
+        slotId: 1, tabId: 11, entryId: 'sku-sibling', generationId: 'gen-sibling',
+        generationSubmittedAt: new Date(now - 20 * 60_000).toISOString(),
+        status: 'OBSERVING', phase: 'OBSERVING', finalCheckPending: true
+      }
+    }
+  };
+
+  assert.equal(STALLED_BATCH_RECOVERY_AFTER_MS, 15 * 60_000);
+  assert.equal(STALLED_BATCH_RECOVERY_DELAY_MS, 5 * 60_000);
+  assert.deepEqual(findStalledBatchRecoveryCandidate(base, now), {
+    slotId: 0,
+    entryId: 'sku-oldest',
+    noResponseSince: new Date(now - STALLED_BATCH_RECOVERY_AFTER_MS).toISOString(),
+    abnormalSlotIds: [1]
+  });
+  assert.equal(findStalledBatchRecoveryCandidate({
+    ...base,
+    slots: { ...base.slots, 0: { ...base.slots[0], noResponseSince: new Date(now - STALLED_BATCH_RECOVERY_AFTER_MS + 1).toISOString() } }
+  }, now), null);
+  assert.equal(findStalledBatchRecoveryCandidate({
+    ...base,
+    slots: { ...base.slots, 1: { ...base.slots[1], status: 'GENERATING', phase: 'GENERATING', finalCheckPending: false } }
+  }, now), null);
+  assert.equal(findStalledBatchRecoveryCandidate({ ...base, pauseReason: 'USER', state: 'PAUSED' }, now), null);
+  assert.equal(findStalledBatchRecoveryCandidate({ ...base, rateLimitPauseUntil: now + 60_000 }, now), null);
+  assert.equal(findStalledBatchRecoveryCandidate({
+    ...base,
+    slots: { ...base.slots, 1: { ...base.slots[1], downloadId: 42 } }
+  }, now), null);
+});
+
+test('stalled recovery preserves the silence timer across its one tab refresh and resets never wait on startup probing', async () => {
+  const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
+  const auditStart = worker.indexOf('function auditActiveRun()');
+  const auditEnd = worker.indexOf('async function claimNext(', auditStart);
+  const audit = worker.slice(auditStart, auditEnd);
+  const refreshStart = audit.indexOf('if (shouldRefreshUnresponsiveGeneration(slot))');
+  const refreshEnd = audit.indexOf('if (slot.finalCheckPending)', refreshStart);
+  assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
+  assert.doesNotMatch(audit.slice(refreshStart, refreshEnd), /slot\.noResponseSince\s*=\s*null/);
+
+  const resetMessageStart = worker.indexOf("if (message?.type === 'RESET_RUN_RESCAN')");
+  const resetMessageEnd = worker.indexOf("if (message?.type === 'CLEAR_HISTORY')", resetMessageStart);
+  assert.ok(resetMessageStart >= 0 && resetMessageEnd > resetMessageStart);
+  const resetMessage = worker.slice(resetMessageStart, resetMessageEnd);
+  assert.match(resetMessage, /resetRunAndRescan\(/);
+  assert.doesNotMatch(resetMessage, /waitForStartupReconciliation/);
+  const resetStart = worker.indexOf('async function performResetRunAndRescan(options = {})');
+  const resetEnd = worker.indexOf('async function clearGenerationHistory()', resetStart);
+  const reset = worker.slice(resetStart, resetEnd);
+  assert.match(reset, /sessionResetIntent:/);
+  assert.match(reset, /initialRun\?\.stalledBatchRecovery\?\.closeTabs/);
+  assert.match(reset, /clear\(STALLED_BATCH_RECOVERY_ALARM_NAME\)/);
+  assert.match(reset, /cleanupTabIds: ownedTabIds/);
+  assert.match(reset, /remove\('sessionResetIntent'\)/);
+
+  const interruptedStart = worker.indexOf('async function recoverInterruptedRun(reason)');
+  const interruptedEnd = worker.indexOf('function hasObservationWork', interruptedStart);
+  const interrupted = worker.slice(interruptedStart, interruptedEnd);
+  assert.ok(interrupted.indexOf('startupSnapshot.sessionResetIntent') < interrupted.indexOf('await reconcileActiveDownloads'));
+  assert.match(interrupted, /resumeInterruptedSessionReset\(startupSnapshot\.sessionResetIntent\)/);
+  const wakeStart = worker.indexOf('async function rehydrateWorkerWake()');
+  const wakeEnd = worker.indexOf('function clockTime', wakeStart);
+  assert.match(worker.slice(wakeStart, wakeEnd), /if \(stored\.sessionResetIntent\)[\s\S]*?resumeInterruptedSessionReset/);
+  assert.match(worker, /let resetRunPromise = null/);
+});
+
+test('opening the gallery automatically recovers missing revision facts and may open their saved ChatGPT chats', async () => {
+  const gallery = await readFile(path.join(extensionDir, 'gallery.js'), 'utf8');
+  const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
+  assert.match(gallery, /scheduleRevisionFactsRecovery\(currentRevisions\)/);
+  assert.match(gallery, /chrome\.runtime\.sendMessage\(\{ type: 'RECOVER_GALLERY_FACTS', generationIds \}\)/);
+  assert.match(worker, /async function recoverGalleryFacts\(/);
+  assert.match(worker, /async function recoverRevisionFactsUnlocked\(/);
+  assert.match(worker, /chrome\.tabs\.create\(\{ windowId: host\.id, url: recoveryUrl, active: false \}\)/);
+});
+
 test('load-error classification and recovery delay are stable and explicit', () => {
   assert.equal(CONVERSATION_LOAD_RECOVERY_DELAY_MS, 2 * 60_000);
   assert.equal(classifyAutomationError('Не удалось загрузить этот разговор ChatGPT'), AUTOMATION_ERROR_CLASSES.CONVERSATION_LOAD_ERROR);
@@ -1452,17 +1606,25 @@ test('run preflight checks a pending entry without generation-slot variables or 
     status: 'pending'
   };
   const queue = { groups: { in_sale_good: [entry], in_sale_bad: [], not_in_sale_good: [], not_in_sale_bad: [] } };
+  const preflightFilter = { saleStatus: 'in_sale', quality: 'good', brand: 'casio' };
+  const partSignature = queuePartPlan([entry], RUN_PART_SIZE, 'regular|in_sale|good|casio').signature;
+  let job = {
+    prompt: '{{REF_TEMPLATE}} {{REF_WATCH}}', inputMode: 2, runLimit: 1,
+    filters: preflightFilter, runQueueMode: 'regular', runPart: 1, runPartSignature: partSignature
+  };
   let savedPreflight = null;
   const context = {
-    getStored: async () => ({
-      job: { prompt: '{{REF_TEMPLATE}} {{REF_WATCH}}', inputMode: 2, filters: { quality: 'good', sale: 'in_sale' } },
-      queue
-    }),
+    getStored: async () => ({ job, queue }),
     buildInputPlan: (mode) => ({ mode: String(mode), count: 2, roles: ['template', 'watchReference'] }),
     normalizeWatchFilter: (filter) => filter,
     parseFilterSelectionId: () => null,
     filterFromQueueGroup: () => ({}),
     groupIdForWatchFilter: () => 'in_sale_good',
+    queuePartPlan,
+    queueEntriesForPart,
+    RUN_PART_SIZE,
+    WATCH_BRAND_FILTERS,
+    watchFilterLabel: () => 'В продаже · хорошее · Casio',
     REGENERATION_QUEUE_ID: 'repair',
     QUEUE_GROUP_IDS: ['in_sale_good', 'in_sale_bad', 'not_in_sale_good', 'not_in_sale_bad'],
     groupEntries: (value, groupId) => value?.groups?.[groupId] || [],
@@ -1486,6 +1648,12 @@ test('run preflight checks a pending entry without generation-slot variables or 
   assert.equal(result.checks.find((check) => check.id === 'watch:casio:AE1200WHD1A').ok, true);
   assert.equal(entry.outputFileName, 'existing-output-name.png', 'preflight leaves generation output identity untouched');
   assert.equal(savedPreflight, result, 'preflight result is persisted before Start continues');
+
+  job = { ...job, filters: { saleStatus: 'in_sale', quality: 'good', brand: 'all' } };
+  const incomplete = await runInNewContext(`${worker.slice(start, end)}\nrunPreflight()`, context);
+  assert.equal(incomplete.ok, false);
+  assert.equal(incomplete.checks.find((check) => check.id === 'launch-selection')?.ok, false,
+    'a non-specific brand filter blocks starting the run');
 });
 
 test('package integrity: every local module/html dependency referenced by the extension exists', async () => {
@@ -1760,7 +1928,7 @@ test('pause keeps OCR observation alive and Stop closes only tracked worker/OCR 
   assert.match(panel, /type: 'STOP_RUN'/);
   const observation = worker.slice(worker.indexOf('function hasObservationWork'), worker.indexOf('function scheduledRetriesForRun'));
   assert.match(observation, /run\?\.postprocessTabs/);
-  const reset = worker.slice(worker.indexOf('async function resetRunAndRescan'), worker.indexOf('async function clearGenerationHistory'));
+  const reset = worker.slice(worker.indexOf('async function performResetRunAndRescan'), worker.indexOf('async function clearGenerationHistory'));
   assert.match(reset, /const postprocessTabIds = Object\.keys\(initialRun\?\.postprocessTabs/);
   assert.match(reset, /const recoveryTabIds = Object\.keys\(initialRun\?\.recoveryTabs/);
   assert.match(reset, /\.\.\.postprocessTabIds/);
@@ -1913,7 +2081,7 @@ test('conversation load recovery pauses sends, closes only recorded worker tabs,
   const failureRecovery = worker.slice(worker.indexOf('async function failConversationLoadRecovery'), recoveryStart);
   const probeStart = recovery.indexOf('const probes = await Promise.all');
   const probeBlock = recovery.slice(probeStart, recovery.indexOf('if (failedProbe)', probeStart));
-  const resetStart = worker.indexOf('async function resetRunAndRescan(options = {})');
+  const resetStart = worker.indexOf('async function performResetRunAndRescan(options = {})');
   const resetEnd = worker.indexOf('async function clearGenerationHistory', resetStart);
   const reset = worker.slice(resetStart, resetEnd);
   const interruptedStart = worker.indexOf('async function recoverInterruptedRun(reason)');
