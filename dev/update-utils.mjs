@@ -171,7 +171,7 @@ async function readJson(filePath) {
   }
 }
 
-async function validateExtractedPackage(root, releaseTag, archiveEntries) {
+export async function validateExtractedPackage(root, releaseTag, archiveEntries) {
   const packageManifest = await readJson(path.join(root, UPDATE_PACKAGE_MANIFEST));
   if (!packageManifest || packageManifest.schemaVersion !== 1 || packageManifest.releaseTag !== releaseTag) {
     throw new Error('Манифест пакета не совпадает с версией опубликованного релиза');
@@ -206,6 +206,9 @@ async function validateExtractedPackage(root, releaseTag, archiveEntries) {
   const extensionManifest = await readJson(path.join(root, 'extension', 'manifest.json'));
   if (!extensionManifest?.version || extensionManifest.version !== packageManifest.extensionVersion) {
     throw new Error('Версия расширения в пакете не совпадает с манифестом обновления');
+  }
+  if (packageManifest.extensionVersion !== versionFromTag(releaseTag)) {
+    throw new Error('Версия расширения в архиве не совпадает с тегом GitHub Release');
   }
   for (const required of [
     'extension/manifest.json',

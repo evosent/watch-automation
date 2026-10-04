@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Автогенерация",
-  "version": "0.3.39",
+  "version": "0.3.40",
   "description": "Автогенерация карточек часов: фоновые OCR-проверки и атомарные ревизии PNG, характеристик и ChatGPT-чатов.",
   "permissions": [
     "tabs",

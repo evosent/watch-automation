@@ -1,9 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { createUpdateManager, inspectUpdateArchive, UPDATE_ASSET_NAME } from '../dev/update-utils.mjs';
+import { createUpdateManager, inspectUpdateArchive, UPDATE_ASSET_NAME, UPDATE_PACKAGE_MANIFEST, validateExtractedPackage } from '../dev/update-utils.mjs';
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
 
 function crc32(bytes) {
   let crc = 0xffffffff;
@@ -66,6 +71,53 @@ test('update package archive rejects traversal and incoming watch photos', () =>
 test('update package archive rejects symlinks', () => {
   const unixSymlinkMode = (0xa000 << 16) >>> 0;
   assert.throws(() => inspectUpdateArchive(storedZipEntry('extension/manifest.json', '{}', unixSymlinkMode)), /символическая ссылка/i);
+});
+
+test('update package extension version must match the GitHub release tag', async (t) => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'watch-update-package-version-'));
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const files = {
+    'extension/manifest.json': JSON.stringify({ manifest_version: 3, version: '0.3.39' }),
+    'extension/sidepanel.html': '<main></main>',
+    'extension/sidepanel.js': '',
+    'extension/service-worker.js': '',
+    'extension/prompts/base.txt': 'prompt',
+    'input-ref-images/brands/Casio/reference.png': 'reference',
+    'dev/control-routing.mjs': '',
+    'dev/watch-extension.mjs': '',
+    'dev/update-utils.mjs': '',
+    'dev/update-watch-automation.mjs': ''
+  };
+  const archivedFiles = Object.entries(files).map(([relative, contents]) => ({
+    path: path.join(projectRoot, ...relative.split('/')),
+    relative,
+    contents
+  }));
+  for (const file of archivedFiles) {
+    await mkdir(path.dirname(file.path), { recursive: true });
+    await writeFile(file.path, file.contents);
+  }
+  const packageManifest = {
+    schemaVersion: 1,
+    releaseTag: 'v0.3.40',
+    extensionVersion: '0.3.39',
+    packageId: 'mismatched-version-test',
+    files: archivedFiles.map(({ relative, contents }) => ({
+      path: relative,
+      size: Buffer.byteLength(contents),
+      sha256: sha256(contents)
+    }))
+  };
+  await writeFile(path.join(projectRoot, UPDATE_PACKAGE_MANIFEST), JSON.stringify(packageManifest));
+  const archiveEntries = [
+    ...archivedFiles.map(({ relative }) => ({ name: relative, isDirectory: false })),
+    { name: UPDATE_PACKAGE_MANIFEST, isDirectory: false }
+  ];
+
+  await assert.rejects(
+    validateExtractedPackage(projectRoot, 'v0.3.40', archiveEntries),
+    /версия расширения в архиве не совпадает с тегом GitHub Release/i
+  );
 });
 
 test('update manager reports an older GitHub release and never downloads it over a newer installation', async (t) => {

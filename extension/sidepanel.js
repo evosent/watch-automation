@@ -81,7 +81,7 @@ let extensionUpdateStatus = { phase: 'idle', message: 'Проверка запу
 let extensionUpdatePollTimer = null;
 let extensionUpdatePollInFlight = false;
 let referenceSyncInFlight = false;
-const EXTENSION_UPDATE_ACTIVE_PHASES = new Set(['checking', 'downloading', 'validating', 'ready', 'applying', 'syncing-references']);
+const EXTENSION_UPDATE_ACTIVE_PHASES = new Set(['checking', 'downloading', 'validating', 'ready', 'applying', 'restarting', 'syncing-references']);
 const DOM_DIAGNOSTICS_MODE_LABELS = {
   off: 'Постоянный сбор выключен.',
   errors: 'DOM сохраняется только при ошибках и зависании.',
@@ -1917,7 +1917,7 @@ function updateActionButtons() {
   else if (waitingImageLimit) startLabel = 'ОЖИДАНИЕ ЛИМИТА';
   $('start').querySelector('span:last-child').textContent = startLabel;
   $('start').disabled = isRunning || isReconciling || actionBusy || waitingImageLimit || conversationRecoveryBusy || stalledBatchBusy
-    || ['applying', 'syncing-references'].includes(extensionUpdateStatus.phase)
+    || ['applying', 'restarting', 'syncing-references'].includes(extensionUpdateStatus.phase)
     || (!canContinue && !launchSelectionReady);
   $('pauseRun').disabled = !isRunning || isReconciling || actionBusy;
   const stopButton = $('stop');
@@ -1938,7 +1938,9 @@ function updateActionButtons() {
   if (updateButton) {
     const updateBusy = EXTENSION_UPDATE_ACTIVE_PHASES.has(extensionUpdateStatus.phase);
     updateButton.disabled = updateBusy || isRunning || isReconciling || actionBusy || Boolean(canContinue);
-    updateButton.textContent = extensionUpdateStatus.phase === 'applying'
+    updateButton.textContent = extensionUpdateStatus.phase === 'restarting'
+      ? 'Ожидаю загрузки версии…'
+      : extensionUpdateStatus.phase === 'applying'
       ? 'Устанавливаю обновление…'
       : extensionUpdateStatus.phase === 'syncing-references'
         ? 'Синхронизирую референсы…'
@@ -2344,7 +2346,9 @@ function renderExtensionUpdateStatus(status, { deferred = false, reason = '', ap
   }
   if (message) {
     message.dataset.state = extensionUpdateStatus.phase;
-    if (applying) {
+    if (extensionUpdateStatus.phase === 'restarting') {
+      message.textContent = String(status?.message || 'Установка завершена. Ожидаю загрузки обновлённой версии расширения…');
+    } else if (applying) {
       message.textContent = 'Обновление готово. Устанавливаю код и референсы; входные фото часов остаются на месте.';
     } else if (deferred) {
       message.textContent = `Пакет готов. Установка начнётся после завершения прогона.${reason ? ` ${reason}` : ''}`;
@@ -2487,7 +2491,7 @@ async function refreshExtensionUpdateStatus() {
     });
     const currentVersion = String(chrome.runtime.getManifest?.().version || '');
     const installedVersionMatches = String(installed?.extensionVersion || '') === currentVersion;
-    const packageInstallationInProgress = ['checking', 'downloading', 'validating', 'ready', 'applying'].includes(String(status.phase || ''));
+    const packageInstallationInProgress = ['checking', 'downloading', 'validating', 'ready', 'applying', 'restarting'].includes(String(status.phase || ''));
     if (installed?.packageId && installedVersionMatches && !packageInstallationInProgress) {
       await syncUpdatedReferenceAssetsIfNeeded(installed, status);
     }
