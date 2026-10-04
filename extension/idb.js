@@ -13,10 +13,27 @@ export const GALLERY_DIRECTORY_HANDLE_KEY = 'gallery-directory';
 // each IndexedDB transaction small so one large folder cannot time out or
 // exhaust the renderer's temporary transaction memory.
 const ASSET_BATCH_SIZE = 32;
+const IDB_OPEN_TIMEOUT_MS = 15000;
+const IDB_TRANSACTION_TIMEOUT_MS = 15000;
 
 export function openDb() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
+    let settled = false;
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const error = new Error(`IndexedDB open timed out after ${IDB_OPEN_TIMEOUT_MS}ms`);
+      error.code = 'IDB_OPEN_TIMEOUT';
+      reject(error);
+    }, IDB_OPEN_TIMEOUT_MS);
+    const settle = (callback, value) => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(timeoutId);
+      callback(value);
+      return true;
+    };
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'key' });
@@ -37,19 +54,40 @@ export function openDb() {
         events.createIndex('operationId', 'operationId', { unique: false });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      if (!settle(resolve, req.result)) req.result.close();
+    };
+    req.onerror = () => settle(reject, req.error || new Error('IndexedDB open failed'));
   });
 }
 
-function transactionResult(db, stores, run, errorLabel) {
+export function transactionResult(db, stores, run, errorLabel, timeoutMs = IDB_TRANSACTION_TIMEOUT_MS, mode = 'readwrite') {
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(stores, 'readwrite');
+    const tx = db.transaction(stores, mode);
+    let settled = false;
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      const error = new Error(`${errorLabel} timed out after ${timeoutMs}ms`);
+      error.code = 'IDB_TRANSACTION_TIMEOUT';
+      settle(reject, error);
+      try { tx.abort(); } catch (_) {}
+    }, timeoutMs);
+    const settle = (callback, value) => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(timeoutId);
+      callback(value);
+      return true;
+    };
     let value;
-    try { value = run(tx); } catch (error) { tx.abort(); reject(error); return; }
-    tx.oncomplete = () => resolve(value);
-    tx.onerror = () => reject(tx.error || new Error(`${errorLabel} failed`));
-    tx.onabort = () => reject(tx.error || new Error(`${errorLabel} aborted`));
+    try { value = run(tx); } catch (error) {
+      try { tx.abort(); } catch (_) {}
+      settle(reject, error);
+      return;
+    }
+    tx.oncomplete = () => settle(resolve, value);
+    tx.onerror = () => settle(reject, tx.error || new Error(`${errorLabel} failed`));
+    tx.onabort = () => settle(reject, tx.error || new Error(`${errorLabel} aborted`));
   });
 }
 
@@ -73,23 +111,16 @@ export async function saveRunDiagnostics(header, events = []) {
 export async function listRunDiagnostics({ limit = 200 } = {}) {
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(RUN_DIAGNOSTICS_STORE, 'readonly');
+    let rows = [];
+    await transactionResult(db, RUN_DIAGNOSTICS_STORE, (tx) => {
       const request = tx.objectStore(RUN_DIAGNOSTICS_STORE).getAll();
-      let rows = [];
-      request.onsuccess = () => {
-        rows = request.result || [];
-      };
-      request.onerror = () => reject(request.error || new Error('Run diagnostics read failed'));
-      tx.onerror = () => reject(tx.error || new Error('Run diagnostics read failed'));
-      tx.oncomplete = () => {
-        rows.sort((left, right) => (
-          String(right.startedAt || right.updatedAt || '').localeCompare(String(left.startedAt || left.updatedAt || ''))
-        ));
-        resolve(rows.slice(0, Math.max(1, Number(limit) || 200)));
-      };
-      tx.onabort = () => reject(tx.error || new Error('Run diagnostics read aborted'));
-    });
+      request.onsuccess = () => { rows = request.result || []; };
+      return null;
+    }, 'Run diagnostics read', undefined, 'readonly');
+    rows.sort((left, right) => (
+      String(right.startedAt || right.updatedAt || '').localeCompare(String(left.startedAt || left.updatedAt || ''))
+    ));
+    return rows.slice(0, Math.max(1, Number(limit) || 200));
   } finally { db.close(); }
 }
 
@@ -97,19 +128,19 @@ export async function getRunDiagnostic(operationId) {
   if (!operationId) return null;
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction([RUN_DIAGNOSTICS_STORE, RUN_DIAGNOSTIC_EVENTS_STORE], 'readonly');
+    let header = null;
+    let events = [];
+    await transactionResult(db, [RUN_DIAGNOSTICS_STORE, RUN_DIAGNOSTIC_EVENTS_STORE], (tx) => {
       const headerRequest = tx.objectStore(RUN_DIAGNOSTICS_STORE).get(String(operationId));
-      const eventsRequest = tx.objectStore(RUN_DIAGNOSTIC_EVENTS_STORE)
-        .index('operationId').getAll(String(operationId));
-      tx.oncomplete = () => resolve({
-        run: headerRequest.result || null,
-        events: (eventsRequest.result || []).sort((left, right) => Number(left.sequence) - Number(right.sequence))
-      });
-      tx.onerror = () => reject(tx.error || new Error('Run diagnostics read failed'));
-      tx.onabort = () => reject(tx.error || new Error('Run diagnostics read aborted'));
-      headerRequest.onerror = eventsRequest.onerror = () => reject(headerRequest.error || eventsRequest.error);
-    });
+      const eventsRequest = tx.objectStore(RUN_DIAGNOSTIC_EVENTS_STORE).index('operationId').getAll(String(operationId));
+      headerRequest.onsuccess = () => { header = headerRequest.result || null; };
+      eventsRequest.onsuccess = () => { events = eventsRequest.result || []; };
+      return null;
+    }, 'Run diagnostics read', undefined, 'readonly');
+    return {
+      run: header,
+      events: events.sort((left, right) => Number(left.sequence) - Number(right.sequence))
+    };
   } finally { db.close(); }
 }
 
@@ -149,7 +180,6 @@ export async function replaceModelCatalog(records = []) {
           result.missing += 1;
         }
       };
-      request.onerror = () => { throw request.error || new Error('Catalog read failed'); };
       return result;
     }, 'Catalog write');
   } finally { db.close(); }
@@ -158,12 +188,12 @@ export async function replaceModelCatalog(records = []) {
 export async function getAllModelCatalog({ includeRemoved = false } = {}) {
   const db = await openDb();
   try {
-    const rows = await new Promise((resolve, reject) => {
-      const tx = db.transaction(MODEL_STORE, 'readonly');
+    let rows = [];
+    await transactionResult(db, MODEL_STORE, (tx) => {
       const request = tx.objectStore(MODEL_STORE).getAll();
-      request.onsuccess = () => resolve(request.result || []);
-      request.onerror = () => reject(request.error);
-    });
+      request.onsuccess = () => { rows = request.result || []; };
+      return null;
+    }, 'Model catalog read', undefined, 'readonly');
     return includeRemoved ? rows : rows.filter((item) => item.sourcePresent !== false);
   } finally { db.close(); }
 }
@@ -172,12 +202,13 @@ export async function getModelCatalog(skuKey) {
   if (!skuKey) return null;
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(MODEL_STORE, 'readonly');
+    let model = null;
+    await transactionResult(db, MODEL_STORE, (tx) => {
       const request = tx.objectStore(MODEL_STORE).get(String(skuKey));
-      request.onsuccess = () => resolve(request.result || null);
-      request.onerror = () => reject(request.error);
-    });
+      request.onsuccess = () => { model = request.result || null; };
+      return null;
+    }, 'Model catalog read', undefined, 'readonly');
+    return model;
   } finally { db.close(); }
 }
 
@@ -215,8 +246,7 @@ export async function adoptLegacyGenerationRevisions(sourceAliases = {}) {
   }
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction([MODEL_STORE, REVISION_STORE, FACTS_STORE], 'readwrite');
+    return await transactionResult(db, [MODEL_STORE, REVISION_STORE, FACTS_STORE], (tx) => {
       const models = tx.objectStore(MODEL_STORE);
       const revisionStore = tx.objectStore(REVISION_STORE);
       const factsStore = tx.objectStore(FACTS_STORE);
@@ -254,10 +284,8 @@ export async function adoptLegacyGenerationRevisions(sourceAliases = {}) {
         };
         request.onerror = () => tx.abort();
       }
-      tx.oncomplete = () => resolve({ adopted, ready });
-      tx.onerror = () => reject(tx.error || new Error('Legacy revision migration failed'));
-      tx.onabort = () => reject(tx.error || new Error('Legacy revision migration aborted'));
-    });
+      return { adopted, ready };
+    }, 'Legacy revision migration');
   } finally { db.close(); }
 }
 
@@ -307,7 +335,6 @@ export async function beginGenerationRevision(record) {
       };
       modelRequest.onsuccess = () => { modelReady = true; commit(); };
       revisionRequest.onsuccess = () => { revisionReady = true; commit(); };
-      modelRequest.onerror = revisionRequest.onerror = () => { throw modelRequest.error || revisionRequest.error; };
       return result;
     }, 'Generation start write');
     if (result.identityConflict) throw new Error('Generation ID is already bound to another SKU');
@@ -424,7 +451,6 @@ export async function persistGenerationImageRevision(record) {
       };
       modelRequest.onsuccess = () => { modelReady = true; commit(); };
       revisionRequest.onsuccess = () => { revisionReady = true; commit(); };
-      modelRequest.onerror = revisionRequest.onerror = () => { throw modelRequest.error || revisionRequest.error; };
       return result;
     }, 'Generation image write');
   } finally { db.close(); }
@@ -497,7 +523,6 @@ export async function persistGenerationFactsRevision(record) {
       };
       modelRequest.onsuccess = () => { modelReady = true; commit(); };
       revisionRequest.onsuccess = () => { revisionReady = true; commit(); };
-      modelRequest.onerror = revisionRequest.onerror = () => { throw modelRequest.error || revisionRequest.error; };
       return result;
     }, 'Generation facts write');
   } finally { db.close(); }
@@ -549,7 +574,6 @@ export async function rejectGenerationRevision(generationId, updates = {}) {
           }
         };
       };
-      revisionRequest.onerror = () => { throw revisionRequest.error; };
       return result;
     }, 'Generation rejection write');
   } finally { db.close(); }
@@ -583,14 +607,11 @@ async function writeAssetBatch(entries = []) {
   if (!entries.length) return;
   const db = await openDb();
   try {
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readwrite');
+    await transactionResult(db, STORE, (tx) => {
       const store = tx.objectStore(STORE);
       for (const entry of entries) store.put(assetRecord(entry));
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
-    });
+      return null;
+    }, 'Asset batch write');
   } finally {
     db.close();
   }
@@ -601,14 +622,11 @@ async function deleteAssetKeys(keys = []) {
     const batch = keys.slice(index, index + ASSET_BATCH_SIZE * 4);
     const db = await openDb();
     try {
-      await new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE, 'readwrite');
+      await transactionResult(db, STORE, (tx) => {
         const store = tx.objectStore(STORE);
         for (const key of batch) store.delete(key);
-        tx.oncomplete = resolve;
-        tx.onerror = () => reject(tx.error || new Error('IndexedDB delete failed'));
-        tx.onabort = () => reject(tx.error || new Error('IndexedDB delete aborted'));
-      });
+        return null;
+      }, 'Asset delete batch');
     } finally {
       db.close();
     }
@@ -617,42 +635,41 @@ async function deleteAssetKeys(keys = []) {
 
 export async function getAsset(key) {
   const db = await openDb();
-  const result = await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readonly');
+  try {
+    let result = null;
+    await transactionResult(db, STORE, (tx) => {
     const req = tx.objectStore(STORE).get(key);
-    req.onsuccess = () => resolve(req.result || null); req.onerror = () => reject(req.error);
-  });
-  db.close();
-  return result;
+      req.onsuccess = () => { result = req.result || null; };
+      return null;
+    }, 'Asset read', undefined, 'readonly');
+    return result;
+  } finally { db.close(); }
 }
 
 export async function getAssetKeys(prefix = '') {
   const db = await openDb();
-  const keys = await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readonly');
-    const request = tx.objectStore(STORE).getAllKeys();
-    request.onsuccess = () => resolve(request.result || []);
-    request.onerror = () => reject(request.error);
-  });
-  db.close();
-  return keys.filter((key) => String(key).startsWith(prefix));
+  try {
+    let keys = [];
+    await transactionResult(db, STORE, (tx) => {
+      const request = tx.objectStore(STORE).getAllKeys();
+      request.onsuccess = () => { keys = request.result || []; };
+      return null;
+    }, 'Asset keys read', undefined, 'readonly');
+    return keys.filter((key) => String(key).startsWith(prefix));
+  } finally { db.close(); }
 }
 
 
 export async function getAssetMetadata(prefix = '') {
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readonly');
+    const items = new Map();
+    await transactionResult(db, STORE, (tx) => {
       const store = tx.objectStore(STORE);
       const request = store.openCursor();
-      const items = new Map();
       request.onsuccess = () => {
         const cursor = request.result;
-        if (!cursor) {
-          resolve(items);
-          return;
-        }
+        if (!cursor) return;
         const record = cursor.value;
         const key = String(record?.key || cursor.key || '');
         if (key.startsWith(prefix)) {
@@ -667,8 +684,9 @@ export async function getAssetMetadata(prefix = '') {
         }
         cursor.continue();
       };
-      request.onerror = () => reject(request.error);
-    });
+      return null;
+    }, 'Asset metadata read', undefined, 'readonly');
+    return items;
   } finally {
     db.close();
   }
@@ -702,30 +720,89 @@ export async function replaceAssets(prefix, entries = [], { force = false } = {}
   return { total: entries.length, changed: changed.length, removed: removedKeys.length };
 }
 
+// Imports files exposed by the local companion service in bounded batches.
+// The caller supplies lightweight file metadata and a loader so large photo
+// libraries never need to be held in browser memory all at once.
+export async function replaceAssetsFromLoader(prefix, entries = [], loadFile, {
+  force = false,
+  batchSize = 12,
+  concurrency = 3,
+  shouldLoad = null,
+  onFileLoaded = null,
+  onProgress = null
+} = {}) {
+  if (typeof loadFile !== 'function') throw new Error('A local asset loader is required');
+  const safeBatchSize = Math.max(1, Math.min(64, Number(batchSize) || 12));
+  const safeConcurrency = Math.max(1, Math.min(8, Number(concurrency) || 3));
+  const existing = await getAssetMetadata(prefix);
+  const desired = new Map(entries.map((entry) => [String(entry.key), entry]));
+  const changed = [];
+
+  for (const entry of entries) {
+    const key = String(entry.key);
+    const file = entry.file || {};
+    const previous = existing.get(key);
+    const relativePath = entry.relativePath || file.relativePath || file.name || '';
+    const sameMetadata = previous
+      && previous.name === String(file.name || '')
+      && previous.type === String(file.type || 'application/octet-stream')
+      && previous.size === Number(file.size || 0)
+      && previous.lastModified === Number(file.lastModified || 0)
+      && previous.relativePath === relativePath;
+    if (force || !sameMetadata || (typeof shouldLoad === 'function' && shouldLoad(entry, previous))) {
+      changed.push(entry);
+    }
+  }
+
+  let completed = 0;
+  for (let offset = 0; offset < changed.length; offset += safeBatchSize) {
+    const batch = changed.slice(offset, offset + safeBatchSize);
+    const loaded = new Array(batch.length);
+    let cursor = 0;
+    await Promise.all(Array.from({ length: Math.min(safeConcurrency, batch.length) }, async () => {
+      while (cursor < batch.length) {
+        const index = cursor++;
+        const entry = batch[index];
+        const file = await loadFile(entry);
+        if (!file || typeof file.arrayBuffer !== 'function') {
+          throw new Error(`Не удалось загрузить локальный файл ${entry.file?.name || entry.key}`);
+        }
+        if (typeof onFileLoaded === 'function') await onFileLoaded(entry, file);
+        loaded[index] = { ...entry, file };
+        completed += 1;
+        if (typeof onProgress === 'function') onProgress(completed, changed.length, entry);
+      }
+    }));
+    await putAssets(loaded);
+  }
+
+  const removedKeys = [...existing.keys()].filter((key) => !desired.has(key));
+  await deleteAssetKeys(removedKeys);
+  return { total: entries.length, changed: changed.length, removed: removedKeys.length };
+}
+
 
 export async function putOutputDirectoryHandle(handle) {
   if (!handle) throw new Error('Output directory handle is required');
   const db = await openDb();
   try {
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(HANDLE_STORE, 'readwrite');
+    await transactionResult(db, HANDLE_STORE, (tx) => {
       tx.objectStore(HANDLE_STORE).put({ key: OUTPUT_DIRECTORY_HANDLE_KEY, handle, updatedAt: Date.now() });
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error || new Error('IndexedDB handle write failed'));
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB handle write aborted'));
-    });
+      return null;
+    }, 'Output directory handle write');
   } finally { db.close(); }
 }
 
 export async function getOutputDirectoryHandle() {
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(HANDLE_STORE, 'readonly');
+    let handle = null;
+    await transactionResult(db, HANDLE_STORE, (tx) => {
       const req = tx.objectStore(HANDLE_STORE).get(OUTPUT_DIRECTORY_HANDLE_KEY);
-      req.onsuccess = () => resolve(req.result?.handle || null);
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { handle = req.result?.handle || null; };
+      return null;
+    }, 'Output directory handle read', undefined, 'readonly');
+    return handle;
   } finally { db.close(); }
 }
 
@@ -734,25 +811,23 @@ export async function putGalleryDirectoryHandle(handle) {
   if (!handle) throw new Error('Gallery directory handle is required');
   const db = await openDb();
   try {
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(HANDLE_STORE, 'readwrite');
+    await transactionResult(db, HANDLE_STORE, (tx) => {
       tx.objectStore(HANDLE_STORE).put({ key: GALLERY_DIRECTORY_HANDLE_KEY, handle, updatedAt: Date.now() });
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error || new Error('IndexedDB gallery handle write failed'));
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB gallery handle write aborted'));
-    });
+      return null;
+    }, 'Gallery directory handle write');
   } finally { db.close(); }
 }
 
 export async function getGalleryDirectoryHandle() {
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(HANDLE_STORE, 'readonly');
+    let handle = null;
+    await transactionResult(db, HANDLE_STORE, (tx) => {
       const req = tx.objectStore(HANDLE_STORE).get(GALLERY_DIRECTORY_HANDLE_KEY);
-      req.onsuccess = () => resolve(req.result?.handle || null);
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { handle = req.result?.handle || null; };
+      return null;
+    }, 'Gallery directory handle read', undefined, 'readonly');
+    return handle;
   } finally { db.close(); }
 }
 
@@ -761,17 +836,14 @@ export async function putGenerationFacts(record) {
   if (!record?.sourceId) throw new Error('Generation facts sourceId is required');
   const db = await openDb();
   try {
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(FACTS_STORE, 'readwrite');
+    await transactionResult(db, FACTS_STORE, (tx) => {
       tx.objectStore(FACTS_STORE).put({
         ...record,
         sourceId: String(record.sourceId),
         updatedAt: record.updatedAt || new Date().toISOString()
       });
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error || new Error('IndexedDB generation facts write failed'));
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB generation facts write aborted'));
-    });
+      return null;
+    }, 'Generation facts write');
   } finally { db.close(); }
 }
 
@@ -779,24 +851,26 @@ export async function getGenerationFacts(sourceId) {
   if (!sourceId) return null;
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(FACTS_STORE, 'readonly');
+    let facts = null;
+    await transactionResult(db, FACTS_STORE, (tx) => {
       const req = tx.objectStore(FACTS_STORE).get(String(sourceId));
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { facts = req.result || null; };
+      return null;
+    }, 'Generation facts read', undefined, 'readonly');
+    return facts;
   } finally { db.close(); }
 }
 
 export async function getAllGenerationFacts() {
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(FACTS_STORE, 'readonly');
+    let facts = [];
+    await transactionResult(db, FACTS_STORE, (tx) => {
       const req = tx.objectStore(FACTS_STORE).getAll();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { facts = req.result || []; };
+      return null;
+    }, 'Generation facts read', undefined, 'readonly');
+    return facts;
   } finally { db.close(); }
 }
 
@@ -804,13 +878,10 @@ export async function deleteGenerationFacts(sourceId) {
   if (!sourceId) return;
   const db = await openDb();
   try {
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(FACTS_STORE, 'readwrite');
+    await transactionResult(db, FACTS_STORE, (tx) => {
       tx.objectStore(FACTS_STORE).delete(String(sourceId));
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error || new Error('IndexedDB generation facts delete failed'));
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB generation facts delete aborted'));
-    });
+      return null;
+    }, 'Generation facts delete');
   } finally { db.close(); }
 }
 
@@ -823,11 +894,10 @@ export async function upsertGenerationRevision(record, { rejectIfReviewed = fals
   if (!record?.sourceId) throw new Error('Generation revision sourceId is required');
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(REVISION_STORE, 'readwrite');
+    let merged = null;
+    await transactionResult(db, REVISION_STORE, (tx) => {
       const store = tx.objectStore(REVISION_STORE);
       const key = String(record.generationId);
-      let merged = null;
       const get = store.get(key);
       get.onsuccess = () => {
         const previous = get.result || {};
@@ -856,11 +926,9 @@ export async function upsertGenerationRevision(record, { rejectIfReviewed = fals
         };
         store.put(merged);
       };
-      get.onerror = () => reject(get.error);
-      tx.oncomplete = () => resolve(merged);
-      tx.onerror = () => reject(tx.error || new Error('IndexedDB generation revision write failed'));
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB generation revision write aborted'));
-    });
+      return null;
+    }, 'Generation revision write');
+    return merged;
   } finally { db.close(); }
 }
 
@@ -868,24 +936,26 @@ export async function getGenerationRevision(generationId) {
   if (!generationId) return null;
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(REVISION_STORE, 'readonly');
+    let revision = null;
+    await transactionResult(db, REVISION_STORE, (tx) => {
       const req = tx.objectStore(REVISION_STORE).get(String(generationId));
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { revision = req.result || null; };
+      return null;
+    }, 'Generation revision read', undefined, 'readonly');
+    return revision;
   } finally { db.close(); }
 }
 
 export async function getAllGenerationRevisions() {
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(REVISION_STORE, 'readonly');
+    let revisions = [];
+    await transactionResult(db, REVISION_STORE, (tx) => {
       const req = tx.objectStore(REVISION_STORE).getAll();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { revisions = req.result || []; };
+      return null;
+    }, 'Generation revisions read', undefined, 'readonly');
+    return revisions;
   } finally { db.close(); }
 }
 
@@ -893,11 +963,12 @@ export async function getGenerationRevisionsForSource(sourceId) {
   if (!sourceId) return [];
   const db = await openDb();
   try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(REVISION_STORE, 'readonly');
+    let revisions = [];
+    await transactionResult(db, REVISION_STORE, (tx) => {
       const req = tx.objectStore(REVISION_STORE).index('sourceId').getAll(String(sourceId));
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { revisions = req.result || []; };
+      return null;
+    }, 'Generation revisions read', undefined, 'readonly');
+    return revisions;
   } finally { db.close(); }
 }

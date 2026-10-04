@@ -14,7 +14,11 @@ test('GitHub installer verifies release assets and preserves an existing watch-p
 
   assert.deepEqual(installerBytes.subarray(0, 3), Buffer.from([0xef, 0xbb, 0xbf]));
   assert.match(bootstrap, /releases\/latest\/download\/Install_From_GitHub\.ps1/);
+  assert.match(bootstrap, /-InstallRoot "%~dp0\."/);
   assert.match(installer, /api\.github\.com\/repos\//);
+  assert.match(installer, /\[string\]\$InstallRoot\s*=\s*\$PSScriptRoot/);
+  assert.match(installer, /\$targetRoot\s*=\s*\$InstallRoot/);
+  assert.doesNotMatch(installer, /\$InstallBase/);
   assert.match(installer, /\$matchingAssets = @\(/);
   assert.match(installer, /return \$matchingAssets\[0\]/);
   assert.doesNotMatch(installer, /\$matches\s*=\s*@\(/i);
@@ -34,4 +38,16 @@ test('GitHub installer verifies release assets and preserves an existing watch-p
   assert.match(builder, /input-watches-images/);
   assert.match(builder, /MAX_RELEASE_ASSET_BYTES/);
   assert.match(builder, /files\.some\(\(file\) => file\.path\.startsWith\('input-watches-images\/'\)\)/);
+});
+
+test('first-run input libraries are resolved from the local app root', async () => {
+  const sidepanel = await readFile(path.join(root, 'extension/sidepanel.js'), 'utf8');
+  const manifest = JSON.parse(await readFile(path.join(root, 'extension/manifest.json'), 'utf8'));
+  assert.match(sidepanel, /\/local-input-files\?kind=/);
+  assert.match(sidepanel, /\/local-input-file\?path=/);
+  assert.match(sidepanel, /autoConnectBundledInputs\(\)/);
+  assert.match(sidepanel, /sourceRoot:\s*projectRoot/);
+  assert.match(sidepanel, /batchSize:\s*12/);
+  assert.match(sidepanel, /concurrency:\s*3/);
+  assert.ok(manifest.host_permissions.includes('http://127.0.0.1:17321/*'));
 });

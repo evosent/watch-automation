@@ -12,6 +12,9 @@ import { runInNewContext } from 'node:vm';
 
 import {
   DB_NAME,
+  STORE,
+  openDb,
+  transactionResult,
   adoptLegacyGenerationRevisions,
   beginGenerationRevision,
   cancelUnsubmittedGenerationRevision,
@@ -39,6 +42,7 @@ import {
 import { galleryRecordsFromCatalog, currentRevisionsForCatalog } from '../extension/gallery-revision-utils.js';
 import { verifiedRevisionMatchesEvent } from '../extension/generation-revision-utils.js';
 import {
+  shouldTripAttachmentFailureCircuitBreaker,
   coalescedPauseDeadline,
   isRateLimitIgnored,
   resolveGenerationPause,
@@ -54,6 +58,43 @@ import {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const future = '2099-01-01T00:00:00.000Z';
+
+test('attachment failures trip a run circuit breaker only across three distinct unsent models', () => {
+  const now = Date.parse('2026-10-04T12:00:00.000Z');
+  const errorFor = (entryId, secondsAgo = 10) => ({
+    entryId,
+    slotId: 0,
+    generationSubmitted: false,
+    at: new Date(now - secondsAgo * 1000).toISOString(),
+    message: 'Timeout waiting for attachment batch 2 (90000ms)'
+  });
+
+  assert.equal(shouldTripAttachmentFailureCircuitBreaker({ errors: [errorFor('sku-a')] }, errorFor('sku-b'), now), false);
+  assert.equal(shouldTripAttachmentFailureCircuitBreaker({ errors: [errorFor('sku-a'), errorFor('sku-a')] }, errorFor('sku-a'), now), false,
+    'duplicate reports for one model cannot trip the breaker');
+  assert.equal(shouldTripAttachmentFailureCircuitBreaker({ errors: [errorFor('sku-a'), errorFor('sku-b')] }, errorFor('sku-c'), now), true);
+  assert.equal(shouldTripAttachmentFailureCircuitBreaker({ errors: [errorFor('sku-a', 900)] }, errorFor('sku-b'), now), false,
+    'old failures outside the ten-minute window are ignored');
+  assert.equal(shouldTripAttachmentFailureCircuitBreaker({ errors: [errorFor('sku-a'), errorFor('sku-b')] }, {
+    ...errorFor('sku-c'), generationSubmitted: true
+  }, now), false, 'a submitted generation is never classified as an attachment-only failure');
+});
+
+test('IndexedDB transactions have a hard timeout instead of remaining pending forever', async () => {
+  const db = await openDb();
+  try {
+    await assert.rejects(transactionResult(db, [STORE], (tx) => {
+      const store = tx.objectStore(STORE);
+      const keepAlive = () => {
+        const request = store.get('__keep_alive__');
+        request.onsuccess = keepAlive;
+      };
+      keepAlive();
+    }, 'Test deliberately stalled write', 20), (error) => error.code === 'IDB_TRANSACTION_TIMEOUT');
+  } finally {
+    db.close();
+  }
+});
 
 test('pausing an unsent revision cancels its catalog pointer and preserves the audit row', async () => {
   const sourceId = `pause-${randomUUID()}`;

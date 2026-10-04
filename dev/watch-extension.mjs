@@ -6,13 +6,19 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { createUpdateManager, UPDATE_STATE_FILE } from './update-utils.mjs';
+import {
+  controlCommandMatchesClient,
+  extensionIdFromOrigin,
+  normalizeControlClient,
+  resolveControlTarget
+} from './control-routing.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXTENSION_ROOT = path.join(PROJECT_ROOT, 'extension');
 const HOST = process.env.WATCH_AUTOMATION_HOST || '127.0.0.1';
 const PORT = Number(process.env.WATCH_AUTOMATION_PORT || 17321);
-const WATCHER_API_VERSION = 9;
-const WATCHER_BUILD_ID = '2026-10-03.1';
+const WATCHER_API_VERSION = 10;
+const WATCHER_BUILD_ID = '2026-10-04.3';
 const DEBOUNCE_MS = Number(process.env.WATCH_AUTOMATION_DEBOUNCE_MS || 650);
 const POLL_MS = Number(process.env.WATCH_AUTOMATION_POLL_MS || 5000);
 const DOM_LIBRARY_ROOT = path.join(PROJECT_ROOT, 'diagnostics', 'dom-library');
@@ -20,6 +26,8 @@ const DOM_DIAGNOSTIC_ROOT = path.join(PROJECT_ROOT, 'diagnostics', 'dom-diagnost
 const MAX_DOM_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_DOM_RECENT_KEYS = 10000;
 const MAX_CONTROL_COMMANDS = 100;
+const CONTROL_CLIENT_TTL_MS = 120000;
+const CONTROL_COMMAND_CLAIM_TIMEOUT_MS = 300000;
 
 const IGNORED_NAMES = new Set([
   '.DS_Store',
@@ -41,7 +49,8 @@ const state = {
   diagnosticLastAt: null,
   controlCommandsReceived: 0,
   controlCommandsCompleted: 0,
-  controlLastCommandAt: null
+  controlLastCommandAt: null,
+  controlLastPoll: null
 };
 
 let rescanTimer = null;
@@ -56,6 +65,7 @@ const recentDomKeys = new Set();
 const recentDomKeyOrder = [];
 const domSessionsSeen = new Set();
 const controlCommands = [];
+const controlClients = new Map();
 // Use a restart-safe numeric ID. The extension persists the last consumed ID,
 // while this development server may be restarted during code changes.
 let nextControlId = Date.now() * 1000 + 1;
@@ -589,6 +599,8 @@ function publicControlCommand(command) {
     id: command.id,
     command: command.command,
     payload: command.payload || {},
+    targetClientId: command.targetClientId || null,
+    targetExtensionId: command.targetExtensionId || null,
     status: command.status,
     createdAt: command.createdAt,
     startedAt: command.startedAt || null,
@@ -599,13 +611,79 @@ function publicControlCommand(command) {
   };
 }
 
-function enqueueControlCommand(payload = {}) {
+function publicControlClient(client) {
+  return {
+    clientId: client.clientId,
+    extensionId: client.extensionId,
+    version: client.version,
+    firstSeenAt: client.firstSeenAt,
+    lastSeenAt: new Date(client.lastSeenAt).toISOString()
+  };
+}
+
+function touchControlClient(request, url, bodyClientId = '', bodyExtensionId = '', bodyVersion = '') {
+  const claimedExtensionId = url?.searchParams?.get('extensionId') || bodyExtensionId || '';
+  const client = normalizeControlClient({
+    origin: request?.headers?.origin,
+    extensionId: claimedExtensionId,
+    clientId: bodyClientId || url?.searchParams?.get('clientId') || '',
+    version: url?.searchParams?.get('version') || bodyVersion || ''
+  });
+  if (!client) return null;
+  const now = Date.now();
+  const previous = controlClients.get(client.clientKey);
+  const next = {
+    ...previous,
+    ...client,
+    version: client.version || previous?.version || null,
+    firstSeenAt: previous?.firstSeenAt || new Date(now).toISOString(),
+    lastSeenAt: now
+  };
+  controlClients.set(client.clientKey, next);
+  return next;
+}
+
+function activeControlClients() {
+  const now = Date.now();
+  for (const [key, client] of controlClients) {
+    if (now - client.lastSeenAt > CONTROL_CLIENT_TTL_MS) controlClients.delete(key);
+  }
+  return [...controlClients.values()];
+}
+
+function failExpiredControlClaims() {
+  const now = Date.now();
+  for (const command of controlCommands) {
+    if (command.status !== 'claimed' || now - Number(command.claimedAt || 0) < CONTROL_COMMAND_CLAIM_TIMEOUT_MS) continue;
+    command.status = 'failed';
+    command.ok = false;
+    command.error = 'Экземпляр расширения не вернул результат команды за 5 минут';
+    command.completedAt = new Date(now).toISOString();
+    state.controlCommandsCompleted += 1;
+    state.controlLastCommandAt = command.completedAt;
+    console.warn(`[watch-extension] Команда ${command.command} истекла без результата, id ${command.id}`);
+  }
+}
+
+function enqueueControlCommand(payload = {}, request = null) {
   const command = normalizeControlCommand(payload.command || payload.action);
   if (!command) throw new Error('Поддерживаются команды start, continue, stop и import_references');
+  const caller = request ? touchControlClient(
+    request,
+    new URL(request.url || '/', `http://${HOST}:${PORT}`),
+    payload.clientId,
+    payload.extensionId,
+    payload.version
+  ) : null;
+  const target = resolveControlTarget({
+    targetClientId: payload.targetClientId || caller?.clientId || '',
+    targetExtensionId: payload.targetExtensionId || ''
+  }, activeControlClients());
   const item = {
     id: nextControlId++,
     command,
     payload: payload.payload && typeof payload.payload === 'object' ? payload.payload : {},
+    ...target,
     status: 'queued',
     createdAt: new Date().toISOString(),
     startedAt: null,
@@ -622,12 +700,21 @@ function enqueueControlCommand(payload = {}) {
   return publicControlCommand(item);
 }
 
-function listControlCommands(url) {
+function listControlCommands(url, request) {
+  failExpiredControlClaims();
+  const client = touchControlClient(request, url);
+  if (!client) return { ok: true, nextId: nextControlId, commands: [] };
   const after = Math.max(0, Number(url.searchParams.get('after') || 0));
   const id = Number(url.searchParams.get('id') || 0);
-  const commands = id
-    ? controlCommands.filter((item) => item.id === id)
-    : controlCommands.filter((item) => item.id > after && item.status === 'queued');
+  const commands = controlCommands.filter((item) => {
+    if (!controlCommandMatchesClient(item, client)) return false;
+    if (id) return item.id === id;
+    if (item.id <= after || item.status !== 'queued') return false;
+    item.status = 'claimed';
+    item.claimedByKey = client.clientKey;
+    item.claimedAt = Date.now();
+    return true;
+  });
   return {
     ok: true,
     nextId: nextControlId,
@@ -635,10 +722,21 @@ function listControlCommands(url) {
   };
 }
 
-function completeControlCommand(payload = {}) {
+function completeControlCommand(payload = {}, request = null) {
   const id = Number(payload.id || 0);
   const command = controlCommands.find((item) => item.id === id);
   if (!command) throw new Error(`Команда ${id} не найдена`);
+  const caller = request ? touchControlClient(
+    request,
+    new URL(request.url || '/', `http://${HOST}:${PORT}`),
+    payload.clientId,
+    payload.extensionId,
+    payload.version
+  ) : null;
+  if (!caller || !controlCommandMatchesClient(command, caller)
+    || (command.claimedByKey && command.claimedByKey !== caller.clientKey)) {
+    throw new Error('Команда принадлежит другому экземпляру расширения');
+  }
   if (command.completedAt || ['completed', 'failed'].includes(command.status)) {
     return publicControlCommand(command);
   }
@@ -651,6 +749,11 @@ function completeControlCommand(payload = {}) {
   state.controlLastCommandAt = command.completedAt;
   console.log(`[watch-extension] Команда ${command.command} завершена (${command.ok ? 'ok' : 'error'}), id ${command.id}`);
   return publicControlCommand(command);
+}
+
+function readControlCommandResult(id) {
+  const command = controlCommands.find((item) => item.id === Number(id));
+  return command ? publicControlCommand(command) : null;
 }
 
 async function listDiagnosticFiles() {
@@ -868,14 +971,14 @@ function startHttpServer() {
     }
     if (request.method === 'POST' && requestUrl.pathname === '/control') {
       readRequestBody(request)
-        .then((payload) => enqueueControlCommand(payload))
+        .then((payload) => enqueueControlCommand(payload, request))
         .then((value) => jsonResponse(response, 202, { ok: true, command: value }))
         .catch((error) => jsonResponse(response, 400, { ok: false, error: error.message }));
       return;
     }
     if (request.method === 'POST' && requestUrl.pathname === '/control/result') {
       readRequestBody(request)
-        .then((payload) => completeControlCommand(payload))
+        .then((payload) => completeControlCommand(payload, request))
         .then((value) => jsonResponse(response, 200, { ok: true, command: value }))
         .catch((error) => jsonResponse(response, 400, { ok: false, error: error.message }));
       return;
@@ -965,6 +1068,19 @@ function startHttpServer() {
       return;
     }
     if (requestUrl.pathname === '/status') {
+      const originExtensionId = extensionIdFromOrigin(request.headers.origin);
+      const statusClient = touchControlClient(request, requestUrl);
+      state.controlLastPoll = {
+        at: new Date().toISOString(),
+        origin: String(request.headers.origin || '').slice(0, 120) || null,
+        clientId: String(requestUrl.searchParams.get('clientId') || '').slice(0, 128) || null,
+        extensionId: String(requestUrl.searchParams.get('extensionId') || '').slice(0, 80) || null,
+        registered: Boolean(statusClient)
+      };
+      // Older copies poll this shared watcher without an installation token.
+      // Returning a revision to them would make an unrelated extension copy
+      // reload itself and every ChatGPT tab it owns.
+      const hideRevisionFromLegacyClient = Boolean(originExtensionId && !statusClient?.clientId);
       jsonResponse(response, 200, {
         ok: true,
         service: 'watch-extension',
@@ -975,12 +1091,28 @@ function startHttpServer() {
         root: EXTENSION_ROOT,
         domLibraryRoot: DOM_LIBRARY_ROOT,
         domDiagnosticRoot: DOM_DIAGNOSTIC_ROOT,
-        ...state
+        ...state,
+        revision: hideRevisionFromLegacyClient ? null : state.revision,
+        revisionHiddenForLegacyClient: hideRevisionFromLegacyClient
       });
       return;
     }
+    if (requestUrl.pathname === '/control/clients') {
+      jsonResponse(response, 200, {
+        ok: true,
+        clients: activeControlClients().map(publicControlClient)
+      });
+      return;
+    }
+    if (requestUrl.pathname === '/control/result') {
+      const command = readControlCommandResult(requestUrl.searchParams.get('id'));
+      jsonResponse(response, command ? 200 : 404, command
+        ? { ok: true, command }
+        : { ok: false, error: 'Команда не найдена' });
+      return;
+    }
     if (requestUrl.pathname === '/control') {
-      jsonResponse(response, 200, listControlCommands(requestUrl));
+      jsonResponse(response, 200, listControlCommands(requestUrl, request));
       return;
     }
     if (requestUrl.pathname === '/observations') {

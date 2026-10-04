@@ -34,7 +34,7 @@ import {
   WATCH_BRAND_FILTERS
 } from './queue-utils.js';
 import {
-  getAsset, getAssetKeys, replaceAssets, replaceModelCatalog, getAllModelCatalog, adoptLegacyGenerationRevisions,
+  getAsset, getAssetKeys, replaceAssets, replaceAssetsFromLoader, replaceModelCatalog, getAllModelCatalog, adoptLegacyGenerationRevisions,
   getOutputDirectoryHandle, putOutputDirectoryHandle, listRunDiagnostics, getRunDiagnostic
 } from './idb.js';
 import { buildInputPlan, normalizeInputMode, DEFAULT_INPUT_MODE } from './input-plan.js';
@@ -52,6 +52,8 @@ const $ = (id) => document.getElementById(id);
 const referenceFiles = new Map();
 const watchFiles = new Map();
 const payloadCache = new Map();
+const LOCAL_INPUT_BASE_URL = 'http://127.0.0.1:17321';
+let autoConnectInputsBusy = false;
 let folderSelections = { references: null, watches: null };
 let outputDestination = { mode: 'downloads', folderName: null, permission: 'unknown' };
 let outputDirectoryHandle = null;
@@ -486,7 +488,7 @@ const CHECK_STATE_LABELS = {
 };
 
 function filePath(file) {
-  return normalizeRelativePath(file.webkitRelativePath || file.name);
+  return normalizeRelativePath(file.relativePath || file.webkitRelativePath || file.name);
 }
 
 function readFileAsDataUrl(file) {
@@ -800,8 +802,8 @@ async function saveDraft() {
   });
 }
 
-async function scanReferenceFolder() {
-  const files = [...($('refFolder').files || [])];
+async function scanReferenceFolder(filesOverride = null, selectionMetadata = {}, options = {}) {
+  const files = Array.isArray(filesOverride) ? filesOverride : [...($('refFolder').files || [])];
   if (!files.length) throw new Error('Папка референсов не содержит доступных файлов. Выбери папку ещё раз.');
   referenceFiles.clear();
   payloadCache.clear();
@@ -814,6 +816,7 @@ async function scanReferenceFolder() {
       ...folderSelections,
       references: {
         ...describeFolderSelection(files, 'input-ref-images', 0),
+        ...selectionMetadata,
         storageStatus: 'error'
       }
     };
@@ -823,6 +826,7 @@ async function scanReferenceFolder() {
   }
   const referenceSelection = {
     ...describeFolderSelection(files, 'input-ref-images', referenceFiles.size),
+    ...selectionMetadata,
     storageStatus: 'saving'
   };
   folderSelections = { ...folderSelections, references: referenceSelection };
@@ -832,7 +836,7 @@ async function scanReferenceFolder() {
     key: `ref:${key}`,
     file,
     relativePath: filePath(file)
-  })));
+  })), { force: options.force === true });
   folderSelections = {
     ...folderSelections,
     references: { ...referenceSelection, storageStatus: 'ready', savedAt: new Date().toISOString() }
@@ -855,8 +859,8 @@ async function scanReferenceFolder() {
   await persistQueue();
 }
 
-async function scanWatchFolder() {
-  const files = [...($('watchFolder').files || [])];
+async function scanWatchFolder(filesOverride = null, options = {}) {
+  const files = Array.isArray(filesOverride) ? filesOverride : [...($('watchFolder').files || [])];
   if (!files.length) throw new Error('Папка с часами не содержит доступных файлов. Выбери папку ещё раз.');
   const nextWatchFiles = new Map();
   const scanned = emptyGroups();
@@ -875,6 +879,7 @@ async function scanWatchFolder() {
   if (!nextWatchFiles.size) {
     const selection = {
       ...describeFolderSelection(files, 'input-watches-images', 0),
+      ...(options.selectionMetadata || {}),
       storageStatus: 'error'
     };
     folderSelections = { ...folderSelections, watches: selection };
@@ -883,21 +888,61 @@ async function scanWatchFolder() {
     throw new Error('В выбранной папке не найдены часы. Выбери корень input-watches-images с папками in_sale и not_in_sale.');
   }
   const watchPathNode = $('watchFolderPath');
-  if (watchPathNode) watchPathNode.textContent = `Проверяю SHA-256: ${nextWatchFiles.size} файлов`;
-  await hashScannedWatchFiles(scanned);
+  if (watchPathNode) watchPathNode.textContent = `${options.loadFile ? 'Подключаю' : 'Проверяю SHA-256'}: ${nextWatchFiles.size} файлов`;
+  const previousHashes = new Map();
+  for (const groupId of QUEUE_GROUP_IDS) {
+    for (const entry of queue.groups?.[groupId] || []) {
+      for (const variant of [entry, ...(entry.variants || [])]) {
+        const id = String(variant?.sourceVariantId || variant?.inputSourceId || '');
+        if (id && variant?.sourceHash) previousHashes.set(id, variant);
+      }
+    }
+  }
+  for (const groupId of QUEUE_GROUP_IDS) {
+    for (const item of scanned[groupId]) {
+      const id = sourceVariantIdFor(groupId, item.relativePath);
+      const previous = previousHashes.get(id);
+      if (previous?.fingerprint === fingerprintForFile(item.file)) item.sourceHash = previous.sourceHash || null;
+    }
+  }
+  if (!options.loadFile) {
+    await hashScannedWatchFiles(scanned);
+  }
   const watchSelection = {
     ...describeFolderSelection(files, 'input-watches-images', nextWatchFiles.size),
+    ...(options.selectionMetadata || {}),
     storageStatus: 'saving'
   };
   folderSelections = { ...folderSelections, watches: watchSelection };
   await chrome.storage.local.set({ folderSelections });
   renderAll();
   try {
-    await replaceAssets('watch:', [...nextWatchFiles.entries()].map(([sourceVariantId, file]) => ({
-    key: `watch:${sourceVariantId}`,
-    file,
-    relativePath: filePath(file)
-    })));
+    if (options.loadFile) {
+      const assetEntries = QUEUE_GROUP_IDS.flatMap((groupId) => scanned[groupId]).map((item) => ({
+        key: `watch:${sourceVariantIdFor(classifyWatchPath(item.relativePath), item.relativePath)}`,
+        file: item.file,
+        relativePath: item.relativePath,
+        sourceItem: item
+      }));
+      await replaceAssetsFromLoader('watch:', assetEntries, options.loadFile, {
+        force: options.forceAssetRefresh === true,
+        batchSize: 12,
+        concurrency: 3,
+        shouldLoad: (entry) => !entry.sourceItem.sourceHash,
+        onFileLoaded: async (entry, file) => {
+          entry.sourceItem.sourceHash = await sha256File(file);
+        },
+        onProgress: (completed, total) => {
+          if (watchPathNode) watchPathNode.textContent = `Сохраняю фото часов: ${completed}/${total}`;
+        }
+      });
+    } else {
+      await replaceAssets('watch:', [...nextWatchFiles.entries()].map(([sourceVariantId, file]) => ({
+        key: `watch:${sourceVariantId}`,
+        file,
+        relativePath: filePath(file)
+      })));
+    }
   } catch (error) {
     folderSelections = {
       ...folderSelections,
@@ -908,7 +953,15 @@ async function scanWatchFolder() {
     throw new Error(`Не удалось сохранить фото часов в локальную память: ${error?.message || error}`);
   }
   watchFiles.clear();
-  for (const [sourceId, file] of nextWatchFiles) watchFiles.set(sourceId, file);
+  for (const [sourceId, file] of nextWatchFiles) {
+    watchFiles.set(sourceId, options.loadFile ? {
+      storedKey: `watch:${sourceId}`,
+      name: file.name,
+      type: file.type || 'image/png',
+      size: Number(file.size || 0),
+      lastModified: Number(file.lastModified || 0)
+    } : file);
+  }
   const stored = await chrome.storage.local.get(['history', 'generationMemory']);
   queue = { ...queue, groups: mergeScannedGroups(scanned, queue.groups) };
   await replaceModelCatalog(modelCatalogRecordsFromGroups(queue.groups));
@@ -926,6 +979,196 @@ async function scanWatchFolder() {
   // The worker creates/merges durable memory records. Refresh immediately so
   // the list is visible as soon as the folder picker finishes.
   await refreshRuntime();
+}
+
+function localInputFileType(name) {
+  const extension = String(name || '').toLowerCase().split('.').at(-1);
+  return ({
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+    bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff'
+  })[extension] || 'application/octet-stream';
+}
+
+function bundledInputMetadata(item) {
+  return {
+    ...item,
+    name: String(item?.name || String(item?.path || '').split('/').at(-1) || 'input.png'),
+    relativePath: String(item?.path || item?.relativePath || ''),
+    size: Number(item?.size || 0),
+    lastModified: Math.floor(Number(item?.lastModified || item?.modifiedAt || 0)),
+    type: localInputFileType(item?.name || item?.path)
+  };
+}
+
+async function bundledInputInventorySignature(files) {
+  const inventory = files
+    .map((item) => bundledInputMetadata(item))
+    .map((item) => `${item.relativePath}\u0000${item.size}\u0000${item.lastModified}`)
+    .sort()
+    .join('\n');
+  if (!crypto?.subtle) return `${files.length}:${inventory.length}`;
+  const bytes = new TextEncoder().encode(inventory);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function listBundledInputFiles(kind) {
+  const response = await fetch(`${LOCAL_INPUT_BASE_URL}/local-input-files?kind=${encodeURIComponent(kind)}`, { cache: 'no-store' });
+  let result = {};
+  try { result = await response.json(); } catch (_) {}
+  if (!response.ok || result.ok === false) {
+    throw new Error(result.error || `Не удалось прочитать папку ${kind} (HTTP ${response.status})`);
+  }
+  return {
+    inputRoot: String(result.root || ''),
+    files: (Array.isArray(result.files) ? result.files : [])
+      .filter((item) => isImageFileName(item?.name || item?.path))
+      .map(bundledInputMetadata)
+  };
+}
+
+async function getLocalProjectRoot() {
+  const response = await fetch(`${LOCAL_INPUT_BASE_URL}/health`, { cache: 'no-store' });
+  let result = {};
+  try { result = await response.json(); } catch (_) {}
+  if (!response.ok || result.ok === false || !result.projectRoot) {
+    throw new Error(result.error || `Локальный сервис не сообщил папку приложения (HTTP ${response.status})`);
+  }
+  return String(result.projectRoot);
+}
+
+async function loadBundledInputFile(entry) {
+  const path = String(entry?.relativePath || entry?.sourceItem?.relativePath || entry?.file?.relativePath || '');
+  if (!path) throw new Error(`Для файла ${entry?.file?.name || entry?.key || ''} не задан путь`);
+  const response = await fetch(`${LOCAL_INPUT_BASE_URL}/local-input-file?path=${encodeURIComponent(path)}`, { cache: 'no-store' });
+  if (!response.ok) {
+    let detail = '';
+    try { detail = (await response.json()).error || ''; } catch (_) {}
+    throw new Error(`Не удалось прочитать ${path}: ${detail || `HTTP ${response.status}`}`);
+  }
+  const blob = await response.blob();
+  const metadata = entry.file || entry.sourceItem?.file || bundledInputMetadata({ path, name: path.split('/').at(-1) });
+  if (Number(metadata.size || 0) > 0 && blob.size !== Number(metadata.size)) {
+    throw new Error(`Размер ${path} изменился во время чтения (${blob.size}/${metadata.size} байт)`);
+  }
+  const file = new File([blob], metadata.name, {
+    type: blob.type || metadata.type || 'image/png',
+    lastModified: Math.floor(Number(metadata.lastModified || 0))
+  });
+  Object.defineProperty(file, 'relativePath', { value: path });
+  return file;
+}
+
+function sameLocalRoot(left, right) {
+  const normalize = (value) => String(value || '').replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase();
+  return Boolean(normalize(left) && normalize(left) === normalize(right));
+}
+
+function hasActiveRunForInputImport() {
+  const state = String(runtime.run?.state || runtime.state || '').toUpperCase();
+  return Boolean(runtime.run && !['IDLE', 'DONE', 'STOPPED'].includes(state));
+}
+
+async function shouldImportBundledInputs(kind, root, signature, persistedFileCount, legacyDataExists = false) {
+  const selection = folderSelections[kind];
+  const hasPersistedFiles = Number(persistedFileCount || 0) > 0;
+  if (selection?.source && selection.source !== 'bundled-local') return false;
+  if (!selection && (hasPersistedFiles || legacyDataExists)) return false;
+  if (!selection) return true;
+  if (selection.source !== 'bundled-local') return !hasPersistedFiles && !selection.fileCount;
+  if (selection.storageStatus !== 'ready') return true;
+  if (Number(selection.fileCount || 0) !== Number(persistedFileCount || 0)) return true;
+  return !sameLocalRoot(selection.sourceRoot, root) || selection.sourceInventory !== signature;
+}
+
+async function autoConnectBundledInputs() {
+  if (autoConnectInputsBusy) return;
+  autoConnectInputsBusy = true;
+  try {
+    if (!await refreshRuntimeFast()) {
+      throw new Error('Не удалось проверить состояние очереди. Повтори открытие панели, когда расширение будет готово.');
+    }
+    if (hasActiveRunForInputImport()) return;
+    const manualReferences = Boolean(folderSelections.references
+      && folderSelections.references.source !== 'bundled-local'
+      && Number(folderSelections.references.fileCount || 0) > 0);
+    const manualWatches = Boolean(folderSelections.watches
+      && folderSelections.watches.source !== 'bundled-local'
+      && Number(folderSelections.watches.fileCount || 0) > 0);
+    if (manualReferences && manualWatches) return;
+    if (!folderSelections.references && $('refFolderPath')) $('refFolderPath').textContent = 'ищу input-ref-images рядом с приложением…';
+    if (!folderSelections.watches && $('watchFolderPath')) $('watchFolderPath').textContent = 'ищу input-watches-images рядом с приложением…';
+    const [projectRoot, referenceListing, watchListing] = await Promise.all([
+      getLocalProjectRoot(),
+      manualReferences ? Promise.resolve(null) : listBundledInputFiles('references'),
+      manualWatches ? Promise.resolve(null) : listBundledInputFiles('watches')
+    ]);
+    if ((referenceListing?.inputRoot && !sameLocalRoot(referenceListing.inputRoot, `${projectRoot}/input-ref-images`))
+      || (watchListing?.inputRoot && !sameLocalRoot(watchListing.inputRoot, `${projectRoot}/input-watches-images`))) {
+      throw new Error('Папки входных файлов расположены вне папки приложения.');
+    }
+    const references = (referenceListing?.files || []).filter((item) => referenceDescriptorForPath(item.relativePath));
+    const watches = (watchListing?.files || []).filter((item) => classifyWatchPath(item.relativePath));
+    const [referenceSignature, watchSignature, referenceKeys, watchKeys] = await Promise.all([
+      bundledInputInventorySignature(references),
+      bundledInputInventorySignature(watches),
+      getAssetKeys('ref:'),
+      getAssetKeys('watch:')
+    ]);
+    const groupsHaveWatches = QUEUE_GROUP_IDS.some((groupId) => (queue.groups?.[groupId] || []).length > 0);
+    const importReferences = !manualReferences && await shouldImportBundledInputs(
+      'references', projectRoot, referenceSignature, referenceKeys.length,
+      !folderSelections.references && Object.keys(queue.refs || {}).length > 0
+    );
+    const importWatches = !manualWatches && await shouldImportBundledInputs(
+      'watches', projectRoot, watchSignature, watchKeys.length,
+      !folderSelections.watches && groupsHaveWatches
+    );
+    if (!importReferences && !importWatches) return;
+    if (importReferences && !references.length) throw new Error('В папке input-ref-images не найдены распознаваемые референсы.');
+    if (importWatches && !watches.length) throw new Error('В папке input-watches-images не найдены фото в папках in_sale и not_in_sale.');
+
+    if (importReferences) {
+      const loadedReferences = new Array(references.length);
+      let referenceCursor = 0;
+      await Promise.all(Array.from({ length: Math.min(3, references.length) }, async () => {
+        while (referenceCursor < references.length) {
+          const index = referenceCursor++;
+          loadedReferences[index] = await loadBundledInputFile({ file: references[index], relativePath: references[index].relativePath });
+        }
+      }));
+      await scanReferenceFolder(loadedReferences, {
+        source: 'bundled-local',
+        sourceRoot: projectRoot,
+        sourceInventory: referenceSignature
+      }, {
+        force: folderSelections.references?.source === 'bundled-local'
+          && !sameLocalRoot(folderSelections.references?.sourceRoot, projectRoot)
+      });
+    }
+    if (importWatches) {
+      const rootChanged = folderSelections.watches?.source === 'bundled-local'
+        && !sameLocalRoot(folderSelections.watches?.sourceRoot, projectRoot);
+      await scanWatchFolder(watches, {
+        loadFile: loadBundledInputFile,
+        forceAssetRefresh: rootChanged,
+        selectionMetadata: {
+          source: 'bundled-local',
+          sourceRoot: projectRoot,
+          sourceInventory: watchSignature
+        }
+      });
+    }
+    showFeedback('Папки input-ref-images и input-watches-images найдены и подключены автоматически.', {
+      type: 'success', autoHide: true
+    });
+  } catch (error) {
+    showFeedback(`Автоподключение входных папок не завершено: ${error?.message || error}. Проверь папки рядом с приложением и перезапусти его.`, {
+      type: 'error'
+    });
+  } finally {
+    autoConnectInputsBusy = false;
+  }
 }
 
 async function outputDirectoryPermission(handle = outputDirectoryHandle) {
@@ -1137,7 +1380,7 @@ async function requestRuntimeFast() {
 
 async function refreshRuntimeFast() {
   const response = await requestRuntimeFast();
-  if (!response?.ok) return;
+  if (!response?.ok) return false;
   const value = response.value || {};
   runtime = { ...runtime, ...(value.runtime || {}), run: value.run ?? null };
   refreshRunDiagnosticsAtBoundary();
@@ -1147,6 +1390,7 @@ async function refreshRuntimeFast() {
   renderSlotGrid();
   if (Array.isArray(value.logs)) renderLogs(value.logs);
   updateActionButtons();
+  return true;
 }
 
 function shortTime(value) {
@@ -1992,9 +2236,10 @@ async function syncUpdatedReferenceAssetsIfNeeded(installed, status = {}) {
     message: 'Код обновлён. Загружаю свежие референсы в локальную библиотеку расширения…'
   });
   try {
-    const listResponse = await fetch('http://127.0.0.1:17321/local-input-files?kind=references', { cache: 'no-store' });
+    const listResponse = await fetch(`${LOCAL_INPUT_BASE_URL}/local-input-files?kind=references`, { cache: 'no-store' });
     if (!listResponse.ok) throw new Error(`Локальный сервис референсов ответил HTTP ${listResponse.status}`);
     const listed = await listResponse.json();
+    const projectRoot = await getLocalProjectRoot();
     const sourceFiles = (Array.isArray(listed?.files) ? listed.files : [])
       .filter((item) => item?.path && referenceDescriptorForPath(item.path));
     if (!sourceFiles.length) throw new Error('В папке input-ref-images не найдены файлы референсов для этой версии.');
@@ -2006,14 +2251,15 @@ async function syncUpdatedReferenceAssetsIfNeeded(installed, status = {}) {
       while (cursor < sourceFiles.length) {
         const item = sourceFiles[cursor++];
         const descriptor = referenceDescriptorForPath(item.path);
-        const url = `http://127.0.0.1:17321/local-input-file?path=${encodeURIComponent(item.path)}`;
+        const url = `${LOCAL_INPUT_BASE_URL}/local-input-file?path=${encodeURIComponent(item.path)}`;
         const fileResponse = await fetch(url, { cache: 'no-store' });
         if (!fileResponse.ok) throw new Error(`Не удалось прочитать референс ${item.name}: HTTP ${fileResponse.status}`);
         const blob = await fileResponse.blob();
         const file = new File([blob], item.name || pathBasename(item.path), {
           type: blob.type || 'image/png',
-          lastModified: Number(item.modifiedAt || Date.now())
+          lastModified: Math.floor(Number(item.lastModified || item.modifiedAt || Date.now()))
         });
+        Object.defineProperty(file, 'relativePath', { value: item.path });
         nextAssets.push({
           key: `ref:${descriptor.storageKey}`,
           file,
@@ -2031,6 +2277,7 @@ async function syncUpdatedReferenceAssetsIfNeeded(installed, status = {}) {
     await Promise.all(workers);
     const uniqueAssets = new Map(nextAssets.map((entry) => [entry.key, entry]));
     if (uniqueAssets.size !== nextAssets.length) throw new Error('В обновлённых референсах повторяются ключи файлов.');
+    const sourceInventory = await bundledInputInventorySignature(sourceFiles.map((item) => bundledInputMetadata(item)));
     await replaceAssets('ref:', [...uniqueAssets.values()], { force: true });
     referenceFiles.clear();
     for (const asset of uniqueAssets.values()) {
@@ -2050,6 +2297,9 @@ async function syncUpdatedReferenceAssetsIfNeeded(installed, status = {}) {
         fileCount: uniqueAssets.size,
         selectedFileCount: sourceFiles.length,
         recognizedFileCount: uniqueAssets.size,
+        source: 'bundled-local',
+        sourceRoot: projectRoot,
+        sourceInventory,
         storageStatus: 'ready',
         savedAt: new Date().toISOString()
       }
@@ -2310,6 +2560,7 @@ loadQueue()
   .then(async () => {
     await refreshRunDiagnosticsList();
     await refreshExtensionUpdateStatus();
+    await autoConnectBundledInputs();
   })
   .catch(showError);
 // Fast status refresh is intentionally lightweight: GET_RUNTIME_FAST never

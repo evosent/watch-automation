@@ -71,6 +71,7 @@ import {
   stableHash,
   shouldRefreshUnresponsiveGeneration,
   findStalledBatchRecoveryCandidate,
+  shouldTripAttachmentFailureCircuitBreaker,
   STALLED_BATCH_RECOVERY_DELAY_MS
 } from './reliability-utils.js';
 
@@ -99,6 +100,7 @@ const PREPARE_PAGE_TIMEOUT_MS = 150000;
 // An error can appear before ChatGPT finishes mounting the image. Keep the
 // failed slot observable for the same 15-minute window as a regular generation.
 const FINAL_CHECK_TIMEOUT_MS = 900000;
+const MAX_ARTIFACT_REVISION_PERSIST_FAILURES = 3;
 const RATE_LIMIT_PAUSE_MS = 180000;
 const DEFAULT_RATE_LIMIT_PAUSE_MINUTES = RATE_LIMIT_PAUSE_MS / 60000;
 const MIN_RATE_LIMIT_PAUSE_MINUTES = 1;
@@ -131,7 +133,7 @@ const SLOT_PROBE_TIMEOUT_MS = 8000;
 const GLOBAL_NO_PROGRESS_WINDOW_MS = 300000;
 const MAX_RUN_EVENTS = 600;
 const OUTPUT_VERIFY_TIMEOUT_MS = 2000;
-const EXTENSION_BUILD_ID = '2026-10-03.1';
+const EXTENSION_BUILD_ID = '2026-10-04.3';
 const PROMPT_PIPELINE_VERSION = '6';
 const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
@@ -139,6 +141,7 @@ const FACTS_START_ACK_TIMEOUT_MS = 8000;
 const FACTS_FAST_PULSE_INTERVAL_MS = 1500;
 const REVISION_FACTS_RECOVERY_TIMEOUT_MS = 60000;
 const REVISION_FACTS_RECOVERY_CONCURRENCY = 3;
+const MAX_POSTPROCESS_TABS = 3;
 const DOM_DIAGNOSTICS_MODES = Object.freeze({
   OFF: 'off',
   ERRORS: 'errors',
@@ -171,11 +174,15 @@ const stalledBatchRecoveryRuns = new Set();
 // write. It lets DOWNLOAD_GENERATED return immediately without risking a very
 // fast download completing before slot.downloadId reaches storage.
 const activeDownloadClaims = new Map();
+const activeDownloadFinalizations = new Set();
+const postprocessCapacityReservations = new Map();
 // Worker tabs are intentionally allocated in parallel. The only globally
 // serialized operation in the generation pipeline is the real Send click.
 let inputFilePromiseCache = new Map();
 let devReloadPollInFlight = false;
 let devControlPollInFlight = false;
+let devControlClientIdentityCache = null;
+let devControlClientIdentityPromise = null;
 let domBridgeChain = Promise.resolve();
 let domBridgeRetryAt = 0;
 let diagnosticBridgeChain = Promise.resolve();
@@ -187,6 +194,14 @@ let domDiagnosticsModeCache = DEFAULT_DOM_DIAGNOSTICS_MODE;
 let pendingLogEntries = [];
 let logFlushTimer = null;
 let logFlushChain = Promise.resolve();
+const pendingRunDiagnosticSnapshots = new Map();
+const runDiagnosticPersistenceState = new Map();
+let runDiagnosticsFlushTimer = null;
+let runDiagnosticsFlushDueAt = 0;
+let runDiagnosticsFlushInFlight = false;
+const RUN_DIAGNOSTICS_FLUSH_DELAY_MS = 300;
+const RUN_DIAGNOSTICS_RETRY_BASE_MS = 30000;
+const RUN_DIAGNOSTICS_RETRY_MAX_MS = 5 * 60_000;
 // Resolve one host window for concurrent worker starts. Worker tabs belong to
 // the window that owns the side panel; the promise prevents races while saving it.
 let automationWindowPromise = null;
@@ -472,15 +487,20 @@ function recordRunEvent(run, type, data = {}) {
   run.eventCount = sequence;
 }
 
-async function persistRunDiagnostics(run, queue = null) {
+function scheduleRunDiagnosticsFlush(delayMs = RUN_DIAGNOSTICS_FLUSH_DELAY_MS) {
+  const dueAt = Date.now() + Math.max(0, Number(delayMs || 0));
+  if (runDiagnosticsFlushTimer && runDiagnosticsFlushDueAt <= dueAt) return;
+  if (runDiagnosticsFlushTimer) clearTimeout(runDiagnosticsFlushTimer);
+  runDiagnosticsFlushDueAt = dueAt;
+  runDiagnosticsFlushTimer = setTimeout(() => {
+    runDiagnosticsFlushTimer = null;
+    runDiagnosticsFlushDueAt = 0;
+    void flushQueuedRunDiagnostics();
+  }, Math.max(0, dueAt - Date.now()));
+}
+
+function queueRunDiagnostics(run, queue = null) {
   if (!run?.operationId) return;
-  if (queue?.groups) {
-    const planned = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
-    const entries = queue.groups[run.groupId] || [];
-    run.diagnosticsLastKnownCompletedCount = entries
-      .filter((entry) => planned.has(entry.sourceId) && entry.status === 'done').length;
-    run.diagnosticsLastKnownPendingCount = Math.max(0, planned.size - run.diagnosticsLastKnownCompletedCount);
-  }
   const events = Array.isArray(run.eventJournal) ? run.eventJournal : [];
   let sequence = Number(run.eventSequence || 0);
   if (events.some((event) => !Number(event?.sequence))) {
@@ -502,13 +522,28 @@ async function persistRunDiagnostics(run, queue = null) {
   run.eventSequence = sequence;
   run.eventCount = sequence;
 
-  const persistedSequence = Math.max(0, Number(run.diagnosticsPersistedSequence || 0));
+  const operationId = String(run.operationId);
+  const state = runDiagnosticPersistenceState.get(operationId) || {
+    persistedSequence: Math.max(0, Number(run.diagnosticsPersistedSequence || 0)),
+    headerFingerprint: run.diagnosticsHeaderFingerprint || null,
+    failures: 0,
+    retryAt: 0,
+    error: null,
+    failedAt: null
+  };
+  run.diagnosticsPersistedSequence = Math.max(Number(run.diagnosticsPersistedSequence || 0), state.persistedSequence);
+  run.diagnosticsHeaderFingerprint = state.headerFingerprint || run.diagnosticsHeaderFingerprint || null;
+  run.diagnosticsPersistenceError = state.error || null;
+  run.diagnosticsPersistenceFailedAt = state.failedAt || null;
+  const header = runDiagnosticHeader(run, queue, chrome.runtime.getManifest?.().version || null);
+  run.diagnosticsLastKnownCompletedCount = Number(header.completedCount || 0);
+  run.diagnosticsLastKnownPendingCount = Number(header.pendingCount || 0);
+  const headerFingerprint = JSON.stringify(header);
+  const persistedSequence = Math.max(0, Number(state.persistedSequence || 0));
   const pendingEvents = events
     .filter((event) => Number(event.sequence) > persistedSequence)
     .sort((left, right) => Number(left.sequence) - Number(right.sequence));
-  const header = runDiagnosticHeader(run, queue, chrome.runtime.getManifest?.().version || null);
-  const headerFingerprint = JSON.stringify(header);
-  if (!pendingEvents.length && headerFingerprint === run.diagnosticsHeaderFingerprint) return;
+  if (!pendingEvents.length && headerFingerprint === state.headerFingerprint) return;
 
   const records = [];
   const firstSequence = Number(pendingEvents[0]?.sequence || 0);
@@ -528,20 +563,78 @@ async function persistRunDiagnostics(run, queue = null) {
     sequence: event.sequence
   })));
 
-  await saveRunDiagnostics(header, records);
-  run.diagnosticsPersistedSequence = Math.max(persistedSequence, ...records.map((event) => Number(event.sequence || 0)));
-  run.diagnosticsHeaderFingerprint = headerFingerprint;
-  run.diagnosticsPersistenceError = null;
+  const maxSequence = Math.max(persistedSequence, ...records.map((event) => Number(event.sequence || 0)));
+  pendingRunDiagnosticSnapshots.set(operationId, { operationId, header, records, maxSequence, headerFingerprint });
+  runDiagnosticPersistenceState.set(operationId, state);
+  scheduleRunDiagnosticsFlush(state.retryAt > Date.now() ? state.retryAt - Date.now() : RUN_DIAGNOSTICS_FLUSH_DELAY_MS);
 }
 
-async function flushRunDiagnosticsSafely(run, queue) {
-  if (!run?.operationId) return;
+async function flushQueuedRunDiagnostics() {
+  if (runDiagnosticsFlushInFlight) return;
+  runDiagnosticsFlushInFlight = true;
   try {
-    await persistRunDiagnostics(run, queue);
-  } catch (error) {
-    run.diagnosticsPersistenceError = String(error?.message || error).slice(0, 1200);
-    run.diagnosticsPersistenceFailedAt = new Date().toISOString();
+    while (pendingRunDiagnosticSnapshots.size) {
+      const now = Date.now();
+      const ready = [...pendingRunDiagnosticSnapshots.entries()].find(([operationId]) => (
+        Number(runDiagnosticPersistenceState.get(operationId)?.retryAt || 0) <= now
+      ));
+      if (!ready) {
+        const nextRetryAt = Math.min(...[...pendingRunDiagnosticSnapshots.keys()].map((operationId) => (
+          Number(runDiagnosticPersistenceState.get(operationId)?.retryAt || now)
+        )));
+        scheduleRunDiagnosticsFlush(Math.max(0, nextRetryAt - now));
+        break;
+      }
+      const [operationId, snapshot] = ready;
+      const state = runDiagnosticPersistenceState.get(operationId) || { persistedSequence: 0, failures: 0, retryAt: 0 };
+      pendingRunDiagnosticSnapshots.delete(operationId);
+      try {
+        await saveRunDiagnostics(snapshot.header, snapshot.records);
+        const nextState = {
+          ...state,
+          persistedSequence: Math.max(Number(state.persistedSequence || 0), snapshot.maxSequence),
+          headerFingerprint: snapshot.headerFingerprint,
+          failures: 0,
+          retryAt: 0,
+          error: null,
+          failedAt: null
+        };
+        runDiagnosticPersistenceState.set(operationId, nextState);
+        await chrome.storage.local.remove('runDiagnosticsPersistenceError').catch(() => {});
+      } catch (error) {
+        const failures = Math.max(0, Number(state.failures || 0)) + 1;
+        const retryMs = Math.min(RUN_DIAGNOSTICS_RETRY_MAX_MS,
+          RUN_DIAGNOSTICS_RETRY_BASE_MS * (2 ** Math.min(failures - 1, 4)));
+        const failedAt = new Date().toISOString();
+        const errorMessage = String(error?.message || error).slice(0, 1200);
+        const nextState = { ...state, failures, retryAt: Date.now() + retryMs, error: errorMessage, failedAt };
+        runDiagnosticPersistenceState.set(operationId, nextState);
+        const queued = pendingRunDiagnosticSnapshots.get(operationId);
+        if (!queued || queued.maxSequence <= snapshot.maxSequence) pendingRunDiagnosticSnapshots.set(operationId, snapshot);
+        await chrome.storage.local.set({ runDiagnosticsPersistenceError: {
+          operationId, error: errorMessage, failedAt, retryAt: nextState.retryAt
+        } }).catch(() => {});
+        scheduleRunDiagnosticsFlush(retryMs);
+        break;
+      }
+    }
+  } finally {
+    runDiagnosticsFlushInFlight = false;
+    if (pendingRunDiagnosticSnapshots.size && !runDiagnosticsFlushTimer) {
+      const now = Date.now();
+      const nextRetryAt = Math.min(...[...pendingRunDiagnosticSnapshots.keys()].map((operationId) => (
+        Math.max(now, Number(runDiagnosticPersistenceState.get(operationId)?.retryAt || 0))
+      )));
+      scheduleRunDiagnosticsFlush(Math.max(0, nextRetryAt - now));
+    }
   }
+}
+
+// Keep diagnostics out of the automation's control path. saveRunAndQueue() is
+// called for frequent slot heartbeats; an IndexedDB stall must never hold up a
+// Send, download finalization, pause, or reset operation.
+async function flushRunDiagnosticsSafely(run, queue) {
+  queueRunDiagnostics(run, queue);
 }
 
 async function setSlotPhase(runId, slotId, phase, extra = {}) {
@@ -2789,6 +2882,88 @@ async function waitForStartupReconciliation() {
   if (pending) await pending;
 }
 
+async function reconcilePostprocessOwners(runSnapshot, reason = 'Перезапуск расширения') {
+  if (!runSnapshot?.operationId) return { checked: 0, released: 0 };
+  const owners = Object.values(runSnapshot.postprocessTabs || {})
+    .filter((owner) => Number(owner?.tabId || 0) > 0 && owner?.entryId && owner?.factsJobId);
+  if (!owners.length) return { checked: 0, released: 0 };
+  const now = Date.now();
+  let released = 0;
+  for (const owner of owners) {
+    const tabId = Number(owner.tabId);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const chatTab = Boolean(tab && /^https:\/\/chatgpt\.com\//i.test(tab.url || tab.pendingUrl || ''));
+    const startedAt = Date.parse(owner.startedAt || '') || 0;
+    const deadline = Number(owner.recoveryDeadlineAt || 0) || (startedAt ? startedAt + FINAL_CHECK_TIMEOUT_MS : 0);
+    const expired = deadline > 0 && now >= deadline;
+    if (chatTab && !expired) {
+      startFactsPulseMonitor(0);
+      if (!Number(owner.recoveryDeadlineAt || 0)) {
+        await withStateLock(async () => {
+          const { run } = await chrome.storage.local.get('run');
+          const current = run?.operationId === runSnapshot.operationId
+            ? run.postprocessTabs?.[String(tabId)] : null;
+          if (!current || current.entryId !== owner.entryId || current.factsJobId !== owner.factsJobId) return;
+          current.recoveryDeadlineAt = deadline || (Date.now() + FINAL_CHECK_TIMEOUT_MS);
+          await chrome.storage.local.set({ run });
+        });
+      }
+      continue;
+    }
+
+    const revision = owner.generationId
+      ? await getGenerationRevision(owner.generationId).catch(() => null)
+      : null;
+    const factsSaved = revision?.factsStatus === 'ok'
+      && revision?.facts?.status === 'ok'
+      && String(revision.facts.generationId || '') === String(owner.generationId || '')
+      && String(revision.facts.factsJobId || '') === String(owner.factsJobId || '');
+    const stageMessage = {
+      operationId: runSnapshot.operationId,
+      slotId: owner.slotId,
+      tabId,
+      entryId: owner.entryId,
+      generationId: owner.generationId || null,
+      factsJobId: owner.factsJobId,
+      outputPath: owner.outputPath || null,
+      outputHash: owner.outputHash || null,
+      modelName: owner.modelName || owner.outputFileName || null,
+      chatUrl: owner.chatUrl || null
+    };
+    await updateFactsStage(stageMessage, { tab: { id: tabId } }, {
+      ...stageMessage,
+      stage: factsSaved ? 'SAVED' : 'ERROR',
+      error: factsSaved ? null : (chatTab
+        ? 'Постпроверка автоматически завершена по тайм-ауту; PNG сохранён, характеристики можно повторить из галереи.'
+        : 'Вкладка постпроверки потеряна; PNG сохранён, характеристики можно повторить из галереи.')
+    }).catch(() => {});
+    await cleanupPostprocessTab(runSnapshot.operationId, tabId);
+    await withStateLock(async () => {
+      const stored = await chrome.storage.local.get(['run', 'queue']);
+      const { run, queue } = stored;
+      if (run?.operationId !== runSnapshot.operationId) return;
+      recordRunEvent(run, 'postprocess_owner_released', {
+        slotId: Number(owner.slotId), entryId: owner.entryId,
+        generationId: owner.generationId || null, factsJobId: owner.factsJobId,
+        reason: chatTab ? 'postprocess_deadline_exceeded' : 'postprocess_tab_missing',
+        factsSaved
+      });
+      if (!['RUNNING', 'DRAINING'].includes(run.state)) {
+        run.currentAction = factsSaved
+          ? `Постпроверка восстановлена: ${owner.modelName || owner.entryId}`
+          : 'Зависшая постпроверка освобождена. Скачанные PNG сохранены; характеристики можно повторить в галерее.';
+      }
+      await saveRunAndQueue(run, queue);
+      await publishRun(run, queue).catch(() => {});
+    });
+    released += 1;
+  }
+  if (released) await appendLog('Восстановлены зависшие/потерянные вкладки постпроверки', {
+    operationId: runSnapshot.operationId, released, reason
+  });
+  return { checked: owners.length, released };
+}
+
 async function recoverInterruptedRun(reason) {
   const startupSnapshot = await getStored();
   if (startupSnapshot.sessionResetIntent) {
@@ -2802,7 +2977,11 @@ async function recoverInterruptedRun(reason) {
     reason,
     error: error.message
   }).catch(() => {}));
-  const initial = await getStored();
+  let initial = await getStored();
+  if (initial.run?.postprocessTabs && Object.keys(initial.run.postprocessTabs).length) {
+    await reconcilePostprocessOwners(initial.run, reason);
+    initial = await getStored();
+  }
   const initialRun = initial.run;
   const initialMemory = normalizeGenerationMemory(initial.generationMemory);
   const recoveryStage = String(initialRun?.conversationRecovery?.stage || '').toUpperCase();
@@ -2884,12 +3063,15 @@ async function recoverInterruptedRun(reason) {
         .map((entry) => entry.sourceId);
       clearResolvedRunError(run, queue);
       const imageLimitWaiting = run.pauseReason === 'IMAGE_LIMIT' && Number(run.rateLimitPauseUntil || 0) > Date.now();
-      run.status = imageLimitWaiting ? 'RATE_LIMIT_PAUSE' : (hasUnresolvedSlotErrors(run) ? 'PAUSED_ON_ERROR' : 'PAUSED');
+      const blockedRevisionCount = Object.values(run.slots || {}).filter((slot) => slot.revisionPersistBlocked).length;
+      run.status = imageLimitWaiting ? 'RATE_LIMIT_PAUSE' : (blockedRevisionCount || hasUnresolvedSlotErrors(run) ? 'PAUSED_ON_ERROR' : 'PAUSED');
       run.currentAction = imageLimitWaiting
         ? `Лимит изображений. Автоматически продолжу в ${clockTime(run.rateLimitPauseUntil)}`
-        : (run.pendingIds.length
-          ? `Сохранённые результаты сверены. Осталось ${run.pendingIds.length} моделей; продолжение запустит только их.`
-          : 'Сохранённые результаты сверены. Очередь завершена.');
+        : (blockedRevisionCount
+          ? `${blockedRevisionCount} PNG уже скачаны, но их ревизии требуют повтора записи. «Продолжить» повторит сохранение без генерации изображения.`
+          : (run.pendingIds.length
+            ? `Сохранённые результаты сверены. Осталось ${run.pendingIds.length} моделей; продолжение запустит только их.`
+            : 'Сохранённые результаты сверены. Очередь завершена.'));
       await saveRunAndQueue(run, queue, history, memory);
       await publishRun(run, queue);
     });
@@ -2956,6 +3138,20 @@ async function recoverInterruptedRun(reason) {
       const ambiguousSend = ['SENDING'].includes(String(slot.status || '').toUpperCase())
         || slot.phase === SLOT_PHASES.SENDING;
 
+      // Keep a completed download recoverable if IndexedDB failed to commit
+      // its verified revision. Continue retries persistence from Downloads and
+      // never resubmit the image-generation prompt for this item.
+      if (slot.revisionPersistBlocked && slot.downloadId) {
+        slot.tabId = null;
+        slot.status = 'PAUSED';
+        slot.phase = SLOT_PHASES.NEEDS_ATTENTION;
+        slot.finalCheckPending = false;
+        slot.finalCheckDeadlineAt = null;
+        slot.failed = true;
+        if (entry && entry.status !== 'done') entry.status = 'error';
+        continue;
+      }
+
       // If the worker died in the narrow window after clicking Send but before
       // PROMPT_SENT reached storage, SENDING is ambiguous: ChatGPT may already
       // have accepted the user turn. Preserve that live tab long enough for a
@@ -3020,17 +3216,22 @@ async function recoverInterruptedRun(reason) {
       .map((entry) => entry.sourceId);
     run.state = 'PAUSED';
     run.pauseReason = preserveImageLimitPause ? 'IMAGE_LIMIT' : (preserveUserPause ? 'USER' : 'RESTART');
-    run.status = preserveImageLimitPause ? 'RATE_LIMIT_PAUSE' : (shouldResumeObservation
-      ? 'PAUSED_RECOVERING'
-      : (preserveUserPause ? 'PAUSED' : 'PAUSED_ON_RESTART'));
+    const blockedRevisionCount = Object.values(run.slots || {}).filter((slot) => slot.revisionPersistBlocked).length;
+    run.status = preserveImageLimitPause ? 'RATE_LIMIT_PAUSE' : (blockedRevisionCount
+      ? 'PAUSED_ON_ERROR'
+      : (shouldResumeObservation
+        ? 'PAUSED_RECOVERING'
+        : (preserveUserPause ? 'PAUSED' : 'PAUSED_ON_RESTART')));
     run.error = null;
     run.currentAction = preserveImageLimitPause
       ? `Лимит изображений. Автоматически продолжу в ${clockTime(run.rateLimitPauseUntil)}`
-      : (shouldResumeObservation
-      ? `${reason}. Досматриваю уже отправленные генерации; новые запросы не запускаю.`
-      : (preserveUserPause
-        ? 'Пауза пользователя восстановлена. Активных генераций для досмотра не осталось.'
-        : `${reason}. Старые слоты освобождены, можно продолжить очередь.`));
+      : (blockedRevisionCount
+        ? `${blockedRevisionCount} PNG уже скачаны, но их ревизии требуют повтора записи. «Продолжить» повторит сохранение без генерации изображения.`
+        : (shouldResumeObservation
+          ? `${reason}. Досматриваю уже отправленные генерации; новые запросы не запускаю.`
+          : (preserveUserPause
+            ? 'Пауза пользователя восстановлена. Активных генераций для досмотра не осталось.'
+            : `${reason}. Старые слоты освобождены, можно продолжить очередь.`)));
     run.lastActivityAt = new Date().toISOString();
     await saveRunAndQueue(run, queue, history, generationMemory);
     await appendLog(message, { observing: shouldResumeObservation, discardedTabs: tabsToDiscard.length });
@@ -3122,6 +3323,24 @@ function ensureDevReloadAlarm() {
   Promise.resolve(chrome.alarms.create(DEV_RELOAD_ALARM_NAME, { periodInMinutes: 0.5 })).catch(() => {});
 }
 
+function getDevControlClientIdentity() {
+  if (devControlClientIdentityCache) return Promise.resolve(devControlClientIdentityCache);
+  if (devControlClientIdentityPromise) return devControlClientIdentityPromise;
+  devControlClientIdentityPromise = (async () => {
+    const stored = await chrome.storage.local.get('devControlClientId');
+    const clientId = String(stored.devControlClientId || globalThis.crypto?.randomUUID?.()
+      || `watch-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    if (!stored.devControlClientId) await chrome.storage.local.set({ devControlClientId: clientId });
+    devControlClientIdentityCache = {
+      clientId,
+      extensionId: String(chrome.runtime.id || ''),
+      version: String(chrome.runtime.getManifest?.().version || '')
+    };
+    return devControlClientIdentityCache;
+  })().finally(() => { devControlClientIdentityPromise = null; });
+  return devControlClientIdentityPromise;
+}
+
 async function refreshChatGPTTabsAfterReload() {
   const stored = await chrome.storage.local.get('devAutoReload');
   const marker = stored.devAutoReload || {};
@@ -3210,7 +3429,9 @@ async function pollDevReload(source = 'poll') {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DEV_RELOAD_POLL_TIMEOUT_MS);
   try {
-    const response = await fetch(DEV_RELOAD_STATUS_URL, {
+    const identity = await getDevControlClientIdentity();
+    const identityQuery = new URLSearchParams(identity);
+    const response = await fetch(`${DEV_RELOAD_STATUS_URL}?${identityQuery}`, {
       cache: 'no-store',
       signal: controller.signal
     });
@@ -3441,7 +3662,7 @@ function runHasActiveAutomationWork(run) {
   ));
 }
 
-async function postControlResult(command, result) {
+async function postControlResult(command, result, controlClient = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DEV_CONTROL_POLL_TIMEOUT_MS);
   try {
@@ -3451,6 +3672,9 @@ async function postControlResult(command, result) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         id: command.id,
+        clientId: controlClient.clientId || null,
+        extensionId: controlClient.extensionId || null,
+        version: controlClient.version || null,
         ok: result.ok === true,
         value: result.value ?? null,
         error: result.ok === true ? null : result.error || 'Команда завершилась с ошибкой'
@@ -3530,6 +3754,23 @@ async function executeControlCommand(command) {
     return {
       runtime: stored.runtime || null,
       summary: stored.run ? runSummary(stored.run, stored.queue) : null,
+      runDiagnostics: stored.run ? {
+        operationId: stored.run.operationId || null,
+        startedAt: stored.run.startedAt || null,
+        lastActivityAt: stored.run.lastActivityAt || null,
+        eventJournal: Array.isArray(stored.run.eventJournal) ? stored.run.eventJournal.slice(-100) : [],
+        postprocessOwners: Object.values(stored.run.postprocessTabs || {}).map((owner) => ({
+          tabId: Number(owner.tabId || 0) || null,
+          entryId: owner.entryId || null,
+          generationId: owner.generationId || null,
+          factsJobId: owner.factsJobId || null,
+          startedAt: owner.startedAt || null,
+          lastPulseAt: owner.lastPulseAt || null,
+          pulseState: owner.pulseState || null,
+          pulseError: owner.pulseError || null,
+          recoveryDeadlineAt: Number(owner.recoveryDeadlineAt || 0) || null
+        }))
+      } : null,
       job: stored.job ? {
         queueGroup: stored.job.queueGroup || null,
         filters: stored.job.filters || filterFromQueueGroup(stored.job.queueGroup),
@@ -3577,7 +3818,16 @@ async function executeControlCommand(command) {
     await applyControlJobPatch(payload);
     return resumeRun();
   }
-  if (command.command === 'STOP') return stopRun();
+  if (command.command === 'STOP') {
+    const expectedOperationId = String(payload.expectedOperationId || '');
+    if (expectedOperationId) {
+      const { run } = await chrome.storage.local.get('run');
+      if (run?.operationId !== expectedOperationId) {
+        throw new Error(`Остановка отменена: ожидался прогон ${expectedOperationId}, активен ${run?.operationId || 'пусто'}`);
+      }
+    }
+    return stopRun();
+  }
   throw new Error(`Неизвестная команда: ${command.command}`);
 }
 
@@ -3589,7 +3839,9 @@ async function pollDevControl(source = 'poll') {
   try {
     const stored = await chrome.storage.local.get('devControlLastId');
     const after = Number(stored.devControlLastId || 0);
-    const response = await fetch(`${DEV_CONTROL_URL}?after=${after}`, {
+    const controlClient = await getDevControlClientIdentity();
+    const query = new URLSearchParams({ after: String(after), ...controlClient });
+    const response = await fetch(`${DEV_CONTROL_URL}?${query}`, {
       cache: 'no-store',
       signal: controller.signal
     });
@@ -3610,7 +3862,7 @@ async function pollDevControl(source = 'poll') {
         result = { ok: false, error: error?.message || String(error) };
         await appendLog(`Локальная команда завершилась ошибкой: ${command.command}`, { commandId: id, error: result.error, source });
       }
-      await postControlResult(command, result);
+      await postControlResult(command, result, controlClient);
       await chrome.storage.local.set({ devControlLastId: id });
       completed.push({ id, ok: result.ok, error: result.error || null });
     }
@@ -4098,6 +4350,8 @@ function slotSummaries(run, queue) {
         lastHeartbeatAt: slot.lastHeartbeatAt || null,
         lastProbeAt: slot.lastProbeAt || null,
         lastProgressAt: slot.lastProgressAt || null,
+        noResponseSince: slot.noResponseSince || null,
+        checkFailures: Number(slot.checkFailures || 0),
         generationSubmittedAt: slot.generationSubmittedAt || null,
         assistantObservedAt: slot.assistantObservedAt || null,
         assistantCount: Number(slot.assistantCount || 0),
@@ -4107,6 +4361,9 @@ function slotSummaries(run, queue) {
         profileId: slot.profileId || null,
         profileVersion: slot.profileVersion || null,
         downloadVerification: slot.downloadVerification || null,
+        revisionPersistFailures: Number(slot.revisionPersistFailures || 0),
+        revisionPersistRetryAt: slot.revisionPersistRetryAt || null,
+        revisionPersistBlocked: slot.revisionPersistBlocked === true,
         lastCheckAt: slot.lastCheckAt || null,
         lastCheckState: slot.lastCheckState || null,
         lastCheckError: slot.lastCheckError || null,
@@ -4769,7 +5026,7 @@ async function saveRunAndQueue(run, queue, history = undefined, generationMemory
   const value = { run, queue };
   if (history !== undefined) value.history = history;
   if (generationMemory !== undefined) value.generationMemory = generationMemory;
-  await flushRunDiagnosticsSafely(run, queue);
+  queueRunDiagnostics(run, queue);
   await chrome.storage.local.set(value);
 }
 
@@ -5279,6 +5536,8 @@ async function reconcileActiveDownloads() {
   if (!run || !['RUNNING', 'DRAINING', 'PAUSED'].includes(run.state)) return;
   for (const slot of Object.values(run.slots || {})) {
     if (!slot.downloadId) continue;
+    if (slot.revisionPersistBlocked) continue;
+    if (Number(slot.revisionPersistRetryAt || 0) > Date.now()) continue;
     let item;
     try {
       [item] = await chrome.downloads.search({ id: Number(slot.downloadId) });
@@ -6951,8 +7210,12 @@ async function pauseRun(reason = 'USER') {
     if (!run) return { runId: null, cancelTabIds: [], cancelRevisions: [], observing: false };
 
     const stateBeforePause = run.state;
+    const requestedPauseReason = String(reason || 'USER').toUpperCase();
+    const pauseReason = ['ERROR', 'RESTART', 'IMAGE_LIMIT'].includes(requestedPauseReason)
+      ? requestedPauseReason
+      : 'USER';
     recordRunEvent(run, 'run_pause_requested', {
-      requestedReason: String(reason || 'USER'),
+      requestedReason: requestedPauseReason,
       stateBefore: stateBeforePause,
       activeSlotsBefore: activeSlots(run)
     });
@@ -6962,7 +7225,7 @@ async function pauseRun(reason = 'USER') {
 
     run.state = 'PAUSED';
     run.status = 'PAUSED';
-    run.pauseReason = 'USER';
+    run.pauseReason = pauseReason;
     // User pause must not erase a platform cooldown. If ChatGPT has already
     // asked us to slow down, Continue must respect the remaining deadline
     // instead of immediately sending a fresh prompt.
@@ -6977,8 +7240,10 @@ async function pauseRun(reason = 'USER') {
       run.rateLimitPauseStartedAt = null;
       run.rateLimitReason = null;
     }
-    run.error = null;
-    run.currentAction = activeRateLimitUntil
+    if (pauseReason !== 'ERROR') run.error = null;
+    run.currentAction = pauseReason === 'ERROR'
+      ? 'Пауза по защите от повторяющихся ошибок загрузки вложений. Очередь и прогресс сохранены.'
+      : activeRateLimitUntil
       ? `Пауза пользователя. Лимит новых запросов действует до ${clockTime(activeRateLimitUntil)}; уже отправленные генерации досматриваются.`
       : 'Пауза: новые запросы не запускаются. Уже отправленные генерации досматриваются и скачиваются.';
     run.lastActivityAt = new Date().toISOString();
@@ -7051,9 +7316,9 @@ async function pauseRun(reason = 'USER') {
     run.pendingIds = entries
       .filter((entry) => plannedIds.has(entry.sourceId) && entry.status !== 'done' && !protectedIds.has(entry.sourceId))
       .map((entry) => entry.sourceId);
-    run.status = observing ? 'PAUSED_RECOVERING' : 'PAUSED';
+    run.status = observing ? 'PAUSED_RECOVERING' : (pauseReason === 'ERROR' ? 'PAUSED_ON_ERROR' : 'PAUSED');
     recordRunEvent(run, 'run_pause_applied', {
-      requestedReason: String(reason || 'USER'),
+      requestedReason: requestedPauseReason,
       pauseReason: run.pauseReason,
       stateBefore: stateBeforePause,
       stateAfter: run.state,
@@ -7065,7 +7330,9 @@ async function pauseRun(reason = 'USER') {
     });
 
     await saveRunAndQueue(run, queue, history, generationMemory);
-    await appendLog('Пауза пользователя', { observing, cancelledUnsubmittedTabs: cancelTabIds.length });
+    await appendLog(pauseReason === 'ERROR' ? 'Прогон приостановлен защитой от повторяющихся ошибок' : 'Пауза пользователя', {
+      pauseReason, observing, cancelledUnsubmittedTabs: cancelTabIds.length
+    });
     await publishRun(run, queue);
     return { runId: run.operationId, cancelTabIds, cancelRevisions, observing };
   });
@@ -7075,7 +7342,8 @@ async function pauseRun(reason = 'USER') {
   )));
 
   await Promise.all(result.cancelTabIds.map(async (tabId) => {
-    await sendTabMessage(tabId, { type: 'STOP' }).catch(() => null);
+    // These slots have no submitted generation. Removing their owned tab is
+    // sufficient cancellation and avoids waiting on an unresponsive renderer.
     await chrome.tabs.remove(tabId).catch(() => null);
   }));
   if (result.observing) startAuditMonitor();
@@ -8017,13 +8285,16 @@ async function pauseRunOnError(runId, error, context = {}) {
     ]);
     const terminalResponse = context.terminalResponse === true || terminalResponseClasses.has(failure.errorClass);
     run.errors = [...(run.errors || []), failure].slice(-20);
-    run.error = context.globalNoProgress ? failure : (run.error || failure);
-    const preservePause = run.state === 'PAUSED' && ['USER', 'RESTART', 'IMAGE_LIMIT'].includes(String(run.pauseReason || '').toUpperCase());
-    run.state = (context.globalNoProgress || preservePause) ? 'PAUSED' : 'RUNNING';
-    run.status = context.globalNoProgress
+    const attachmentFailureCircuitBreaker = shouldTripAttachmentFailureCircuitBreaker(run, failure);
+    const pauseForError = context.globalNoProgress === true || attachmentFailureCircuitBreaker;
+    run.error = pauseForError ? failure : (run.error || failure);
+    const preservePause = run.state === 'PAUSED'
+      && ['USER', 'RESTART', 'IMAGE_LIMIT', 'ERROR'].includes(String(run.pauseReason || '').toUpperCase());
+    run.state = (pauseForError || preservePause) ? 'PAUSED' : 'RUNNING';
+    run.status = pauseForError
       ? 'PAUSED_ON_ERROR'
       : (preservePause ? 'PAUSED_WITH_ERRORS' : 'RUNNING_WITH_ERRORS');
-    if (context.globalNoProgress) run.pauseReason = 'ERROR';
+    if (pauseForError) run.pauseReason = 'ERROR';
     const directSlot = run.slots?.[context.slotId];
     const failedSlot = (directSlot && (!context.entryId || directSlot.entryId === context.entryId) && directSlot.entryId
       ? directSlot
@@ -8121,6 +8392,15 @@ async function pauseRunOnError(runId, error, context = {}) {
     if (context.globalNoProgress) {
       run.unresolvedError = true;
       run.currentAction = 'Пауза: ни одна рабочая вкладка не показала прогресс за 5 минут.';
+    } else if (attachmentFailureCircuitBreaker) {
+      run.unresolvedError = true;
+      run.currentAction = 'Пауза: 3 разные модели подряд не загрузили пакет вложений. Очередь сохранена.';
+      recordRunEvent(run, 'attachment_failure_circuit_opened', {
+        windowMs: 10 * 60 * 1000,
+        threshold: 3,
+        slotId: failedSlot?.slotId ?? context.slotId ?? null,
+        entryId: failedSlot?.entryId ?? context.entryId ?? null
+      });
     } else if ((generationWasStarted && failedSlot?.tabId != null) || !(run.pendingIds || []).length) finalizeDrainingRun(run, queue);
     await saveRunAndQueue(run, queue, history, generationMemory);
     await appendLog('ОШИБКА: проблемный слот исключён, остальные продолжают очередь', { error: failure.message, ...context });
@@ -8128,6 +8408,10 @@ async function pauseRunOnError(runId, error, context = {}) {
     return {
       tabIds: [...new Set(tabIds)],
       failure,
+      pauseRunForAttachmentStorm: attachmentFailureCircuitBreaker,
+      closeUnsubmittedTabId: !duplicateFailure && !generationWasStarted && failedSlot?.tabId != null
+        ? Number(failedSlot.tabId)
+        : null,
       cancelRevision: !generationWasStarted && failedSlot?.generationId && failedSlot?.entryId
         ? { generationId: failedSlot.generationId, sourceId: failedSlot.entryId }
         : null,
@@ -8244,6 +8528,18 @@ async function pauseRunOnError(runId, error, context = {}) {
       if (response?.ok && response.value) await storeDiagnostics({ ...response.value, ...context });
     } catch (_) {}
   }));
+  if (result.pauseRunForAttachmentStorm) {
+    await pauseRun('ERROR');
+    return;
+  }
+  if (result.closeUnsubmittedTabId) {
+    const latest = await getStored().catch(() => ({ run: null }));
+    const automationWindowId = Number(latest.run?.operationId === runId ? latest.run.automationWindowId : 0);
+    const tab = await chrome.tabs.get(result.closeUnsubmittedTabId).catch(() => null);
+    if (automationWindowId && isAutomationChatTab(tab, automationWindowId)) {
+      await chrome.tabs.remove(result.closeUnsubmittedTabId).catch(() => {});
+    }
+  }
   if (replacement) {
     const next = await claimNext(runId, replacement.slotId);
     if (next) void executeSlot(runId, next.slot.slotId, next.entry.sourceId);
@@ -8507,6 +8803,20 @@ async function resumeRun(options = {}) {
           lastError: slot.lastCheckError || null,
           lastRunId: run.operationId
         });
+      }
+      if (slot.downloadId && slot.revisionPersistBlocked) {
+        slot.revisionPersistBlocked = false;
+        slot.revisionPersistFailures = 0;
+        slot.revisionPersistRetryAt = null;
+        slot.status = 'DOWNLOADING';
+        slot.phase = SLOT_PHASES.DOWNLOADING;
+        slot.failed = false;
+        if (slotEntry && slotEntry.status !== 'done') {
+          slotEntry.status = 'running';
+          slotEntry.lastError = null;
+          slotEntry.errorClass = null;
+          slotEntry.nextRetryAt = null;
+        }
       }
       if (!slot.downloadId) continue;
       if (slotEntry?.status === 'done') {
@@ -8899,6 +9209,24 @@ async function cleanupPostprocessTab(runId, tabId) {
   await closeAutomationWindowIfEmpty(runId).catch(() => {});
 }
 
+async function reservePostprocessCapacity(runId, slotId, downloadId) {
+  const key = String(Number(downloadId));
+  if (postprocessCapacityReservations.has(key)) return { allowed: false, reserved: false };
+  const { run } = await chrome.storage.local.get('run');
+  if (!run || run.operationId !== runId) return { allowed: false, reserved: false };
+  if (!run.slots?.[slotId]?.tabId) return { allowed: true, reserved: false };
+  const ownerCount = Object.keys(run.postprocessTabs || {}).length;
+  const reservedCount = [...postprocessCapacityReservations.values()]
+    .filter((item) => item.operationId === runId).length;
+  if (ownerCount + reservedCount >= MAX_POSTPROCESS_TABS) return { allowed: false, reserved: false };
+  postprocessCapacityReservations.set(key, { operationId: runId, slotId: Number(slotId) });
+  return { allowed: true, reserved: true };
+}
+
+function releasePostprocessCapacity(downloadId) {
+  postprocessCapacityReservations.delete(String(Number(downloadId)));
+}
+
 function startFactsPulseMonitor(delay = FACTS_FAST_PULSE_INTERVAL_MS) {
   if (factsPulseTimer || factsPulseInFlight) return;
   factsPulseTimer = setTimeout(() => {
@@ -8933,7 +9261,7 @@ async function pulsePostprocessTabs(runSnapshot) {
   await Promise.all(expired.map(async (owner) => {
     await updateFactsStage({ operationId: runSnapshot.operationId, entryId: owner.entryId,
       generationId: owner.generationId, factsJobId: owner.factsJobId, slotId: owner.slotId }, { tab: { id: Number(owner.tabId) } }, {
-      stage: 'ERROR', error: 'Полный JSON не появился за 15 минут после ошибки ожидания ответа'
+      stage: 'ERROR', error: 'Постпроверка не завершилась за 15 минут; PNG сохранён, спецификацию можно повторить из галереи'
     });
     await cleanupPostprocessTab(runSnapshot.operationId, owner.tabId);
   }));
@@ -9412,6 +9740,15 @@ function startFactsExtractionDetached(context) {
   });
 }
 
+function isIndexedDbPersistenceError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const name = String(error?.name || '').toLowerCase();
+  const message = String(error?.message || error || '');
+  return /^IDB_(?:OPEN|TRANSACTION)_TIMEOUT$/.test(code)
+    || name === 'quotaexceedederror'
+    || /indexeddb.*(?:failed|aborted|timed out|quota)|transaction.*timed out/i.test(message);
+}
+
 async function handleFactsExtractionResult(message, sender) {
   const sourceId = String(message?.entryId || '');
   const tabId = Number(sender?.tab?.id || message?.tabId || 0);
@@ -9601,6 +9938,7 @@ async function handleFactsExtractionResult(message, sender) {
     return { ok: false, rateLimited };
   }
 
+  let revisionFactsCommitted = false;
   try {
     await updateFactsStage(message, sender, { stage: 'PERSISTING', chatUrl: message?.chatUrl });
     const facts = normalizeExtractedFacts(revisionEntry, message?.text || '', {
@@ -9628,6 +9966,7 @@ async function handleFactsExtractionResult(message, sender) {
       if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
       return { stale: true, reason: persistedRevision?.matched ? 'generation_superseded' : 'revision_rejected_or_mismatch' };
     }
+    revisionFactsCommitted = true;
     await updateFactsMetadata(sourceId, resultGenerationId, {
       factsStatus: 'ok',
       factsUpdatedAt: facts.extractedAt,
@@ -9650,6 +9989,24 @@ async function handleFactsExtractionResult(message, sender) {
     if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
     return { ok: true, warnings: facts.warnings };
   } catch (error) {
+    if (revisionFactsCommitted) {
+      await updateFactsStage(message, sender, { stage: 'SAVED', chatUrl: message?.chatUrl, error: null }).catch(() => {});
+      void appendLog('Характеристики записаны в ревизию; не удалось обновить вторичную проекцию', {
+        sourceId, generationId: resultGenerationId, error: error?.message || String(error)
+      });
+      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+      return { ok: true, projectionWarning: true };
+    }
+    if (isIndexedDbPersistenceError(error)) {
+      const persistenceMessage = `IndexedDB не сохранила спецификацию: ${error?.message || String(error)}. PNG остаётся сохранённым; повтори извлечение из галереи.`;
+      await updateFactsStage(message, sender, { stage: 'ERROR', error: persistenceMessage, chatUrl: message?.chatUrl }).catch(() => {});
+      void appendLog('Не удалось сохранить спецификацию в IndexedDB; освобождаю вкладку постпроверки', {
+        sourceId, generationId: resultGenerationId, factsJobId: message?.factsJobId || null,
+        error: error?.message || String(error)
+      });
+      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+      return { ok: false, persistenceError: true };
+    }
     const parseWarning = error?.code === 'FACTS_JSON_INCOMPLETE'
       ? 'FACTS_INCOMPLETE_RESPONSE'
       : 'FACTS_PARSE_ERROR';
@@ -9671,16 +10028,28 @@ async function handleFactsExtractionResult(message, sender) {
       factsJobId: message?.factsJobId || null,
       chatUrl: normalizeChatConversationUrl(message?.chatUrl || entry.chatUrl)
     };
-    const persistedRevision = await upsertGenerationRevision({
-      ...revision,
-      generationId: resultGenerationId,
-      sourceId,
-      factsJobId: message?.factsJobId || revision?.factsJobId || null,
-      factsStatus: 'error',
-      facts: errorRecord,
-      factsSavedAt: errorRecord.extractedAt,
-      chatUrl: errorRecord.chatUrl || revision?.chatUrl || null
-    }, { rejectIfReviewed: true });
+    let persistedRevision;
+    try {
+      persistedRevision = await upsertGenerationRevision({
+        ...revision,
+        generationId: resultGenerationId,
+        sourceId,
+        factsJobId: message?.factsJobId || revision?.factsJobId || null,
+        factsStatus: 'error',
+        facts: errorRecord,
+        factsSavedAt: errorRecord.extractedAt,
+        chatUrl: errorRecord.chatUrl || revision?.chatUrl || null
+      }, { rejectIfReviewed: true });
+    } catch (persistError) {
+      const persistenceMessage = `Не удалось записать ошибку разбора спецификации: ${persistError?.message || String(persistError)}. PNG сохранён; повтори чтение из галереи.`;
+      await updateFactsStage(message, sender, { stage: 'ERROR', error: persistenceMessage, chatUrl: errorRecord.chatUrl }).catch(() => {});
+      void appendLog('Не удалось сохранить статус ошибки спецификации в IndexedDB', {
+        sourceId, generationId: resultGenerationId, factsJobId: message?.factsJobId || null,
+        error: persistError?.message || String(persistError)
+      });
+      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+      return { ok: false, persistenceError: true };
+    }
     if (persistedRevision?.reviewStatus === 'rejected') {
       if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
       return { stale: true, reason: 'revision_rejected' };
@@ -9840,6 +10209,7 @@ async function finalizeCompletedArtifact(runId, slotId, entryId, outputPath, ver
         baselineUserCount: Number(persistedFactsProgress?.baselineUserCount || 0),
         slotId,
         startedAt: new Date().toISOString(),
+        recoveryDeadlineAt: Date.now() + FINAL_CHECK_TIMEOUT_MS,
         lastPulseAt: null
       };
       void protectAutomationTab(completedTabId);
@@ -9873,6 +10243,9 @@ async function finalizeCompletedArtifact(runId, slotId, entryId, outputPath, ver
     slot.finalCheckDeadlineAt = null;
     slot.finalCheckAttempts = 0;
     slot.failed = false;
+    slot.revisionPersistFailures = 0;
+    slot.revisionPersistRetryAt = null;
+    slot.revisionPersistBlocked = false;
     clearResolvedRunError(run, queue);
     run.currentAction = `${sourceMode === 'custom' ? 'Сохранено' : 'Скачано'}: ${entry.fileName}`;
     run.lastActivityAt = new Date().toISOString();
@@ -9979,6 +10352,10 @@ async function finalizeCompletedArtifact(runId, slotId, entryId, outputPath, ver
 }
 
 async function finishDownload(runId, slotId, downloadId, outputPath) {
+  const downloadKey = Number(downloadId);
+  if (activeDownloadFinalizations.has(downloadKey)) return { skipped: true, reason: 'finalization_in_progress' };
+  activeDownloadFinalizations.add(downloadKey);
+  try {
   let [downloadItem] = await chrome.downloads.search({ id: Number(downloadId) }).catch(() => []);
   if (downloadItem?.state === 'complete' && !downloadItem.fileSize && !downloadItem.bytesReceived) {
     await sleep(250);
@@ -10004,10 +10381,106 @@ async function finishDownload(runId, slotId, downloadId, outputPath) {
   }
   if (!expectedEntry) return;
   const resolvedOutputPath = outputPath || downloadItem?.filename || null;
-  await finalizeCompletedArtifact(runId, slotId, expectedEntry.sourceId, resolvedOutputPath, verification, {
-    expectedDownloadId: downloadId,
-    sourceMode: 'downloads'
-  });
+  const capacity = await reservePostprocessCapacity(runId, slotId, downloadId);
+  if (!capacity.allowed) {
+    return { ok: false, deferred: true, reason: 'postprocess_capacity_full' };
+  }
+  try {
+    await finalizeCompletedArtifact(runId, slotId, expectedEntry.sourceId, resolvedOutputPath, verification, {
+      expectedDownloadId: downloadId,
+      sourceMode: 'downloads'
+    });
+  } catch (error) {
+    let retryAt = null;
+    let terminalFailure = false;
+    let terminalTabId = null;
+    await withStateLock(async () => {
+      const stored = await getStored();
+      const run = stored.run?.operationId === runId ? stored.run : null;
+      const slot = run?.slots?.[slotId];
+      if (!run || slot?.entryId !== expectedEntry.sourceId || Number(slot.downloadId) !== Number(downloadId)) return;
+      const failures = Math.max(0, Number(slot.revisionPersistFailures || 0)) + 1;
+      slot.revisionPersistFailures = failures;
+      slot.lastCheckError = error?.message || String(error);
+      run.lastActivityAt = new Date().toISOString();
+      if (failures >= MAX_ARTIFACT_REVISION_PERSIST_FAILURES) {
+        terminalFailure = true;
+        slot.revisionPersistBlocked = true;
+        slot.revisionPersistRetryAt = null;
+        slot.status = 'PAUSED';
+        slot.phase = SLOT_PHASES.NEEDS_ATTENTION;
+        slot.finalCheckPending = false;
+        slot.finalCheckDeadlineAt = null;
+        slot.failed = true;
+        slot.lastCheckState = 'REVISION_PERSIST_FAILED';
+        terminalTabId = Number(slot.tabId || 0) || null;
+        slot.tabId = null;
+        const entries = groupEntries(stored.queue, run.groupId);
+        const entry = entries.find((item) => item.sourceId === expectedEntry.sourceId);
+        if (entry && entry.status !== 'done') {
+          entry.status = 'error';
+          entry.lastError = slot.lastCheckError;
+          entry.errorClass = AUTOMATION_ERROR_CLASSES.DOWNLOAD;
+          entry.nextRetryAt = null;
+          entry.autoRetryPending = false;
+          stored.generationMemory = normalizeGenerationMemory(stored.generationMemory);
+          setGenerationMemoryStatus(stored.generationMemory, entry, GENERATION_MEMORY_STATUSES.NOT_READY, {
+            statusSource: 'automatic', generationStartedAt: slot.generationSubmittedAt || null,
+            lastError: slot.lastCheckError, lastRunId: runId
+          });
+        }
+        run.state = 'PAUSED';
+        run.status = 'PAUSED_ON_ERROR';
+        run.pauseReason = 'ERROR';
+        run.unresolvedError = true;
+        run.error = slot.lastCheckError;
+        run.finishedAt = null;
+        run.currentAction = 'PNG уже скачан. Запись ревизии не прошла 3 попытки, прогон поставлен на паузу; «Продолжить» повторит сохранение без новой генерации.';
+        recordRunEvent(run, 'artifact_revision_persist_blocked', {
+          slotId, entryId: expectedEntry.sourceId,
+          generationId: slot.generationId || null, downloadId,
+          attempts: failures, outputPath: resolvedOutputPath,
+          error: slot.lastCheckError
+        });
+      } else {
+        const backoffMs = Math.min(5 * 60_000, 30_000 * (2 ** Math.min(failures - 1, 4)));
+        retryAt = Date.now() + backoffMs;
+        slot.revisionPersistBlocked = false;
+        slot.revisionPersistRetryAt = retryAt;
+        slot.status = 'DOWNLOADING';
+        slot.phase = SLOT_PHASES.DOWNLOADING;
+        run.currentAction = `PNG скачан; повторная запись ревизии через ${Math.ceil(backoffMs / 1000)} с`;
+        recordRunEvent(run, 'artifact_revision_persist_retry_scheduled', {
+          slotId,
+          entryId: expectedEntry.sourceId,
+          generationId: slot.generationId || null,
+          attempt: failures,
+          retryAt: new Date(retryAt).toISOString(),
+          error: slot.lastCheckError
+        });
+      }
+      await saveRunAndQueue(run, stored.queue, undefined, stored.generationMemory);
+      await publishRun(run, stored.queue);
+    });
+    if (!retryAt && !terminalFailure) throw error;
+    if (terminalTabId) await chrome.tabs.remove(terminalTabId).catch(() => {});
+    await appendLog(terminalFailure
+      ? 'PNG скачан, но запись ревизии исчерпала лимит попыток; прогон остановлен на паузу'
+      : 'PNG проверен; запись ревизии не завершилась, будет повторена с паузой', {
+      operationId: runId,
+      slotId,
+      entryId: expectedEntry.sourceId,
+      downloadId,
+      retryAt: retryAt ? new Date(retryAt).toISOString() : null,
+      error: error?.message || String(error)
+    });
+    return { ok: false, persistPending: true, terminal: terminalFailure, retryAt };
+  } finally {
+    if (capacity.reserved) releasePostprocessCapacity(downloadId);
+  }
+  } finally {
+    activeDownloadFinalizations.delete(downloadKey);
+  }
 }
 
 async function persistDownloadStartedFast({ operationId, slotId, entryId, downloadId, resultFingerprint, outputFileName, chatUrl }) {

@@ -8,7 +8,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%INSTALLER%" %*
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%INSTALLER%" -InstallRoot "%~dp0." %*
 set "EXITCODE=%ERRORLEVEL%"
 del "%INSTALLER%" >nul 2>nul
 if not "%EXITCODE%"=="0" pause

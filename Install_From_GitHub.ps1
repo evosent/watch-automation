@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$InstallBase = (Join-Path $env:LOCALAPPDATA "WatchAutomation"),
+    [string]$InstallRoot = $PSScriptRoot,
     [switch]$NoLaunch,
     [switch]$NoGuide,
     [switch]$NoShortcut,
@@ -17,7 +17,7 @@ $photosReleaseTag = "watch-photos-v1"
 $packageAssetName = "watch-automation-installer-package.zip"
 $photosAssetName = "watch-photos-v1.tar"
 $photosManifestAssetName = "watch-photos-manifest.json"
-$targetRoot = Join-Path $InstallBase "WatchAutomation"
+$targetRoot = $InstallRoot
 
 function Write-Step([string]$Message) {
     Write-Host ""
@@ -162,7 +162,7 @@ function Install-Photos($Release, [string]$WorkRoot, [string]$Target) {
         throw "Размер архива фототеки в GitHub Release не совпадает с манифестом."
     }
 
-    $volumeRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($InstallBase))
+    $volumeRoot = [System.IO.Path]::GetPathRoot($InstallRoot)
     $drive = [System.IO.DriveInfo]::new($volumeRoot)
     $requiredFreeBytes = [long]$archiveAsset.size + [long]$manifest.totalBytes + 512MB
     if ($drive.AvailableFreeSpace -lt $requiredFreeBytes) {
@@ -215,11 +215,11 @@ function Copy-AppPackage([string]$PackageStage, [string]$Target) {
 }
 
 try {
-    if (-not $InstallBase) { throw "Не задана папка установки." }
-    $InstallBase = [System.IO.Path]::GetFullPath($InstallBase)
-    $volumeRoot = [System.IO.Path]::GetPathRoot($InstallBase)
-    if ($InstallBase.TrimEnd([char]'\') -eq $volumeRoot.TrimEnd([char]'\')) { throw "Выбери папку внутри диска, например %LOCALAPPDATA%\WatchAutomation." }
-    $targetRoot = Join-Path $InstallBase "WatchAutomation"
+    if (-not $InstallRoot) { throw "Не задана папка установки." }
+    $InstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+    $volumeRoot = [System.IO.Path]::GetPathRoot($InstallRoot)
+    if ($InstallRoot.TrimEnd([char]'\') -eq $volumeRoot.TrimEnd([char]'\')) { throw "Запусти установщик из папки внутри диска, например C:\WatchAutomation." }
+    $targetRoot = $InstallRoot
 
     if (Test-Path -LiteralPath (Join-Path $targetRoot "extension\manifest.json")) {
         Write-Host "Обнаружена существующая установка. Закрой окна Chrome for Testing, которые используют профиль автогенерации." -ForegroundColor Yellow
@@ -232,7 +232,8 @@ try {
     $latestRelease = Get-Release ("https://api.github.com/repos/" + $repository + "/releases/latest")
     if ($latestRelease.draft -or $latestRelease.prerelease) { throw "GitHub вернул незавершённый релиз вместо стабильной версии." }
     $packageAsset = Find-ReleaseAsset $latestRelease $packageAssetName
-    $workRoot = Join-Path $InstallBase (".watch-automation-install-stage-" + [guid]::NewGuid().ToString("N"))
+    $stageParent = Split-Path -Parent $InstallRoot
+    $workRoot = Join-Path $stageParent (".watch-automation-install-stage-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
 
     try {

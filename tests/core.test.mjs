@@ -1235,7 +1235,7 @@ test('submitted generation refresh is bounded to one reload after four minutes w
   assert.equal(shouldRefreshUnresponsiveGeneration({ ...base, generationSubmittedAt: null }, now), false);
 });
 
-test('stalled batch recovery requires the oldest submitted slot to be silent for 15 minutes and an abnormal sibling', () => {
+test('stalled batch recovery requires the oldest active tab to be silent for 15 minutes and an abnormal sibling', () => {
   const now = 2_000_000_000_000;
   const base = {
     state: 'RUNNING',
@@ -1277,6 +1277,19 @@ test('stalled batch recovery requires the oldest submitted slot to be silent for
     ...base,
     slots: { ...base.slots, 1: { ...base.slots[1], downloadId: 42 } }
   }, now), null);
+  const unsent = {
+    ...base,
+    slots: {
+      0: { ...base.slots[0], generationId: null, generationSubmittedAt: null, status: 'PREPARING' },
+      1: { ...base.slots[1], generationId: null, generationSubmittedAt: null, status: 'PAUSED', phase: 'TAB_LOST', finalCheckPending: false }
+    }
+  };
+  assert.deepEqual(findStalledBatchRecoveryCandidate(unsent, now), {
+    slotId: 0,
+    entryId: 'sku-oldest',
+    noResponseSince: new Date(now - STALLED_BATCH_RECOVERY_AFTER_MS).toISOString(),
+    abnormalSlotIds: [1]
+  });
 });
 
 test('stalled recovery preserves the silence timer across its one tab refresh and resets never wait on startup probing', async () => {
@@ -1758,6 +1771,61 @@ test('background facts recovery reloads frozen tabs and resumes DOM inspection w
   assert.match(adapter, /isCompleteFactsResponse/);
 });
 
+test('postprocess backpressure caps live OCR tabs and expires each owner within fifteen minutes', async () => {
+  const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
+  const finish = worker.slice(worker.indexOf('async function finishDownload'), worker.indexOf('async function persistDownloadStartedFast'));
+  const pulse = worker.slice(worker.indexOf('async function pulsePostprocessTabs'), worker.indexOf('function startFactsExtractionDetached'));
+  assert.match(worker, /MAX_POSTPROCESS_TABS = 3/);
+  assert.match(finish, /reservePostprocessCapacity\(runId, slotId, downloadId\)/);
+  assert.match(finish, /postprocess_capacity_full/);
+  assert.match(worker, /recoveryDeadlineAt: Date\.now\(\) \+ FINAL_CHECK_TIMEOUT_MS/);
+  assert.match(pulse, /Постпроверка не завершилась за 15 минут/);
+  assert.match(finish, /activeDownloadFinalizations/);
+});
+
+test('diagnostic persistence stays off the generation path and revision failures remain resumable', async () => {
+  const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
+  const revisionUtils = await readFile(path.join(extensionDir, 'generation-revision-utils.js'), 'utf8');
+  const idb = await readFile(path.join(extensionDir, 'idb.js'), 'utf8');
+  const save = worker.slice(worker.indexOf('async function saveRunAndQueue'), worker.indexOf('function normalizedDownloadPath'));
+  const diagnosticFlush = worker.slice(worker.indexOf('async function flushQueuedRunDiagnostics'), worker.indexOf('async function setSlotPhase'));
+  const finish = worker.slice(worker.indexOf('async function finishDownload'), worker.indexOf('async function persistDownloadStartedFast'));
+
+  assert.match(save, /queueRunDiagnostics\(run, queue\)/);
+  assert.doesNotMatch(save, /await\s+(?:saveRunDiagnostics|flushQueuedRunDiagnostics)/);
+  assert.match(worker, /async function flushRunDiagnosticsSafely\(run, queue\)/);
+  assert.match(diagnosticFlush, /\.find\(\(\[operationId\]\)/);
+  assert.match(diagnosticFlush, /RUN_DIAGNOSTICS_RETRY_BASE_MS/);
+  assert.doesNotMatch(diagnosticFlush, /withStateLock/,
+    'diagnostic archival must not queue behind automation state transactions');
+  assert.match(idb, /IDB_OPEN_TIMEOUT_MS = 15000/);
+  assert.match(idb, /IDB_TRANSACTION_TIMEOUT_MS = 15000/);
+  assert.match(worker, /MAX_ARTIFACT_REVISION_PERSIST_FAILURES = 3/);
+  assert.match(finish, /slot\.revisionPersistBlocked = true/);
+  assert.match(finish, /stored\.generationMemory\);/);
+  assert.match(revisionUtils, /revisionPersistBlocked: false/);
+});
+
+test('unsubmitted attachment failures close their worker tab and stop a repeated upload-failure storm', async () => {
+  const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
+  const retryUtils = await readFile(path.join(extensionDir, 'reliability-utils.js'), 'utf8');
+  const errorStart = worker.indexOf('async function pauseRunOnError(');
+  const errorEnd = worker.indexOf('async function recoverVisibleResults(', errorStart);
+  const errorHandler = worker.slice(errorStart, errorEnd);
+  const pauseStart = worker.indexOf('async function pauseRun(');
+  const pauseEnd = worker.indexOf('async function stopRun(', pauseStart);
+  const pauseHandler = worker.slice(pauseStart, pauseEnd);
+
+  assert.match(retryUtils, /ATTACHMENT_FAILURE_CIRCUIT_THRESHOLD = 3/);
+  assert.match(retryUtils, /ATTACHMENT_FAILURE_CIRCUIT_WINDOW_MS = 10 \* 60 \* 1000/);
+  assert.match(errorHandler, /shouldTripAttachmentFailureCircuitBreaker\(run, failure\)/);
+  assert.match(errorHandler, /closeUnsubmittedTabId/);
+  assert.match(errorHandler, /if \(result\.pauseRunForAttachmentStorm\)\s*\{\s*await pauseRun\('ERROR'\)/);
+  assert.match(errorHandler, /chrome\.tabs\.remove\(result\.closeUnsubmittedTabId\)/);
+  assert.match(pauseHandler, /const pauseReason = \['ERROR', 'RESTART', 'IMAGE_LIMIT'\]/);
+  assert.match(pauseHandler, /run\.status = observing \? 'PAUSED_RECOVERING' : \(pauseReason === 'ERROR' \? 'PAUSED_ON_ERROR' : 'PAUSED'\)/);
+});
+
 test('five background postprocess owners are inspected independently in one audit pass', async () => {
   const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
   const start = worker.indexOf('async function pulsePostprocessTabs');
@@ -1998,7 +2066,7 @@ test('user pause preserves submitted work and does not convert expected cancella
   assert.match(pauseBlock, /if \(submitted\) \{/);
   assert.doesNotMatch(pauseBlock, /delete history\.items\[entry\.sourceId\]/);
   assert.doesNotMatch(pauseBlock, /history\.ignored\[entry\.sourceId\] = true/);
-  assert.match(pauseBlock, /run\.status = observing \? 'PAUSED_RECOVERING' : 'PAUSED'/);
+  assert.match(pauseBlock, /run\.status = observing \? 'PAUSED_RECOVERING' : \(pauseReason === 'ERROR' \? 'PAUSED_ON_ERROR' : 'PAUSED'\)/);
   assert.match(worker, /async function stopRun\(\) \{[\s\S]*?preserveLogs: true/);
   assert.match(worker, /message\?\.type === 'PAUSE_RUN'/);
   assert.match(worker, /message\?\.type === 'STOP_RUN'/);
@@ -2052,7 +2120,10 @@ test('postprocess timeout recovery, retry wakeups, and facts UI stay bound to pe
   assert.match(worker, /const waitForLateJson = !rateLimited && errorRecord\.promptAccepted/);
   assert.match(worker, /owner\.recoveryDeadlineAt = Date\.now\(\) \+ FINAL_CHECK_TIMEOUT_MS/);
   assert.match(worker, /responseDiagnostics: message\.error\.responseDiagnostics/);
-  assert.match(watcher, /item\.id > after && item\.status === 'queued'/);
+  assert.match(watcher, /item\.id <= after \|\| item\.status !== 'queued'/);
+  assert.match(watcher, /controlCommandMatchesClient\(item, client\)/);
+  assert.match(watcher, /resolveControlTarget/);
+  assert.match(watcher, /'\/control\/result'/);
   assert.match(watcher, /if \(command\.completedAt \|\| \['completed', 'failed'\]\.includes\(command\.status\)\)/);
 });
 

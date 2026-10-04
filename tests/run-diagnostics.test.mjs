@@ -78,3 +78,35 @@ test('run diagnostic headers and event streams are archived independently by ope
   assert.deepEqual(archive.events.map((event) => event.sequence), [1, 2]);
   assert.ok((await listRunDiagnostics({ limit: 500 })).some((item) => item.operationId === operationId));
 });
+
+test('diagnostic completion counts match planned IDs across filtered queue group keys', () => {
+  const run = {
+    operationId: 'run-filtered-group',
+    groupId: 'filter:in_sale:good:casio',
+    plannedIds: ['sku-a', 'sku-b', 'sku-c'],
+    diagnosticsLastKnownCompletedCount: 0,
+    eventJournal: [
+      { type: 'output_verified', entryId: 'sku-c' },
+      { type: 'output_verified', entryId: 'outside-plan' }
+    ]
+  };
+  const queue = { groups: {
+    in_sale_good: [
+      { sourceId: 'sku-a', status: 'done' },
+      { sourceId: 'sku-b', status: 'done' },
+      { sourceId: 'sku-c', status: 'running' },
+      { sourceId: 'outside-plan', status: 'done' }
+    ]
+  } };
+
+  const header = runDiagnosticHeader(run, queue);
+  assert.equal(header.completedCount, 3);
+  assert.equal(header.pendingCount, 0);
+
+  const eventOnlyHeader = runDiagnosticHeader({
+    ...run,
+    eventJournal: [{ type: 'output_verified', entryId: 'sku-b' }]
+  }, null);
+  assert.equal(eventOnlyHeader.completedCount, 1);
+  assert.equal(eventOnlyHeader.pendingCount, 2);
+});

@@ -48,13 +48,38 @@ export function diagnosticCategoryForType(type) {
   return 'step';
 }
 
+function completedPlannedIdsFromQueue(plannedIds, queue) {
+  const planned = new Set(plannedIds.map((id) => String(id)));
+  const doneIds = new Set();
+  for (const entries of Object.values(queue?.groups || {})) {
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      const sourceId = String(entry?.sourceId || '');
+      if (sourceId && planned.has(sourceId) && String(entry?.status || '').toLowerCase() === 'done') {
+        doneIds.add(sourceId);
+      }
+    }
+  }
+  return doneIds;
+}
+
 export function runDiagnosticHeader(run, queue = null, extensionVersion = null) {
   if (!run?.operationId) return null;
   const plannedIds = Array.isArray(run.plannedIds) ? run.plannedIds : [];
-  const planned = new Set(plannedIds);
-  const completedCount = queue?.groups
-    ? (queue.groups[run.groupId] || []).filter((entry) => planned.has(entry.sourceId) && entry.status === 'done').length
-    : Number(run.diagnosticsLastKnownCompletedCount || 0);
+  const planned = new Set(plannedIds.map((id) => String(id)));
+  const verifiedEventIds = new Set((Array.isArray(run.eventJournal) ? run.eventJournal : [])
+    .filter((event) => event?.type === 'output_verified' && event?.entryId != null)
+    .map((event) => String(event.entryId))
+    .filter((entryId) => planned.has(entryId)));
+  const queueCompletedIds = queue?.groups
+    ? completedPlannedIdsFromQueue(plannedIds, queue)
+    : new Set();
+  const verifiedCompletedIds = new Set([...queueCompletedIds, ...verifiedEventIds]);
+  const observedCompleted = Math.max(
+    Number(run.diagnosticsLastKnownCompletedCount || 0),
+    verifiedCompletedIds.size
+  );
+  const completedCount = Math.min(planned.size, observedCompleted);
   const activeSlots = Object.values(run.slots || {}).filter((slot) => slot?.entryId
     && !['IDLE', 'DONE', 'STOPPED', 'PAUSED'].includes(String(slot.status || '').toUpperCase())).length;
   const lastEvent = Array.isArray(run.eventJournal) ? run.eventJournal.at(-1) : null;
@@ -83,9 +108,7 @@ export function runDiagnosticHeader(run, queue = null, extensionVersion = null) 
     },
     plannedCount: plannedIds.length,
     completedCount,
-    pendingCount: queue?.groups
-      ? Math.max(0, plannedIds.length - completedCount)
-      : Number(run.diagnosticsLastKnownPendingCount ?? Math.max(0, plannedIds.length - completedCount)),
+    pendingCount: Math.max(0, plannedIds.length - completedCount),
     activeSlotCount: activeSlots,
     eventCount: Number(run.eventSequence || run.eventCount || 0),
     lastEventAt: lastEvent?.at || null,
