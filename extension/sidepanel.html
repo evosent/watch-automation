@@ -178,16 +178,6 @@
             <input id="memorySearch" type="search" placeholder="Поиск модели" autocomplete="off">
           </div>
           <div class="filter-grid">
-            <select id="memoryGroupFilter" aria-label="Фильтр списка">
-              <option value="all">Все списки</option>
-              <option value="in_sale_good">В продаже · хорошее</option>
-              <option value="in_sale_bad">В продаже · плохое</option>
-              <option value="not_in_sale_good">Не в продаже · хорошее</option>
-              <option value="not_in_sale_bad">Не в продаже · плохое</option>
-            </select>
-            <select id="memoryBrandFilter" aria-label="Фильтр бренда">
-              <option value="all">Все бренды</option>
-            </select>
             <select id="memoryStatusFilter" aria-label="Фильтр статуса">
               <option value="all">Все статусы</option>
               <option value="not_ready">Не готово</option>
@@ -197,6 +187,14 @@
               <option value="ready">Готово</option>
             </select>
           </div>
+
+          <section class="memory-browser" aria-label="Очереди и части прогонов">
+            <div class="memory-browser-heading">
+              <strong>Очереди и части</strong>
+              <span id="memoryTreeSummary" class="summary-meta">Части по 100 моделей</span>
+            </div>
+            <div id="memoryTree" class="memory-tree" aria-live="polite"></div>
+          </section>
 
           <div class="memory-table-head" aria-hidden="true"><span>Модель</span><span>Статус и результат</span></div>
           <div id="memoryList" class="memory-list" aria-live="polite"></div>

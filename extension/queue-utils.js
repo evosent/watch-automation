@@ -882,6 +882,128 @@ export function queueEntriesForPart(plan, partNumber) {
   return plan?.parts?.find((part) => part.partNumber === number)?.entries || [];
 }
 
+export function buildQueueProgressTree(groups = {}, repairQueue = [], partSize = RUN_PART_SIZE) {
+  const repairs = new Set((Array.isArray(repairQueue) ? repairQueue : [])
+    .map((item) => typeof item === 'string' ? item : item?.sourceId)
+    .filter(Boolean)
+    .map(String));
+  const uniqueEntries = (entries = []) => {
+    const bySource = new Map();
+    for (const entry of entries) {
+      const sourceId = String(entry?.skuKey || entry?.sourceId || '').trim();
+      if (sourceId && !bySource.has(sourceId)) bySource.set(sourceId, { ...entry, sourceId, skuKey: sourceId });
+    }
+    return [...bySource.values()];
+  };
+  const snapshot = (entries = [], mode = 'regular') => {
+    const items = uniqueEntries(entries);
+    const done = mode === 'regular'
+      ? items.filter((entry) => entry.status === 'done' && !repairs.has(String(entry.sourceId))).length
+      : 0;
+    const running = mode === 'regular'
+      ? items.filter((entry) => entry.status === 'running' && !repairs.has(String(entry.sourceId))).length
+      : 0;
+    const total = items.length;
+    return {
+      total,
+      done,
+      running,
+      pending: Math.max(0, total - done - running),
+      percent: total ? Math.floor((done / total) * 100) : 0,
+      queued: mode === REGENERATION_QUEUE_ID ? total : 0
+    };
+  };
+  const brandLabel = (brandId) => WATCH_BRAND_FILTERS.find((item) => item.id === brandId)?.label || brandId;
+  const roots = [];
+
+  for (const mode of ['regular', REGENERATION_QUEUE_ID]) {
+    const sales = [];
+    for (const saleStatus of ['in_sale', 'not_in_sale']) {
+      const categories = [];
+      for (const quality of ['good', 'bad']) {
+        const groupId = `${saleStatus}_${quality}`;
+        const baseEntries = filteredWatchEntries(groups, { saleStatus, quality, brand: 'all' })
+          .filter((entry) => mode === 'regular' || repairs.has(String(entry.sourceId)));
+        const entriesByBrand = new Map();
+        for (const entry of baseEntries) {
+          const brandId = brandIdFromModelName(entry.modelName || entry.fileName);
+          const items = entriesByBrand.get(brandId) || [];
+          items.push(entry);
+          entriesByBrand.set(brandId, items);
+        }
+        const brandIds = [...entriesByBrand.keys()]
+          .sort((left, right) => brandLabel(left).localeCompare(brandLabel(right), 'ru'));
+        const brands = [];
+        for (const brandId of brandIds) {
+          const entries = entriesByBrand.get(brandId) || [];
+          if (!entries.length) continue;
+          const plan = queuePartPlan(entries, partSize, `${mode}|${saleStatus}|${quality}|${brandId}`);
+          const parts = plan.parts.map((part) => ({
+            id: `part:${mode}:${groupId}:${brandId}:${plan.signature}:${part.partNumber}`,
+            type: 'part',
+            mode,
+            groupId,
+            brandId,
+            partNumber: part.partNumber,
+            signature: plan.signature,
+            sourceIds: part.sourceIds,
+            entries: part.entries,
+            ...snapshot(part.entries, mode)
+          }));
+          brands.push({
+            id: `brand:${mode}:${groupId}:${brandId}`,
+            type: 'brand',
+            mode,
+            groupId,
+            brandId,
+            label: brandLabel(brandId),
+            entries,
+            children: parts,
+            ...snapshot(entries, mode)
+          });
+        }
+        if (brands.length) {
+          const entries = uniqueEntries(brands.flatMap((brand) => brand.entries));
+          categories.push({
+            id: `category:${mode}:${groupId}`,
+            type: 'quality',
+            mode,
+            groupId,
+            label: quality === 'good' ? 'Хорошее качество' : 'Плохое качество',
+            entries,
+            children: brands,
+            ...snapshot(entries, mode)
+          });
+        }
+      }
+      if (categories.length) {
+        const entries = uniqueEntries(categories.flatMap((category) => category.entries));
+        sales.push({
+          id: `sale:${mode}:${saleStatus}`,
+          type: 'sale',
+          mode,
+          saleStatus,
+          label: saleStatus === 'in_sale' ? 'В продаже' : 'Не в продаже',
+          entries,
+          children: categories,
+          ...snapshot(entries, mode)
+        });
+      }
+    }
+    const entries = uniqueEntries(sales.flatMap((sale) => sale.entries));
+    roots.push({
+      id: `queue:${mode}`,
+      type: 'queue',
+      mode,
+      label: mode === 'regular' ? 'Обычная очередь' : 'Перегенерация брака',
+      entries,
+      children: sales,
+      ...snapshot(entries, mode)
+    });
+  }
+  return roots;
+}
+
 export function historyRecordFromEntry(entry, overrides = {}) {
   return {
     sourceId: entry?.sourceId || null,

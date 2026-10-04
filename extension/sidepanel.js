@@ -5,6 +5,7 @@ import {
   applyGenerationHistory,
   applyGenerationMemory,
   brandIdFromModelName,
+  buildQueueProgressTree,
   classifyWatchPath,
   chooseSourceVariant,
   filterFromQueueGroup,
@@ -63,6 +64,13 @@ let promptText = '';
 let generationMemory = { version: 1, items: {} };
 let lastPreflight = null;
 let lastMemoryRenderKey = '';
+let selectedMemoryPartId = '';
+const memoryTreeOpenIds = new Set(['queue:regular']);
+let cachedMemoryTreeGroups = null;
+let cachedMemoryTreeRepairQueue = null;
+let cachedMemoryTreeGenerationMemory = null;
+let cachedMemoryProgressTree = null;
+let cachedMemoryProgressTreeSignature = '';
 let diagnosticsObservedOperationId = '';
 let diagnosticsObservedRunState = 'IDLE';
 let desiredRunPart = '';
@@ -102,6 +110,10 @@ function setWorkspaceView(view, { persist = true } = {}) {
   });
   if (persist) {
     try { localStorage.setItem(UI_VIEW_STORAGE_KEY, next); } catch (_) {}
+  }
+  if (next === 'models') {
+    lastMemoryRenderKey = '';
+    renderGenerationMemory();
   }
 }
 
@@ -229,12 +241,8 @@ function memoryFilterState() {
   const status = String($('memoryStatusFilter')?.value || 'all');
   return {
     search: String($('memorySearch')?.value || '').trim(),
-    group: QUEUE_GROUP_IDS.includes(String($('memoryGroupFilter')?.value || ''))
-      ? String($('memoryGroupFilter').value)
-      : 'all',
-    brand: WATCH_BRAND_FILTERS.some((item) => item.id === String($('memoryBrandFilter')?.value || ''))
-      ? String($('memoryBrandFilter').value)
-      : 'all',
+    group: 'all',
+    brand: 'all',
     status: ['all', ...Object.values(GENERATION_MEMORY_STATUSES)].includes(status) ? status : 'all'
   };
 }
@@ -246,14 +254,6 @@ function setFilterInputs(filterValue = {}, memoryFilters = {}) {
   const brand = filter.brand !== 'all' ? filter.brand : '';
   if ($('runGroupFilter')) $('runGroupFilter').value = group;
   if ($('runBrandFilter')) $('runBrandFilter').value = brand;
-  const catalogGroup = QUEUE_GROUP_IDS.includes(String(memoryFilters.group || ''))
-    ? String(memoryFilters.group)
-    : 'all';
-  const catalogBrand = WATCH_BRAND_FILTERS.some((item) => item.id === String(memoryFilters.brand || ''))
-    ? String(memoryFilters.brand)
-    : 'all';
-  if ($('memoryGroupFilter')) $('memoryGroupFilter').value = catalogGroup;
-  if ($('memoryBrandFilter')) $('memoryBrandFilter').value = catalogBrand;
   if ($('memorySearch') && memoryFilters.search != null) {
     $('memorySearch').value = String(memoryFilters.search || '');
   }
@@ -391,13 +391,6 @@ function populateBrandFilter() {
     runBrand.replaceChildren(new Option('Выберите один бренд', ''));
     for (const item of WATCH_BRAND_FILTERS.filter((item) => item.id !== 'all')) {
       runBrand.add(new Option(item.label, item.id));
-    }
-  }
-  const memoryBrand = $('memoryBrandFilter');
-  if (memoryBrand) {
-    memoryBrand.replaceChildren();
-    for (const item of WATCH_BRAND_FILTERS) {
-      memoryBrand.add(new Option(item.label, item.id));
     }
   }
 }
@@ -1660,49 +1653,196 @@ function updateMemorySummary(records, visible) {
   const visibleCount = visible.filter((record) => record.sourcePresent !== false).length;
   if ($('memoryStats')) $('memoryStats').textContent = `Всего ${records.length} · Готово ${counts.ready} · Фото сохранено ${counts.imageSaved} · OCR ${counts.factsPending} · В работе ${counts.running} · Не готово ${counts.not_ready} · видно ${visibleCount}`;
   if ($('memoryVisibleCount')) $('memoryVisibleCount').textContent = `Показано ${visible.length}/${records.length}`;
-  const groupFilter = $('memoryGroupFilter');
-  if (groupFilter) {
-    const allOption = groupFilter.querySelector('option[value="all"]');
-    if (allOption) allOption.textContent = `Все списки · ${records.length}`;
-    for (const groupId of QUEUE_GROUP_IDS) {
-      const option = groupFilter.querySelector(`option[value="${groupId}"]`);
-      if (!option) continue;
-      const total = records.filter((record) => record.groupId === groupId).length;
-      option.textContent = `${QUEUE_GROUPS[groupId].label} · ${total}`;
-    }
+}
+
+function findMemoryPart(nodes, partId) {
+  for (const node of nodes || []) {
+    if (node.type === 'part' && node.id === partId) return node;
+    const nested = findMemoryPart(node.children, partId);
+    if (nested) return nested;
   }
-  const brandFilter = $('memoryBrandFilter');
-  if (brandFilter) {
-    const allOption = brandFilter.querySelector('option[value="all"]');
-    if (allOption) allOption.textContent = `Все бренды · ${records.length}`;
-    for (const brand of WATCH_BRAND_FILTERS.filter((item) => item.id !== 'all')) {
-      const option = brandFilter.querySelector(`option[value="${brand.id}"]`);
-      if (!option) continue;
-      const total = records.filter((record) => brandIdFromModelName(record.modelName || record.fileName) === brand.id).length;
-      option.textContent = `${brand.label} · ${total}`;
+  return null;
+}
+
+function openMemoryPartPath(nodes, partId, ancestors = []) {
+  for (const node of nodes || []) {
+    const path = [...ancestors, node.id];
+    if (node.type === 'part' && node.id === partId) {
+      path.forEach((id) => memoryTreeOpenIds.add(id));
+      return true;
     }
+    if (openMemoryPartPath(node.children, partId, path)) return true;
+  }
+  return false;
+}
+
+function memoryTreeSignature(nodes) {
+  return (nodes || []).map((node) => [
+    node.id,
+    node.total,
+    node.done,
+    node.running,
+    node.percent,
+    node.queued,
+    (node.entries || []).map((entry) => entry.sourceId).join(','),
+    memoryTreeSignature(node.children)
+  ].join(':')).join('|');
+}
+
+function currentMemoryProgressTree() {
+  if (cachedMemoryTreeGroups !== queue.groups
+    || cachedMemoryTreeRepairQueue !== queue.repairQueue
+    || cachedMemoryTreeGenerationMemory !== generationMemory
+    || !cachedMemoryProgressTree) {
+    cachedMemoryTreeGroups = queue.groups;
+    cachedMemoryTreeRepairQueue = queue.repairQueue;
+    cachedMemoryTreeGenerationMemory = generationMemory;
+    cachedMemoryProgressTree = buildQueueProgressTree(queue.groups, queue.repairQueue, RUN_PART_SIZE);
+    cachedMemoryProgressTreeSignature = memoryTreeSignature(cachedMemoryProgressTree);
+  }
+  return { tree: cachedMemoryProgressTree, signature: cachedMemoryProgressTreeSignature };
+}
+
+function memoryProgressLabel(node) {
+  if (node.mode === REGENERATION_QUEUE_ID) return `${node.queued} в очереди`;
+  return `${node.done}/${node.total} готово · ${node.percent}%${node.running ? ` · ${node.running} в работе` : ''}`;
+}
+
+function memoryTreeFolder(node, depth = 0) {
+  if (node.type === 'part') return memoryTreePart(node, depth);
+  const details = document.createElement('details');
+  details.className = 'memory-tree-folder';
+  details.dataset.treeId = node.id;
+  details.style.setProperty('--tree-depth', String(depth));
+  details.open = memoryTreeOpenIds.has(node.id);
+
+  const summary = document.createElement('summary');
+  summary.className = 'memory-tree-summary';
+  const icon = document.createElement('span');
+  icon.className = 'memory-tree-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = '▰';
+  const copy = document.createElement('span');
+  copy.className = 'memory-tree-copy';
+  const name = document.createElement('span');
+  name.className = 'memory-tree-name';
+  name.textContent = node.label;
+  const metric = document.createElement('span');
+  metric.className = 'memory-tree-metric';
+  metric.textContent = memoryProgressLabel(node);
+  copy.append(name, metric);
+  summary.append(icon, copy);
+  if (node.mode !== REGENERATION_QUEUE_ID) {
+    const track = document.createElement('span');
+    track.className = 'memory-tree-track';
+    track.setAttribute('aria-hidden', 'true');
+    const bar = document.createElement('span');
+    bar.className = 'memory-tree-bar';
+    bar.style.width = `${node.percent}%`;
+    track.append(bar);
+    summary.append(track);
+  }
+  details.append(summary);
+
+  if (node.children?.length) {
+    const children = document.createElement('div');
+    children.className = 'memory-tree-children';
+    node.children.forEach((child) => children.append(memoryTreeFolder(child, depth + 1)));
+    details.append(children);
+  }
+  details.addEventListener('toggle', () => {
+    if (details.open) memoryTreeOpenIds.add(node.id);
+    else memoryTreeOpenIds.delete(node.id);
+  });
+  return details;
+}
+
+function memoryTreePart(node, depth = 0) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'memory-tree-part';
+  button.dataset.partId = node.id;
+  button.style.setProperty('--tree-depth', String(depth));
+  button.setAttribute('aria-pressed', String(node.id === selectedMemoryPartId));
+  if (node.id === selectedMemoryPartId) button.classList.add('is-selected');
+  const icon = document.createElement('span');
+  icon.className = 'memory-tree-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = '▧';
+  const copy = document.createElement('span');
+  copy.className = 'memory-tree-copy';
+  const name = document.createElement('span');
+  name.className = 'memory-tree-name';
+  name.textContent = `Часть ${node.partNumber} · ${node.total} моделей`;
+  const metric = document.createElement('span');
+  metric.className = 'memory-tree-metric';
+  metric.textContent = memoryProgressLabel(node);
+  copy.append(name, metric);
+  button.append(icon, copy);
+  if (node.mode !== REGENERATION_QUEUE_ID) {
+    const track = document.createElement('span');
+    track.className = 'memory-tree-track';
+    track.setAttribute('aria-hidden', 'true');
+    const bar = document.createElement('span');
+    bar.className = 'memory-tree-bar';
+    bar.style.width = `${node.percent}%`;
+    track.append(bar);
+    button.append(track);
+  }
+  return button;
+}
+
+function renderMemoryTree(nodes, selectedPart = null) {
+  const tree = $('memoryTree');
+  if (!tree) return;
+  tree.replaceChildren();
+  const fragment = document.createDocumentFragment();
+  for (const queueNode of nodes) {
+    const queueFolder = document.createElement('section');
+    queueFolder.className = `memory-tree-queue${queueNode.mode === REGENERATION_QUEUE_ID ? ' is-repair-queue' : ''}`;
+    queueFolder.append(memoryTreeFolder(queueNode));
+    fragment.append(queueFolder);
+  }
+  tree.append(fragment);
+  if ($('memoryTreeSummary')) {
+    $('memoryTreeSummary').textContent = selectedPart
+      ? `Выбрано: часть ${selectedPart.partNumber} · ${selectedPart.total} моделей`
+      : `Части по ${RUN_PART_SIZE} моделей · выберите папку`;
   }
 }
 
 function renderGenerationMemory() {
   const list = $('memoryList');
-  if (!list) return;
+  if (!list || document.querySelector('[data-workspace-view="models"]')?.hidden) return;
   const records = memoryRecords();
   const memoryFilters = memoryFilterState();
   const repairs = repairQueueSourceIds();
-  const renderKey = `${JSON.stringify(memoryFilters)}|${records.map((record) => `${record.sourceId}:${record.status}:${record.sourcePresent}:${repairs.has(String(record.sourceId))}:${record.updatedAt || ''}:${record.lastError || ''}:${record.errorClass || ''}:${record.outputWidth || ''}x${record.outputHeight || ''}`).join(';')}`;
+  const { tree: progressTree, signature: progressTreeSignature } = currentMemoryProgressTree();
+  let selectedPart = findMemoryPart(progressTree, selectedMemoryPartId);
+  if (!selectedPart && selectedMemoryPartId) selectedMemoryPartId = '';
+  selectedPart = findMemoryPart(progressTree, selectedMemoryPartId);
+  if (selectedPart) openMemoryPartPath(progressTree, selectedPart.id);
+  const renderKey = `${JSON.stringify(memoryFilters)}|${selectedMemoryPartId}|${progressTreeSignature}|${records.map((record) => `${record.sourceId}:${record.status}:${record.sourcePresent}:${repairs.has(String(record.sourceId))}:${record.updatedAt || ''}:${record.lastError || ''}:${record.errorClass || ''}:${record.outputWidth || ''}x${record.outputHeight || ''}`).join(';')}`;
   if (renderKey === lastMemoryRenderKey) return;
   lastMemoryRenderKey = renderKey;
-  const visible = visibleMemoryRecords(records, memoryFilters);
+  const partSourceIds = selectedPart ? new Set(selectedPart.sourceIds.map(String)) : null;
+  const listFilters = selectedPart ? { ...memoryFilters, group: 'all', brand: 'all' } : memoryFilters;
+  const visible = selectedPart
+    ? visibleMemoryRecords(records, listFilters).filter((record) => partSourceIds.has(String(record.sourceId)))
+    : [];
   updateMemorySummary(records, visible);
+  renderMemoryTree(progressTree, selectedPart);
+  if (!selectedPart && $('memoryVisibleCount')) $('memoryVisibleCount').textContent = 'Выберите часть';
   const scrollTop = list.scrollTop;
   list.replaceChildren();
   if (!visible.length) {
     const empty = document.createElement('div');
     empty.className = 'memory-empty';
-    empty.textContent = records.length
-      ? 'Текущие фильтры не нашли моделей.'
-      : 'Выбери папку input-watches-images — все модели появятся здесь автоматически.';
+    empty.textContent = !records.length
+      ? 'Выбери папку input-watches-images — все модели появятся здесь автоматически.'
+      : !selectedPart
+        ? 'Раскрой папки очереди и выбери часть — здесь появятся входящие в неё модели.'
+        : 'Текущие фильтры не нашли моделей в выбранной части.';
     list.append(empty);
     return;
   }
@@ -2464,11 +2604,22 @@ $('memorySearch')?.addEventListener('input', () => {
   renderAll();
   saveDraft().catch(showError);
 });
-['memoryGroupFilter', 'memoryBrandFilter', 'memoryStatusFilter'].forEach((id) => {
-  $(id)?.addEventListener('change', () => {
-    renderAll();
-    saveDraft().catch(showError);
-  });
+$('memoryTree')?.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-part-id]');
+  if (!button) return;
+  const part = findMemoryPart(
+    currentMemoryProgressTree().tree,
+    button.dataset.partId
+  );
+  if (!part) return;
+  selectedMemoryPartId = part.id;
+  lastMemoryRenderKey = '';
+  renderGenerationMemory();
+  saveDraft().catch(showError);
+});
+$('memoryStatusFilter')?.addEventListener('change', () => {
+  renderAll();
+  saveDraft().catch(showError);
 });
 ['runQueueMode', 'runGroupFilter', 'runBrandFilter'].forEach((id) => {
   $(id)?.addEventListener('change', () => {

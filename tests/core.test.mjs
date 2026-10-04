@@ -46,6 +46,7 @@ import {
   generationOutputFileName,
   ensureGenerationOutputFileName,
   brandIdFromModelName,
+  buildQueueProgressTree,
   filteredWatchEntries,
   queuePartPlan,
   queueEntriesForPart,
@@ -269,6 +270,38 @@ test('queue part plan uses stable, disjoint chunks of 100 models', () => {
   assert.deepEqual(queueEntriesForPart(first, 2).map((entry) => entry.sourceId), first.parts[1].sourceIds);
   assert.deepEqual(queueEntriesForPart(first, 0), []);
   assert.deepEqual(queueEntriesForPart(first, 4), []);
+});
+
+test('model queue tree mirrors launch parts and reports progress at every regular queue level', () => {
+  const groups = { in_sale_good: [], in_sale_bad: [], not_in_sale_good: [], not_in_sale_bad: [] };
+  groups.in_sale_good = Array.from({ length: 101 }, (_, index) => ({
+    sourceId: `casio:${String(index).padStart(4, '0')}`,
+    skuKey: `casio:${String(index).padStart(4, '0')}`,
+    modelName: `Casio Model ${String(index).padStart(4, '0')}`,
+    groupId: 'in_sale_good',
+    status: index < 50 ? 'done' : (index === 50 ? 'running' : 'pending')
+  }));
+  const tree = buildQueueProgressTree(groups, [{ sourceId: 'casio:0000' }]);
+  const regular = tree.find((node) => node.mode === 'regular');
+  const regen = tree.find((node) => node.mode === 'regeneration');
+  assert.equal(regular.total, 101);
+  assert.equal(regular.done, 49, 'a rejected result awaiting regeneration is not counted as done');
+  assert.equal(regular.running, 1);
+  assert.equal(regular.percent, 48);
+
+  const inSale = regular.children.find((node) => node.saleStatus === 'in_sale');
+  const good = inSale.children.find((node) => node.groupId === 'in_sale_good');
+  const casio = good.children.find((node) => node.brandId === 'casio');
+  assert.equal(casio.total, 101);
+  assert.equal(casio.children.length, 2);
+  assert.equal(casio.children[0].total, 100);
+  assert.equal(casio.children[0].done, 49);
+  assert.equal(casio.children[1].total, 1);
+  assert.deepEqual(casio.children.flatMap((part) => part.sourceIds), casio.entries.map((entry) => entry.sourceId));
+
+  assert.equal(regen.total, 1);
+  assert.equal(regen.queued, 1);
+  assert.equal(regen.children[0].children[0].children[0].children[0].queued, 1);
 });
 
 test('generic brand is an exact filter instead of aliasing all brands', () => {
