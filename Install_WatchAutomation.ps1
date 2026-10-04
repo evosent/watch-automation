@@ -80,7 +80,7 @@ function Install-Node {
     } | Select-Object -First 1
     if (-not $release) { throw "Не удалось найти актуальный Node.js LTS для архитектуры $arch." }
     $versionName = $release.version
-    $msiUrl = "https://nodejs.org/dist/$versionName/$versionName-win-$arch.msi"
+    $msiUrl = "https://nodejs.org/dist/$versionName/node-$versionName-$arch.msi"
     $msiPath = Join-Path ([IO.Path]::GetTempPath()) "WatchAutomation-Node-$versionName.msi"
     Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
     try {

@@ -286,6 +286,38 @@
     }
   }
 
+  async function verifyGeneratedPngSource(sourceUrl) {
+    const parsedUrl = new URL(String(sourceUrl || ''), location.href);
+    const allowedHost = /(^|\.)((chatgpt\.com)|(openai\.com)|(oaiusercontent\.com))$/i.test(parsedUrl.hostname);
+    if (parsedUrl.protocol !== 'https:' || !allowedHost) throw new Error('URL исходного изображения не относится к ChatGPT/OpenAI');
+    const response = await fetch(parsedUrl.href, { cache: 'no-store', credentials: 'include' });
+    if (!response.ok) throw new Error(`Не удалось повторно прочитать PNG: HTTP ${response.status}`);
+    const buffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const signature = [137, 80, 78, 71, 13, 10, 26, 10];
+    if (bytes.length < 24 || signature.some((value, index) => bytes[index] !== value)) {
+      return { valid: false, reason: 'source_not_png', bytes: bytes.length };
+    }
+    const view = new DataView(buffer);
+    const width = view.getUint32(16, false);
+    const height = view.getUint32(20, false);
+    if (!width || !height || width < 512 || height < 512) {
+      return { valid: false, reason: `image_too_small:${width}x${height}`, width, height, bytes: bytes.length };
+    }
+    const ratio = width / height;
+    const hash = await crypto.subtle.digest('SHA-256', buffer);
+    return {
+      valid: true,
+      verified: true,
+      verificationMode: 'page-source',
+      width,
+      height,
+      bytes: bytes.length,
+      sha256: [...new Uint8Array(hash)].map((value) => value.toString(16).padStart(2, '0')).join(''),
+      qualityWarnings: Math.abs(ratio - 0.75) > 0.035 ? [`aspect_ratio:${ratio.toFixed(4)} (ожидается около 3:4)`] : []
+    };
+  }
+
   function generatedSourceNeedsPageFetch(source) {
     const value = String(source || '').trim().toLowerCase();
     return value.startsWith('blob:') || value.startsWith('data:');
@@ -962,6 +994,16 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || !message.type) return;
+    if (message.type === 'VERIFY_GENERATED_PNG_SOURCE') {
+      if (!runCache || runCache.operationId !== message.operationId || runCache.entryId !== message.entryId) {
+        sendResponse({ ok: false, error: { message: 'Operation mismatch while verifying downloaded PNG source' } });
+        return;
+      }
+      verifyGeneratedPngSource(message.url)
+        .then((value) => sendResponse({ ok: true, value }))
+        .catch((error) => sendResponse({ ok: false, error: { message: error?.message || String(error) } }));
+      return true;
+    }
     if (message.type === 'PING') {
       sendResponse({ ok: true, value: { href: publicPageUrl(), ready: !!window.WatchChatGPTAdapter, buildId: runCache?.buildId || null } });
       return;

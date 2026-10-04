@@ -12,6 +12,7 @@ const MAX_ARCHIVE_BYTES = 160 * 1024 * 1024;
 const MAX_UNPACKED_BYTES = 220 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 1000;
 const ALLOWED_DEV_FILES = new Set([
+  'dev/control-routing.mjs',
   'dev/watch-extension.mjs',
   'dev/update-utils.mjs',
   'dev/update-watch-automation.mjs'
@@ -231,6 +232,21 @@ function versionFromTag(value) {
   return String(value || '').replace(/^v/i, '');
 }
 
+function compareReleaseVersions(left, right) {
+  const parse = (value) => {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/.exec(String(value || '').trim());
+    return match ? match.slice(1, 4).map((part) => BigInt(part)) : null;
+  };
+  const a = parse(left);
+  const b = parse(right);
+  if (!a || !b) return null;
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] < b[index]) return -1;
+    if (a[index] > b[index]) return 1;
+  }
+  return 0;
+}
+
 async function fetchLatestRelease(fetchImpl) {
   const url = `https://api.github.com/repos/${UPDATE_REPOSITORY}/releases/latest`;
   const response = await fetchImpl(url, {
@@ -357,6 +373,18 @@ export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyE
     const { release, asset } = await fetchLatestRelease(fetchImpl);
     const latestVersion = versionFromTag(release.tag_name);
     releaseIdentity = `${release.tag_name}|${asset.id || ''}|${asset.updated_at || ''}|${asset.size}`;
+    const versionOrder = compareReleaseVersions(latestVersion, currentVersion);
+    if (versionOrder == null) {
+      throw new Error(`Не удалось безопасно сравнить установленную версию ${currentVersion} с релизом ${latestVersion}; установка отменена.`);
+    }
+    if (versionOrder < 0) {
+      setStatus('current', `На GitHub опубликована более старая версия ${latestVersion}; установлена ${currentVersion}. Откат версии отменён.`, {
+        currentVersion,
+        latestVersion: null,
+        error: null
+      });
+      return { available: false, version: latestVersion, newerInstalled: true };
+    }
     const installedState = await readJson(path.join(root, UPDATE_STATE_FILE));
     if (installedState?.releaseIdentity === releaseIdentity) {
       setStatus('current', `Установлена актуальная версия ${latestVersion}.`, { latestVersion });

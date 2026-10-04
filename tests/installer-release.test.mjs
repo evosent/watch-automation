@@ -51,3 +51,34 @@ test('first-run input libraries are resolved from the local app root', async () 
   assert.match(sidepanel, /concurrency:\s*3/);
   assert.ok(manifest.host_permissions.includes('http://127.0.0.1:17321/*'));
 });
+
+test('reliability fixes serialize OCR telemetry, ship updater dependencies, and validate offline PNG fallback', async () => {
+  const worker = await readFile(path.join(root, 'extension/service-worker.js'), 'utf8');
+  const content = await readFile(path.join(root, 'extension/content-script.js'), 'utf8');
+  const updater = await readFile(path.join(root, 'dev/update-utils.mjs'), 'utf8');
+  const builder = await readFile(path.join(root, 'scripts/build-update-package.mjs'), 'utf8');
+  const installer = await readFile(path.join(root, 'Install_WatchAutomation.ps1'), 'utf8');
+
+  const pulseStart = worker.indexOf('async function pulsePostprocessTabs');
+  const pulseEnd = worker.indexOf('async function persistRecoveredRevisionFacts', pulseStart);
+  const pulse = worker.slice(pulseStart, pulseEnd);
+  const telemetryStart = pulse.indexOf('if (telemetry.length)');
+  const telemetry = pulse.slice(telemetryStart);
+  assert.match(telemetry, /await withStateLock\(async \(\) => \{/);
+  assert.match(telemetry, /chrome\.storage\.local\.set\(\{ run \}\)/);
+  assert.match(telemetry, /run\?\.operationId !== runSnapshot\.operationId/);
+
+  assert.match(updater, /'dev\/control-routing\.mjs'/);
+  assert.match(builder, /'dev\/control-routing\.mjs'/);
+  assert.match(installer, /node-\$versionName-\$arch\.msi/);
+  assert.doesNotMatch(installer, /\$versionName-win-\$arch\.msi/);
+
+  const verify = worker.slice(worker.indexOf('async function verifyDownloadedArtifact'), worker.indexOf('function resetLaunchScheduler'));
+  const finish = worker.slice(worker.indexOf('async function finishDownload'), worker.indexOf('async function persistDownloadStartedFast'));
+  assert.match(verify, /fallbackVerify/);
+  assert.match(verify, /sha256_unavailable/);
+  assert.match(verify, /valid: false/);
+  assert.match(finish, /VERIFY_GENERATED_PNG_SOURCE/);
+  assert.match(content, /message\.type === 'VERIFY_GENERATED_PNG_SOURCE'/);
+  assert.match(content, /crypto\.subtle\.digest\('SHA-256', buffer\)/);
+});

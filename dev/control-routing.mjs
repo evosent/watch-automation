@@ -27,6 +27,23 @@ export function normalizeControlClient({ origin, extensionId: claimedExtensionId
   };
 }
 
+export function normalizeExtensionUpdateClient({ origin, extensionId = '', clientId = '', version = '' } = {}) {
+  const normalizedOrigin = String(origin || '').trim();
+  const originId = extensionIdFromOrigin(normalizedOrigin);
+  // Reject an explicit non-extension Origin even if the caller also supplies
+  // an extension ID. For MV3 service-worker fetches with no Origin header, the
+  // persisted per-install client ID is required as the loopback capability.
+  if (normalizedOrigin && !originId) return null;
+  const client = normalizeControlClient({
+    origin: normalizedOrigin,
+    extensionId,
+    clientId,
+    version
+  });
+  if (!client || (!originId && !client.clientId)) return null;
+  return client;
+}
+
 export function resolveControlTarget(payload = {}, activeClients = []) {
   const targetClientId = String(payload.targetClientId || '').trim();
   const targetExtensionId = String(payload.targetExtensionId || '').trim().toLowerCase();

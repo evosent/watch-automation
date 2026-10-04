@@ -5,6 +5,7 @@ import {
   controlCommandMatchesClient,
   extensionIdFromOrigin,
   normalizeControlClient,
+  normalizeExtensionUpdateClient,
   resolveControlTarget
 } from '../dev/control-routing.mjs';
 
@@ -44,4 +45,34 @@ test('browser origin is the authoritative extension identity', () => {
   assert.equal(extensionIdFromOrigin(`chrome-extension://${extensionA}`), extensionA);
   assert.equal(extensionIdFromOrigin('http://127.0.0.1:17321'), null);
   assert.equal(normalizeControlClient({ origin: `chrome-extension://${extensionA}`, clientId: 'bad id' }), null);
+});
+
+test('extension update accepts an MV3 service worker with omitted Origin when it supplies its installation identity', () => {
+  const client = normalizeExtensionUpdateClient({
+    origin: '',
+    extensionId: extensionA,
+    clientId: 'client-current-001',
+    version: '0.3.38'
+  });
+
+  assert.equal(client?.extensionId, extensionA);
+  assert.equal(client?.clientId, 'client-current-001');
+});
+
+test('extension update keeps legacy extension origins and rejects untrusted or unscoped origins', () => {
+  assert.equal(normalizeExtensionUpdateClient({ origin: `chrome-extension://${extensionA}` })?.extensionId, extensionA);
+  assert.equal(normalizeExtensionUpdateClient({
+    origin: '',
+    extensionId: extensionA
+  }), null);
+  assert.equal(normalizeExtensionUpdateClient({
+    origin: 'https://example.com',
+    extensionId: extensionA,
+    clientId: 'client-current-001'
+  }), null);
+  assert.equal(normalizeExtensionUpdateClient({
+    origin: `chrome-extension://${extensionA}`,
+    extensionId: extensionB,
+    clientId: 'client-current-001'
+  }), null);
 });

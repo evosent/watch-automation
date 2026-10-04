@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UPDATE_FILES = [
+  'dev/control-routing.mjs',
   'dev/watch-extension.mjs',
   'dev/update-utils.mjs',
   'dev/update-watch-automation.mjs'

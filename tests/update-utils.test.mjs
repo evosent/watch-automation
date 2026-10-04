@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { inspectUpdateArchive } from '../dev/update-utils.mjs';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { createUpdateManager, inspectUpdateArchive, UPDATE_ASSET_NAME } from '../dev/update-utils.mjs';
 
 function crc32(bytes) {
   let crc = 0xffffffff;
@@ -63,4 +66,42 @@ test('update package archive rejects traversal and incoming watch photos', () =>
 test('update package archive rejects symlinks', () => {
   const unixSymlinkMode = (0xa000 << 16) >>> 0;
   assert.throws(() => inspectUpdateArchive(storedZipEntry('extension/manifest.json', '{}', unixSymlinkMode)), /символическая ссылка/i);
+});
+
+test('update manager reports an older GitHub release and never downloads it over a newer installation', async (t) => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'watch-update-version-'));
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+  await mkdir(path.join(projectRoot, 'extension'), { recursive: true });
+  await writeFile(path.join(projectRoot, 'extension', 'manifest.json'), JSON.stringify({ version: '0.3.38' }));
+
+  const requests = [];
+  const manager = createUpdateManager(projectRoot);
+  manager.startPrepare(async (url) => {
+    requests.push(String(url));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        draft: false,
+        prerelease: false,
+        tag_name: 'v0.3.35',
+        html_url: 'https://github.com/evosent/watch-automation/releases/tag/v0.3.35',
+        assets: [{
+          name: UPDATE_ASSET_NAME,
+          id: 1,
+          updated_at: '2026-10-03T17:15:00Z',
+          size: 123,
+          browser_download_url: 'https://github.com/evosent/watch-automation/releases/download/v0.3.35/watch-automation-update.zip'
+        }]
+      })
+    };
+  });
+
+  const status = await manager.waitForPrepare();
+  assert.equal(status.phase, 'current');
+  assert.equal(status.currentVersion, '0.3.38');
+  assert.equal(status.latestVersion, null);
+  assert.match(status.message, /более старая версия 0\.3\.35/i);
+  assert.match(status.message, /откат версии отменён/i);
+  assert.equal(requests.length, 1, 'the updater must stop before downloading the older ZIP');
 });

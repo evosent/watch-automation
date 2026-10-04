@@ -10,6 +10,7 @@ import {
   controlCommandMatchesClient,
   extensionIdFromOrigin,
   normalizeControlClient,
+  normalizeExtensionUpdateClient,
   resolveControlTarget
 } from './control-routing.mjs';
 
@@ -882,13 +883,19 @@ function startHttpServer() {
     const requestUrl = new URL(request.url || '/', `http://${HOST}:${PORT}`);
     if (requestUrl.pathname.startsWith('/update')) {
       const origin = String(request.headers.origin || '');
-      if (!/^chrome-extension:\/\/[a-p]{32}$/i.test(origin)) {
+      const updateClient = normalizeExtensionUpdateClient({
+        origin,
+        extensionId: requestUrl.searchParams.get('extensionId') || '',
+        clientId: requestUrl.searchParams.get('clientId') || '',
+        version: requestUrl.searchParams.get('version') || ''
+      });
+      if (!updateClient) {
         jsonResponse(response, 403, { ok: false, error: 'Обновление разрешено только из интерфейса расширения' });
         return;
       }
       if (request.method === 'OPTIONS') {
         response.writeHead(204, {
-          'Access-Control-Allow-Origin': origin,
+          'Access-Control-Allow-Origin': origin || '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type',
           'Vary': 'Origin'
@@ -908,19 +915,20 @@ function startHttpServer() {
         return;
       }
       if (request.method === 'POST' && requestUrl.pathname === '/update') {
-        if (!updateManager.startPrepare()) {
-          jsonResponse(response, 409, { ok: false, error: 'Проверка или установка обновления уже идёт', status: updateManager.getStatus() });
-          return;
-        }
-        jsonResponse(response, 202, { ok: true, started: true, status: updateManager.getStatus() });
+        const started = updateManager.startPrepare();
+        // Treat repeated requests as idempotent. Another panel/context may
+        // already be checking or applying the same single staged update.
+        jsonResponse(response, 202, { ok: true, started, status: updateManager.getStatus() });
         return;
       }
       if (request.method === 'POST' && requestUrl.pathname === '/update/apply') {
-        if (!updateManager.startApply()) {
-          jsonResponse(response, 409, { ok: false, error: 'Нет подготовленного обновления для установки', status: updateManager.getStatus() });
+        const started = updateManager.startApply();
+        const status = updateManager.getStatus();
+        if (!started && !['applying', 'complete', 'current'].includes(String(status.phase || ''))) {
+          jsonResponse(response, 409, { ok: false, error: 'Нет подготовленного обновления для установки', status });
           return;
         }
-        jsonResponse(response, 202, { ok: true, started: true, status: updateManager.getStatus() });
+        jsonResponse(response, 202, { ok: true, started, status });
         return;
       }
       jsonResponse(response, 404, { ok: false, error: 'Неизвестный маршрут обновления' });

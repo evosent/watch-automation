@@ -707,9 +707,10 @@ function fetchWithTimeout(url, options = {}, timeoutMs = 6000) {
     .finally(() => clearTimeout(timeout));
 }
 
-async function verifyDownloadedArtifact(downloadItem, entry = null) {
+async function verifyDownloadedArtifact(downloadItem, entry = null, fallbackVerify = null) {
   const filename = String(downloadItem?.filename || '');
-  const bytes = Number(downloadItem?.fileSize || downloadItem?.bytesReceived || 0);
+  const fileSize = Number(downloadItem?.fileSize || 0);
+  const bytes = fileSize > 0 ? fileSize : Number(downloadItem?.bytesReceived || 0);
   const isPngPath = /\.png$/i.test(filename);
   if (!downloadItem || downloadItem.state !== 'complete' || !isPngPath || bytes <= 0) {
     return {
@@ -731,12 +732,18 @@ async function verifyDownloadedArtifact(downloadItem, entry = null) {
       const width = Number(payload.width || 0);
       const height = Number(payload.height || 0);
       const warnings = [];
+      if (payload.valid === false) {
+        return { ...payload, valid: false, verified: true, verificationMode: 'watcher' };
+      }
       if (width && height) {
         const ratio = width / height;
         if (width < 512 || height < 512) {
           return { ...payload, valid: false, verified: true, verificationMode: 'watcher', reason: `image_too_small:${width}x${height}` };
         }
         if (Math.abs(ratio - 0.75) > 0.035) warnings.push(`aspect_ratio:${ratio.toFixed(4)} (ожидается около 3:4)`);
+      }
+      if (!/^[a-f0-9]{64}$/i.test(String(payload.sha256 || ''))) {
+        throw new Error('Локальная проверка не вернула SHA-256 PNG');
       }
       return {
         ...payload,
@@ -747,13 +754,36 @@ async function verifyDownloadedArtifact(downloadItem, entry = null) {
       };
     }
   } catch (_) {
-    // The watcher is an optional verifier. Downloads API metadata still gives
-    // us an idempotent, non-empty PNG fallback when the helper is offline.
+    // Continue with an independent page-side hash only when the watcher is
+    // unavailable or returned an incomplete verification record.
+  }
+  if (typeof fallbackVerify === 'function') {
+    try {
+      const fallback = await fallbackVerify();
+      const sha256 = String(fallback?.sha256 || '').toLowerCase();
+      const sourceBytes = Number(fallback?.bytes || 0);
+      if (fallback?.valid === true && /^[a-f0-9]{64}$/.test(sha256)
+        && sourceBytes > 0 && (fileSize <= 0 || sourceBytes === fileSize)) {
+        return {
+          ...fallback,
+          valid: true,
+          verified: true,
+          verificationMode: 'page-source',
+          sha256,
+          filename,
+          bytes: sourceBytes
+        };
+      }
+      if (fallback?.valid === false) {
+        return { ...fallback, verified: true, verificationMode: 'page-source', filename, bytes };
+      }
+    } catch (_) {}
   }
   return {
-    valid: true,
+    valid: false,
     verified: false,
     verificationMode: 'downloads-api',
+    reason: 'sha256_unavailable',
     filename,
     bytes
   };
@@ -3541,11 +3571,14 @@ async function requestLocalExtensionUpdate(url, method = 'GET') {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 3500);
   try {
-    const response = await fetch(url, {
+    const client = await getDevControlClientIdentity();
+    const requestUrl = new URL(url);
+    requestUrl.searchParams.set('extensionId', client.extensionId);
+    requestUrl.searchParams.set('clientId', client.clientId);
+    requestUrl.searchParams.set('version', client.version);
+    const response = await fetch(requestUrl.toString(), {
       method,
       cache: 'no-store',
-      headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
-      body: method === 'POST' ? '{}' : undefined,
       signal: controller.signal
     });
     const payload = await response.json().catch(() => ({}));
@@ -9346,8 +9379,9 @@ async function pulsePostprocessTabs(runSnapshot) {
   // the small run object, not queue/history/generationMemory.
   if (telemetry.length) {
     try {
-      const { run } = await chrome.storage.local.get('run');
-      if (run?.operationId === runSnapshot.operationId) {
+      await withStateLock(async () => {
+        const { run } = await chrome.storage.local.get('run');
+        if (run?.operationId !== runSnapshot.operationId) return;
         let changed = false;
         for (const info of telemetry) {
           const owner = run.postprocessTabs?.[String(info.tabId)];
@@ -9370,7 +9404,7 @@ async function pulsePostprocessTabs(runSnapshot) {
           changed = true;
         }
         if (changed) await chrome.storage.local.set({ run });
-      }
+      });
     } catch (_) {}
   }
   return { checked: liveOwners.length, completed, expired: expired.length };
@@ -10351,7 +10385,7 @@ async function finalizeCompletedArtifact(runId, slotId, entryId, outputPath, ver
   if (shouldCloseAutomationWindow) await closeAutomationWindowIfEmpty(runId);
 }
 
-async function finishDownload(runId, slotId, downloadId, outputPath) {
+async function finishDownload(runId, slotId, downloadId, outputPath, knownVerification = null) {
   const downloadKey = Number(downloadId);
   if (activeDownloadFinalizations.has(downloadKey)) return { skipped: true, reason: 'finalization_in_progress' };
   activeDownloadFinalizations.add(downloadKey);
@@ -10368,7 +10402,24 @@ async function finishDownload(runId, slotId, downloadId, outputPath) {
       .find((entry) => entry.sourceId === stored.run?.slots?.[slotId]?.entryId) || null;
   } catch (_) {}
   const downloadedFileName = String(downloadItem?.filename || outputPath || '').replaceAll('\\', '/').split('/').at(-1) || '';
-  const verification = await verifyDownloadedArtifact(downloadItem, { outputFileName: downloadedFileName });
+  const runSnapshot = await chrome.storage.local.get('run').then(({ run }) => run).catch(() => null);
+  const owningSlot = runSnapshot?.operationId === runId ? runSnapshot.slots?.[slotId] : null;
+  const sourceUrl = String(downloadItem?.finalUrl || downloadItem?.url || '');
+  const fallbackVerify = knownVerification?.valid === true
+    ? async () => knownVerification
+    : owningSlot?.tabId && sourceUrl
+    ? async () => {
+      const response = await sendTabMessage(Number(owningSlot.tabId), {
+        type: 'VERIFY_GENERATED_PNG_SOURCE',
+        operationId: runId,
+        entryId: owningSlot.entryId,
+        url: sourceUrl
+      }, 20000);
+      if (!response?.ok) throw new Error(response?.error?.message || 'Страница не смогла проверить исходный PNG');
+      return response.value;
+    }
+    : null;
+  const verification = await verifyDownloadedArtifact(downloadItem, { outputFileName: downloadedFileName }, fallbackVerify);
   if (!verification.valid) {
     await pauseRunOnError(runId, new Error(`Результат скачивания не прошёл проверку: ${verification.reason || 'невалидный PNG'}`), {
       slotId,
@@ -10543,6 +10594,7 @@ async function startGeneratedDownload({ operationId, slotId, entryId, url, dataU
     throw new Error('CUSTOM_OUTPUT_REQUIRES_PAGE_FETCH');
   }
 
+  let pagePayloadVerification = null;
   if (destination.mode === 'custom') {
     const stored = await getStored();
     const currentRun = stored.run;
@@ -10574,6 +10626,8 @@ async function startGeneratedDownload({ operationId, slotId, entryId, url, dataU
         await publishRun(current.run, current.queue);
       });
       const blob = await blobFromGeneratedPayload(pageDataUrl, url);
+      pagePayloadVerification = await verifyPngBlob(blob);
+      if (!pagePayloadVerification.valid) throw new Error(`PNG не прошёл проверку перед записью: ${pagePayloadVerification.reason || 'invalid'}`);
       const saved = await writeGeneratedToCustomDirectory(entry, blob);
       if (!saved) throw new Error('Папка результатов не выбрана');
       await finalizeCompletedArtifact(operationId, slotId, entryId, saved.outputPath, saved.verification, { sourceMode: 'custom' });
@@ -10609,6 +10663,10 @@ async function startGeneratedDownload({ operationId, slotId, entryId, url, dataU
     || (QUEUE_GROUP_IDS.includes(String(outputEntry?.groupId || '')) ? outputEntry.groupId : null);
   if (!outputGroupId) throw new Error('Не удалось определить настоящую категорию модели для сохранения PNG');
   const filename = `WatchAutomation/${sanitizeFilename(outputGroupId)}/${sanitizeFilename(resolvedOutputFileName)}`;
+  if (pageDataUrl && !pagePayloadVerification) {
+    pagePayloadVerification = await verifyPngBlob(await blobFromGeneratedPayload(pageDataUrl, url));
+    if (!pagePayloadVerification.valid) throw new Error(`PNG не прошёл проверку перед скачиванием: ${pagePayloadVerification.reason || 'invalid'}`);
+  }
   const resultFingerprint = stableHash({
     entryId,
     url: String(url || ''),
@@ -10638,6 +10696,7 @@ async function startGeneratedDownload({ operationId, slotId, entryId, url, dataU
     slotId: Number(slotId),
     entryId,
     outputFileName: resolvedOutputFileName,
+    pagePayloadVerification,
     persistPromise,
     startedAt: Date.now()
   });
@@ -10829,7 +10888,7 @@ async function reconcileDownloadChange(delta) {
       await claim.persistPromise?.catch(() => {});
       const [item] = await chrome.downloads.search({ id: delta.id });
       activeDownloadClaims.delete(Number(delta.id));
-      await finishDownload(claim.operationId, Number(claim.slotId), delta.id, item?.filename || null);
+      await finishDownload(claim.operationId, Number(claim.slotId), delta.id, item?.filename || null, claim.pagePayloadVerification || null);
       return;
     }
   }
