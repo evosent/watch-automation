@@ -43,7 +43,13 @@ import {
 } from './idb.js';
 import { transferableRevision, planResultsMerge, resultsImportPreview } from './results-transfer-utils.js';
 import { buildInputPlan, normalizeInputMode, DEFAULT_INPUT_MODE } from './input-plan.js';
-import { verifiedRevisionMatchesEvent, freshSlotRevisionFields, canAuditSlot } from './generation-revision-utils.js';
+import {
+  verifiedRevisionMatchesEvent,
+  freshSlotRevisionFields,
+  canAuditSlot,
+  currentLeasePhysicalSend,
+  pageProbeConfirmsUnsubmitted
+} from './generation-revision-utils.js';
 import { factsStageMatchesOwner, savedFactsStageMatchesReleasedOwner } from './facts-progress-utils.js';
 import {
   normalizedRepairQueue,
@@ -53,6 +59,7 @@ import {
 } from './repair-queue-utils.js';
 import { brandPromptPath, buildGenerationPrompt, detectBrandProfile, resolveTitleSpec } from './prompt-profiles.js';
 import { runDiagnosticHeader, sanitizeRunDiagnosticEvent } from './run-diagnostics-utils.js';
+import { syncRunClock, elapsedRunClock, pauseRunClock, resumeRunClock, stopRunClock } from './run-clock-utils.js';
 import {
   AUTOMATION_ERROR_CLASSES,
   CONVERSATION_LOAD_RECOVERY_DELAY_MS,
@@ -72,6 +79,11 @@ import {
   scheduledRunRetries,
   stableHash,
   shouldRefreshUnresponsiveGeneration,
+  isStalledUnsubmittedPreparation,
+  shouldRefreshStalledGeneration,
+  shouldExpireSubmittedObservation,
+  PREPARATION_STALL_AFTER_MS,
+  SUBMITTED_STALL_REFRESH_AFTER_MS,
   findStalledBatchRecoveryCandidate,
   shouldTripAttachmentFailureCircuitBreaker,
   STALLED_BATCH_RECOVERY_DELAY_MS
@@ -98,10 +110,11 @@ const FOCUS_AUDIT_INTERVAL_MS = 30000;
 // stuck behind a page modal or an obsolete listener. Bound every transport
 // request so one slot cannot remain STARTING forever.
 const TAB_MESSAGE_TIMEOUT_MS = 30000;
-const PREPARE_PAGE_TIMEOUT_MS = 150000;
+const PREPARE_PAGE_TIMEOUT_MS = 300000;
 // An error can appear before ChatGPT finishes mounting the image. Keep the
 // failed slot observable for the same 15-minute window as a regular generation.
 const FINAL_CHECK_TIMEOUT_MS = 900000;
+const MAX_AUTOMATIC_PREPARATION_RECOVERIES = 2;
 const MAX_ARTIFACT_REVISION_PERSIST_FAILURES = 3;
 const RATE_LIMIT_PAUSE_MS = 180000;
 const DEFAULT_RATE_LIMIT_PAUSE_MINUTES = RATE_LIMIT_PAUSE_MS / 60000;
@@ -134,8 +147,14 @@ const OUTPUT_ARCHIVE_REVISION_ENDPOINT = 'http://127.0.0.1:17321/output-archive-
 const SLOT_PROBE_TIMEOUT_MS = 8000;
 const GLOBAL_NO_PROGRESS_WINDOW_MS = 300000;
 const MAX_RUN_EVENTS = 600;
+const RUN_CLOCK_PAUSE_EVENTS = new Set([
+  'run_pause_requested', 'run_pause_applied', 'run_paused_on_error',
+  'rate_limit_pause', 'image_limit_pause', 'run_retry_backoff_scheduled',
+  'stalled_batch_recovery_started', 'stalled_batch_recovery_waiting',
+  'conversation_load_recovery_started', 'run_stop_accepted', 'run_completed'
+]);
 const OUTPUT_VERIFY_TIMEOUT_MS = 2000;
-const EXTENSION_BUILD_ID = '2026-10-05.2';
+const EXTENSION_BUILD_ID = '2026-10-05.3';
 const PROMPT_PIPELINE_VERSION = '6';
 const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
@@ -154,6 +173,11 @@ const RECOVERY_ACTIVE_STATES = new Set(['WAITING_ASSISTANT', 'GENERATING', 'WAIT
 let stateChain = Promise.resolve();
 let auditTimer = null;
 let auditInFlight = null;
+let auditMonitorDesired = false;
+let auditMonitorEpoch = 0;
+let auditAlarmKnownPresent = false;
+let auditAlarmReconcilePromise = null;
+let auditTimerGeneration = 0;
 let factsPulseTimer = null;
 let factsPulseInFlight = null;
 let launchChain = Promise.resolve();
@@ -333,13 +357,26 @@ async function rehydrateWorkerWake() {
   const run = stored.run;
   if (!run) return;
   const batchRecoveryStage = String(run.stalledBatchRecovery?.stage || '').toUpperCase();
-  if (['CLOSING', 'WAITING', 'RESTARTING'].includes(batchRecoveryStage)) {
+  const preparationStallWaiting = run.stalledBatchRecovery?.kind === 'PREPARATION_STALL'
+    && batchRecoveryStage === 'WAITING';
+  if (run.stalledBatchRecovery?.kind === 'PREPARATION_STALL'
+    && ['CLOSING', 'RESTARTING'].includes(batchRecoveryStage)) {
+    void resumePreparationStallRecovery().catch((error) => appendLog('Ошибка восстановления подготовки', { error: error.message }));
+    return;
+  }
+  if (run.state === 'PAUSED' && preparationStallWaiting) {
+    scheduleStalledBatchRecovery(run.operationId, Number(run.stalledBatchRecovery.dueAt || 0) || Date.now() + 1000);
+  }
+  if (run.stalledBatchRecovery?.kind !== 'PREPARATION_STALL'
+    && ['CLOSING', 'WAITING', 'RESTARTING'].includes(batchRecoveryStage)) {
     void restoreStalledBatchRecovery(run.operationId).catch((error) => appendLog(
       'Ошибка восстановления отложенного перезапуска рабочих вкладок', { error: error.message }
     ));
     return;
   }
-  if (batchRecoveryStage === 'FAILED') return;
+  if (batchRecoveryStage === 'FAILED' && run.stalledBatchRecovery?.kind !== 'PREPARATION_STALL') return;
+  if (run.state === 'PAUSED' && preparationStallWaiting
+    && !hasObservationWork(run) && !hasScheduledRunRetries(run, stored.queue)) return;
   const conversationStage = String(run.conversationRecovery?.stage || '').toUpperCase();
   if (conversationStage === 'INSPECTING') {
     void beginConversationLoadRecovery(run.operationId, {
@@ -384,9 +421,9 @@ async function rehydrateWorkerWake() {
     await scheduleInterruptedRunRecovery('Сверка завершённых результатов');
     return;
   }
-  if (run.state === 'PAUSED' && hasScheduledRunRetries(run, stored.queue)) {
+  if (run.state === 'PAUSED' && shouldKeepAuditMonitor(run, stored.queue)) {
     startAuditMonitor();
-    await processDueScheduledRetries(run.operationId);
+    if (hasScheduledRunRetries(run, stored.queue)) await processDueScheduledRetries(run.operationId);
     return;
   }
   if (!['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)) return;
@@ -460,6 +497,9 @@ function ensureSlotGenerationIdentity(run, slot, entry, generationMemory = null)
 
 function recordRunEvent(run, type, data = {}) {
   if (!run) return;
+  const eventAtMs = Date.now();
+  if (type === 'run_stop_requested') stopRunClock(run, eventAtMs);
+  else if (RUN_CLOCK_PAUSE_EVENTS.has(type)) pauseRunClock(run, eventAtMs);
   const events = Array.isArray(run.eventJournal) ? run.eventJournal : [];
   let sequence = Number(run.eventSequence || 0);
   if (events.some((event) => !Number(event?.sequence))) {
@@ -478,7 +518,7 @@ function recordRunEvent(run, type, data = {}) {
     sequence = Math.max(sequence, Number(run.eventCount || 0));
   }
   sequence += 1;
-  const at = new Date().toISOString();
+  const at = new Date(eventAtMs).toISOString();
   const startedAtMs = Date.parse(run.startedAt || '');
   const previousEventAtMs = Date.parse(events.at(-1)?.at || '');
   events.push({
@@ -960,6 +1000,7 @@ async function failStalledBatchRecovery(operationId, error) {
 
 async function resumeStalledBatchRecovery() {
   const initial = await getStored();
+  if (initial.run?.stalledBatchRecovery?.kind === 'PREPARATION_STALL') return resumePreparationStallRecovery();
   const operationId = initial.run?.operationId;
   if (!operationId) return { skipped: true };
   if (stalledBatchRecoveryRuns.has(operationId)) {
@@ -1038,6 +1079,120 @@ async function resumeStalledBatchRecovery() {
     if (chrome.alarms?.clear) await chrome.alarms.clear(STALLED_BATCH_RECOVERY_ALARM_NAME).catch(() => {});
     await appendLog('Прогон автоматически продолжен после пятиминутного отдыха', { operationId });
     return { resumed: true, operationId };
+  } catch (error) {
+    await failStalledBatchRecovery(operationId, error);
+    return { failed: true, error: error.message };
+  } finally {
+    stalledBatchRecoveryRuns.delete(operationId);
+  }
+}
+
+// Preparation has no server result to wait for. Persist the recovery intent
+// before closing drafts so worker suspension cannot strand a half-reset run.
+async function schedulePreparationStallRecovery(operationId, entryIds = []) {
+  const plan = await withStateLock(async () => {
+    const stored = await getStored();
+    const run = stored.run;
+    if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)
+      || run.clockStopped || run.stopBlocked
+      || ['USER', 'RESTART', 'IMAGE_LIMIT'].includes(run.pauseReason)) return { skipped: true };
+    const recovery = run.stalledBatchRecovery;
+    if (['CLOSING', 'WAITING', 'RESTARTING'].includes(recovery?.stage)) {
+      return recovery.kind === 'PREPARATION_STALL' ? { scheduled: true } : { skipped: true };
+    }
+    const attempts = Number(run.preparationRecoveryAttempts || 0);
+    const exhausted = attempts >= MAX_AUTOMATIC_PREPARATION_RECOVERIES;
+    run.preparationRecoveryAttempts = exhausted ? attempts : attempts + 1;
+    run.stalledBatchRecovery = {
+      kind: 'PREPARATION_STALL', stage: 'CLOSING',
+      attempts: run.preparationRecoveryAttempts, exhausted,
+      triggeredAt: new Date().toISOString(), dueAt: null,
+      triggerEntryIds: [...new Set(entryIds.map(String))]
+    };
+    run.state = 'PAUSED';
+    run.status = 'PAUSED_ON_ERROR';
+    run.pauseReason = 'ERROR';
+    recordRunEvent(run, 'stalled_batch_recovery_started', {
+      kind: 'PREPARATION_STALL', attempts: run.preparationRecoveryAttempts,
+      exhausted, entryIds: run.stalledBatchRecovery.triggerEntryIds
+    });
+    await saveRunAndQueue(run, stored.queue);
+    await publishRun(run, stored.queue);
+    return { scheduled: !exhausted, terminal: exhausted };
+  });
+  if (!plan.skipped) {
+    scheduleStalledBatchRecovery(operationId, Date.now() + 5000);
+    await resumePreparationStallRecovery();
+  }
+  return plan;
+}
+
+async function resumePreparationStallRecovery() {
+  const initial = await getStored();
+  const operationId = initial.run?.operationId;
+  if (!operationId || initial.run.stalledBatchRecovery?.kind !== 'PREPARATION_STALL') return { skipped: true };
+  if (stalledBatchRecoveryRuns.has(operationId)) {
+    scheduleStalledBatchRecovery(operationId, Date.now() + 5000);
+    return { skipped: true, inFlight: true };
+  }
+  stalledBatchRecoveryRuns.add(operationId);
+  try {
+    let run = initial.run;
+    if (run.clockStopped || run.stopBlocked || run.pauseReason !== 'ERROR'
+      || run.state !== 'PAUSED') return { skipped: true };
+    if (run.stalledBatchRecovery.stage === 'CLOSING') {
+      // pauseRun releases only conclusively unsent drafts; real Send leases,
+      // downloads and verified results retain their existing ownership.
+      await pauseRun('ERROR', operationId);
+      await withStateLock(async () => {
+        const stored = await getStored();
+        const current = stored.run;
+        if (!current || current.operationId !== operationId || current.clockStopped
+          || current.stopBlocked || current.pauseReason !== 'ERROR'
+          || current.stalledBatchRecovery?.stage !== 'CLOSING') return;
+        const recovery = current.stalledBatchRecovery;
+        recovery.requeuedIds = [...(current.pendingIds || [])];
+        recovery.stage = recovery.exhausted ? 'FAILED' : 'WAITING';
+        recovery.waitStartedAt = new Date().toISOString();
+        recovery.dueAt = recovery.exhausted ? null : Date.now() + STALLED_BATCH_RECOVERY_DELAY_MS;
+        current.attachmentFailureBaselineAt = recovery.waitStartedAt;
+        for (const entry of groupEntries(stored.queue, current.groupId)) {
+          if (!current.pendingIds.includes(entry.sourceId)) continue;
+          entry.autoRetryPending = false;
+          entry.nextRetryAt = null;
+        }
+        current.currentAction = recovery.exhausted
+          ? 'Повторные ошибки подготовки: автоматические попытки исчерпаны. Прогресс сохранён; требуется проверка и Продолжить.'
+          : `Ошибка подготовки. Очередь сохранена; продолжу через 5 минут (${clockTime(recovery.dueAt)}).`;
+        recordRunEvent(current, recovery.exhausted ? 'preparation_recovery_exhausted' : 'stalled_batch_recovery_waiting', {
+          kind: 'PREPARATION_STALL', dueAt: recovery.dueAt, attempts: recovery.attempts,
+          returnedCount: recovery.requeuedIds.length
+        });
+        await saveRunAndQueue(current, stored.queue, stored.history, stored.generationMemory);
+        await publishRun(current, stored.queue);
+      });
+      run = (await getStored()).run;
+    }
+    if (!run || run.operationId !== operationId || run.clockStopped || run.stopBlocked
+      || run.pauseReason !== 'ERROR' || run.state !== 'PAUSED') return { skipped: true };
+    if (!['WAITING', 'RESTARTING'].includes(run.stalledBatchRecovery.stage)) return { skipped: true };
+    const dueAt = Number(run.stalledBatchRecovery.dueAt || 0);
+    if (run.stalledBatchRecovery.stage === 'WAITING' && dueAt > Date.now()) {
+      scheduleStalledBatchRecovery(operationId, dueAt);
+      return { waiting: true, dueAt };
+    }
+    await withStateLock(async () => {
+      const stored = await getStored();
+      if (stored.run?.operationId !== operationId || stored.run.clockStopped || stored.run.stopBlocked
+        || stored.run.pauseReason !== 'ERROR' || stored.run.stalledBatchRecovery?.stage !== 'WAITING') return;
+      stored.run.stalledBatchRecovery.stage = 'RESTARTING';
+      await saveRunAndQueue(stored.run, stored.queue);
+    });
+    const latest = (await getStored()).run;
+    if (latest?.operationId !== operationId || latest.clockStopped || latest.stopBlocked
+      || latest.stalledBatchRecovery?.stage !== 'RESTARTING') return { skipped: true };
+    await resumeRun({ preparationStallRecoveryInternal: true });
+    return { resumed: true };
   } catch (error) {
     await failStalledBatchRecovery(operationId, error);
     return { failed: true, error: error.message };
@@ -2235,7 +2390,7 @@ async function submitPreparedSlot(operationId, slotId, entryId, tabId) {
     const stored = await getStored();
     const run = stored.run;
     const slot = run?.slots?.[slotId];
-    if (!run || run.operationId !== operationId || run.state !== 'RUNNING' || slot?.entryId !== entryId) {
+    if (!run || run.operationId !== operationId || run.state !== 'RUNNING' || run.clockStopped || run.stopBlocked || slot?.entryId !== entryId) {
       throw new Error('Отправка генерации отменена: очередь больше не активна');
     }
     if (!slot.preparedForSubmit) {
@@ -2287,7 +2442,7 @@ async function submitPreparedSlot(operationId, slotId, entryId, tabId) {
     await waitForRateLimitClear(operationId);
     const beforeSend = await getStored();
     const beforeSlot = beforeSend.run?.slots?.[slotId];
-    if (!beforeSend.run || beforeSend.run.operationId !== operationId || beforeSend.run.state !== 'RUNNING' || beforeSlot?.entryId !== entryId) {
+    if (!beforeSend.run || beforeSend.run.operationId !== operationId || beforeSend.run.state !== 'RUNNING' || beforeSend.run.clockStopped || beforeSend.run.stopBlocked || beforeSlot?.entryId !== entryId || beforeSlot.leaseId !== slot.leaseId) {
       throw new Error('Отправка генерации отменена: очередь больше не активна');
     }
     if (!beforeSlot.preparedForSubmit) throw new Error('Подготовленная вкладка потеряла состояние READY_TO_SEND');
@@ -2298,7 +2453,7 @@ async function submitPreparedSlot(operationId, slotId, entryId, tabId) {
     // shared gate the two clicks could collide.
     const physicalGateTask = physicalSendChain.then(async () => {
       const latest = await chrome.storage.local.get('run');
-      if (!latest.run || latest.run.operationId !== operationId || latest.run.state !== 'RUNNING') {
+      if (!latest.run || latest.run.operationId !== operationId || latest.run.state !== 'RUNNING' || latest.run.clockStopped || latest.run.stopBlocked) {
         throw new Error('Отправка генерации отменена у физического Send-gate');
       }
       const previousAny = Math.max(
@@ -2321,7 +2476,7 @@ async function submitPreparedSlot(operationId, slotId, entryId, tabId) {
     await withStateLock(async () => {
       const latest = await getStored();
       const latestSlot = latest.run?.slots?.[slotId];
-      if (!latest.run || latest.run.operationId !== operationId || latest.run.state !== 'RUNNING' || latestSlot?.entryId !== entryId) {
+      if (!latest.run || latest.run.operationId !== operationId || latest.run.state !== 'RUNNING' || latest.run.clockStopped || latest.run.stopBlocked || latestSlot?.entryId !== entryId || latestSlot.leaseId !== slot.leaseId) {
         throw new Error('Отправка генерации отменена: очередь больше не активна');
       }
       latest.run.currentAction = `Нажимаю Send: ${entryDisplayName(groupEntries(latest.queue, latest.run.groupId).find((entry) => entry.sourceId === entryId), latestSlot)}`;
@@ -2346,7 +2501,8 @@ async function submitPreparedSlot(operationId, slotId, entryId, tabId) {
       type: 'SUBMIT_PAGE_RUN',
       operationId,
       slotId,
-      entryId
+      entryId,
+      leaseId: slot.leaseId
     }, TAB_MESSAGE_TIMEOUT_MS);
     const sendClickedAt = Number(submitted?.sendClickedAtMs || submitted?.submittedAtMs || Date.now());
     lastLaunchAt = Math.max(lastLaunchAt, sendClickedAt);
@@ -2356,13 +2512,16 @@ async function submitPreparedSlot(operationId, slotId, entryId, tabId) {
     await withStateLock(async () => {
       const latest = await getStored();
       const latestSlot = latest.run?.slots?.[slotId];
-      if (!latest.run || latest.run.operationId !== operationId || latestSlot?.entryId !== entryId) return;
+      if (!latest.run || latest.run.operationId !== operationId || latestSlot?.entryId !== entryId || latestSlot.leaseId !== slot.leaseId) return;
       // The global spacing clock is the physical Send click, not the later DOM
       // acknowledgement that ChatGPT created a user turn.
       latest.run.lastGenerationLaunchAt = Math.max(Number(latest.run.lastGenerationLaunchAt || 0), sendClickedAt);
       latest.run.lastAnySendAt = Math.max(Number(latest.run.lastAnySendAt || 0), sendClickedAt);
       latest.run.lastActivityAt = new Date(sendClickedAt).toISOString();
       latestSlot.lastSendClickedAt = new Date(sendClickedAt).toISOString();
+      latestSlot.physicalSendAtMs = sendClickedAt;
+      latestSlot.physicalSendLeaseId = slot.leaseId;
+      latestSlot.submissionObservationDeadlineAt ||= sendClickedAt + FINAL_CHECK_TIMEOUT_MS;
       // confirmSendAndMonitor runs in the page immediately after the physical
       // click. It can detect a rate-limit rejection and restore READY_TO_SEND
       // before this worker reaches its post-click write. Never stomp that
@@ -4205,14 +4364,21 @@ function slotGenerationSubmitted(slot) {
   if (!slot) return false;
   const status = String(slot.status || '').toUpperCase();
   const phase = String(slot.phase || '').toUpperCase();
-  // A reused slot may still carry the previous model's Send timestamp. A
-  // prepared draft with no click in its own lease has never been submitted.
-  if (slot.preparedForSubmit && !slot.generationSubmittedAt && !slot.downloadId
-    && !currentSlotSendClicked(slot) && status !== 'SENDING') return false;
+  if (slot.generationSubmittedAt || slot.downloadId || currentLeasePhysicalSend(slot)) return true;
+  const pageConfirmedCurrentLease = Boolean(slot.leaseId)
+    && String(slot.pageSubmissionLeaseId || '') === String(slot.leaseId);
+  if (pageConfirmedCurrentLease && slot.pageGenerationSubmitted === true) return true;
+  if (pageConfirmedCurrentLease && slot.pageGenerationSubmitted === false
+    && !slot.chatUrl
+    && Number(slot.assistantCount || 0) <= Number(slot.baselineAssistantCount || 0)) return false;
+  // A prepared draft can inherit stale presentation fields from older runs.
+  // Those UI phases are not proof of a physical Send click.
+  if (slot.preparedForSubmit === true && !currentSlotSendClicked(slot)) return false;
+
+  // Compatibility for older snapshots without page lease evidence: retain
+  // their observation status until a current page probe confirms it was unsent.
   return Boolean(
-    slot.generationSubmittedAt
-    || slot.finalCheckPending
-    || slot.downloadId
+    slot.finalCheckPending
     || ['SENDING', 'PROMPT_SENT', 'WAITING_ASSISTANT', 'WAITING_GENERATION', 'GENERATING', 'WAITING_IMAGE', 'REQUESTING_DOWNLOAD', 'DOWNLOADING', 'OBSERVING'].includes(status)
     || [SLOT_PHASES.SENDING, SLOT_PHASES.PROMPT_SENT, SLOT_PHASES.GENERATING, SLOT_PHASES.OBSERVING, SLOT_PHASES.IMAGE_FOUND, SLOT_PHASES.DOWNLOADING, SLOT_PHASES.VERIFYING_FILE].includes(phase)
   );
@@ -4299,8 +4465,8 @@ function hasObservationWork(run) {
     || Object.keys(run?.recoveryTabs || {}).length > 0
     || Object.values(run?.slots || {}).some((slot) => (
     slot.downloadId
-    || slot.finalCheckPending
-    || (slot.entryId && slot.tabId && slotGenerationSubmitted(slot))
+    || (slot.observationExpired !== true && slot.finalCheckPending)
+    || (slot.observationExpired !== true && slot.entryId && slot.tabId && slotGenerationSubmitted(slot))
   ));
 }
 
@@ -4470,30 +4636,93 @@ function slotSummaries(run, queue) {
     });
 }
 
+function shouldKeepAuditMonitor(run, queue) {
+  if (!run || conversationRecoveryIsBlocked(run)) return false;
+  if (['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)) return true;
+  return run.state === 'PAUSED'
+    && (hasObservationWork(run) || hasScheduledRunRetries(run, queue));
+}
+
+function reconcileAuditAlarm() {
+  if (!chrome.alarms || (!chrome.alarms.create && auditMonitorDesired)) return Promise.resolve();
+  if (auditAlarmReconcilePromise) return auditAlarmReconcilePromise;
+
+  let lastCheckedEpoch = auditMonitorEpoch;
+  const syncPromise = (async () => {
+    while (true) {
+      const epoch = auditMonitorEpoch;
+      const wanted = auditMonitorDesired;
+      try {
+        const existing = typeof chrome.alarms.get === 'function'
+          ? await chrome.alarms.get(AUDIT_ALARM_NAME)
+          : (auditAlarmKnownPresent ? { name: AUDIT_ALARM_NAME } : null);
+        auditAlarmKnownPresent = Boolean(existing);
+        if (epoch !== auditMonitorEpoch) continue;
+
+        if (wanted && !existing) {
+          await chrome.alarms.create(AUDIT_ALARM_NAME, { periodInMinutes: 0.5 });
+          auditAlarmKnownPresent = true;
+        } else if (!wanted && existing && chrome.alarms.clear) {
+          await chrome.alarms.clear(AUDIT_ALARM_NAME);
+          auditAlarmKnownPresent = false;
+        }
+      } catch {
+        if (epoch !== auditMonitorEpoch) continue;
+        lastCheckedEpoch = epoch;
+        return;
+      }
+
+      lastCheckedEpoch = epoch;
+      if (epoch === auditMonitorEpoch) return;
+    }
+  })();
+  auditAlarmReconcilePromise = syncPromise;
+  void syncPromise.finally(() => {
+    if (auditAlarmReconcilePromise !== syncPromise) return;
+    auditAlarmReconcilePromise = null;
+    if (lastCheckedEpoch !== auditMonitorEpoch) void reconcileAuditAlarm();
+  }).catch(() => {});
+  return syncPromise;
+}
+
 function startAuditMonitor() {
-  if (chrome.alarms?.create) {
-    Promise.resolve(chrome.alarms.create(AUDIT_ALARM_NAME, { periodInMinutes: 0.5 })).catch(() => {});
+  const newlyStarted = !auditMonitorDesired;
+  if (newlyStarted) {
+    auditMonitorDesired = true;
+    auditMonitorEpoch += 1;
   }
-  scheduleAudit(250);
+  const alarmSync = reconcileAuditAlarm();
+  // Publishing each probe must not replace the normal 5s cadence with a new
+  // 250ms timer. The in-flight audit schedules its own next interval.
+  if (newlyStarted || (!auditTimer && !auditInFlight)) scheduleAudit(250);
+  return alarmSync;
 }
 
 function stopAuditMonitor() {
+  if (auditMonitorDesired) {
+    auditMonitorDesired = false;
+    auditMonitorEpoch += 1;
+  }
+  auditTimerGeneration += 1;
   if (auditTimer) clearTimeout(auditTimer);
   auditTimer = null;
-  if (chrome.alarms?.clear) Promise.resolve(chrome.alarms.clear(AUDIT_ALARM_NAME)).catch(() => {});
+  return reconcileAuditAlarm();
 }
 
 function scheduleAudit(delay = AUDIT_INTERVAL_MS) {
+  if (!auditMonitorDesired) return;
+  const timerGeneration = ++auditTimerGeneration;
   if (auditTimer) clearTimeout(auditTimer);
   auditTimer = setTimeout(() => {
+    if (!auditMonitorDesired || timerGeneration !== auditTimerGeneration) return;
     auditTimer = null;
     auditActiveRun()
       .catch((error) => appendLog('Ошибка фоновой проверки генераций', { error: error.message }))
       .finally(async () => {
         const { run, queue } = await getStored().catch(() => ({ run: null, queue: null }));
-        if (run && !conversationRecoveryIsBlocked(run)
-          && (['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)
-            || (run.state === 'PAUSED' && (hasObservationWork(run) || hasScheduledRunRetries(run, queue))))) scheduleAudit();
+        if (timerGeneration !== auditTimerGeneration) return;
+        if (shouldKeepAuditMonitor(run, queue)) scheduleAudit();
+        else stopAuditMonitor();
       });
   }, delay);
 }
@@ -4504,7 +4733,7 @@ function shouldWakeSlot(slot, now = Date.now()) {
   return !Number.isFinite(lastFocusAt) || now - lastFocusAt >= FOCUS_AUDIT_INTERVAL_MS;
 }
 
-function phaseForProbeState(state, { finalCheckPending = false, generationSubmitted = false, downloadId = null } = {}) {
+function phaseForProbeState(state, { finalCheckPending = false, generationSubmitted = false, downloadId = null, preparedForSubmit = false } = {}) {
   const normalized = String(state || '').toUpperCase();
   if (normalized === 'READY') return SLOT_PHASES.IMAGE_FOUND;
   if (normalized === 'DOWNLOADING') return SLOT_PHASES.DOWNLOADING;
@@ -4517,6 +4746,15 @@ function phaseForProbeState(state, { finalCheckPending = false, generationSubmit
   if (normalized === 'CONVERSATION_LOAD_ERROR') return SLOT_PHASES.OBSERVING;
   if (normalized === 'ERROR') return finalCheckPending ? SLOT_PHASES.OBSERVING : SLOT_PHASES.NEEDS_ATTENTION;
   if (finalCheckPending) return SLOT_PHASES.OBSERVING;
+  // CHECK_GENERATION also runs while uploads or prompt preparation are in
+  // progress. A blank conversation naturally reports WAITING_ASSISTANT;
+  // that state cannot advance an unsent slot into GENERATING.
+  if (generationSubmitted === false && !downloadId) {
+    if (['WAITING_ASSISTANT', 'WAITING_GENERATION', 'WAITING_IMAGE'].includes(normalized)) {
+      return preparedForSubmit ? SLOT_PHASES.WAITING_LAUNCH : SLOT_PHASES.PREPARING;
+    }
+    if (normalized === 'GENERATING') return null;
+  }
   if (['WAITING_ASSISTANT', 'GENERATING', 'WAITING_GENERATION', 'WAITING_IMAGE'].includes(normalized)) {
     return SLOT_PHASES.GENERATING;
   }
@@ -4551,6 +4789,7 @@ async function wakeTabForAudit(operationId, candidate) {
 }
 
 function runSummary(run, queue) {
+  const elapsedMs = elapsedRunClock(run, Date.now());
   const entries = groupEntries(queue, run?.groupId);
   const plannedIds = Array.isArray(run?.plannedIds) ? run.plannedIds : entries.map((entry) => entry.sourceId);
   const planned = entries.filter((entry) => plannedIds.includes(entry.sourceId));
@@ -4588,6 +4827,11 @@ function runSummary(run, queue) {
     } : null,
     startedAt: run?.startedAt || null,
     finishedAt: run?.finishedAt || null,
+    clockVersion: Number(run?.clockVersion || 0) || null,
+    clockAccumulatedMs: run?.clockAccumulatedMs == null ? null : Math.max(0, Number(run.clockAccumulatedMs || 0)),
+    clockActiveSinceMs: run?.clockActiveSinceMs ?? null,
+    clockStopped: run?.clockStopped === true,
+    elapsedMs,
     automationWindowId: run?.automationWindowId || null,
     queueGroup: run?.groupId || null,
     filter,
@@ -4636,9 +4880,7 @@ async function publishRun(run, queue) {
     ...runSummary(run, queue),
     error: run.error?.message || null
   });
-  if (!conversationRecoveryIsBlocked(run)
-    && (['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)
-      || (run.state === 'PAUSED' && hasScheduledRunRetries(run, queue)))) startAuditMonitor();
+  if (shouldKeepAuditMonitor(run, queue)) startAuditMonitor();
   else stopAuditMonitor();
 }
 
@@ -4695,26 +4937,43 @@ async function ensureAutomationScripts(tabId) {
   return true;
 }
 
-async function reloadTabForRecovery(tabId, slotId, { force = false } = {}) {
+async function reloadTabForRecovery(tabId, slotId, {
+  force = false, leaseId = null, entryId = null, conversationUrl = null
+} = {}) {
   const beforeReload = await getStored();
   const automationWindowId = Number(beforeReload.run?.automationWindowId || 0);
-  await withStateLock(async () => {
+  const marked = await withStateLock(async () => {
     const stored = await getStored();
     const slot = stored.run?.slots?.[slotId];
-    if (!stored.run || slot?.tabId !== tabId) return;
+    if (!stored.run || slot?.tabId !== tabId
+      || (entryId && slot.entryId !== entryId)
+      || (leaseId && String(slot.leaseId || '') !== String(leaseId))) return false;
     slot.status = 'RECOVERING';
     slot.lastActivityAt = new Date().toISOString();
     stored.run.currentAction = `Переподключаю вкладку ${Number(slotId) + 1}`;
     stored.run.lastActivityAt = new Date().toISOString();
     await saveRunAndQueue(stored.run, stored.queue);
     await publishRun(stored.run, stored.queue);
+    return true;
   });
+  if (!marked) return { skipped: true, staleLease: true };
   // Content scripts from the previous unpacked-extension version stay alive
   // in already-open tabs. A real reload injects the current script again and
   // also restores the chat from ChatGPT's conversation URL.
   const tab = await chrome.tabs.get(tabId);
   if (automationWindowId && Number(tab.windowId) !== automationWindowId) {
     throw new Error('Рабочая вкладка находится вне окна автоматизации');
+  }
+  const safeConversationUrl = normalizeChatConversationUrl(conversationUrl);
+  if (safeConversationUrl && normalizeChatConversationUrl(tab.url || tab.pendingUrl) !== safeConversationUrl) {
+    const latest = await getStored();
+    const liveSlot = latest.run?.slots?.[slotId];
+    if (latest.run?.operationId !== beforeReload.run?.operationId
+      || liveSlot?.tabId !== tabId
+      || (leaseId && String(liveSlot.leaseId || '') !== String(leaseId))) return { skipped: true, staleLease: true };
+    await chrome.tabs.update(tabId, { url: safeConversationUrl });
+    await waitTabReady(tabId, 60000);
+    return { reloaded: true, navigatedToConversation: true };
   }
   if (!/^https:\/\/chatgpt\.com\//i.test(tab.url || '')) throw new Error('Рабочая вкладка больше не ведёт в ChatGPT');
   const slotContext = beforeReload.run?.slots?.[slotId];
@@ -4728,8 +4987,14 @@ async function reloadTabForRecovery(tabId, slotId, { force = false } = {}) {
   // scripts left behind by an unpacked-extension update.
   const ping = await sendTabMessage(tabId, { type: 'PING' }, 5000).catch(() => null);
   if (ping?.ok && !force) return;
+  const latest = await getStored();
+  const liveSlot = latest.run?.slots?.[slotId];
+  if (latest.run?.operationId !== beforeReload.run?.operationId
+    || liveSlot?.tabId !== tabId
+    || (leaseId && String(liveSlot.leaseId || '') !== String(leaseId))) return { skipped: true, staleLease: true };
   await chrome.tabs.reload(tabId);
   await waitTabReady(tabId, 60000);
+  return { reloaded: true };
 }
 
 function base64FromArrayBuffer(buffer) {
@@ -5097,6 +5362,7 @@ async function sendToTab(tabId, message, timeout = TAB_MESSAGE_TIMEOUT_MS) {
 }
 
 async function saveRunAndQueue(run, queue, history = undefined, generationMemory = undefined) {
+  if (run) syncRunClock(run, Date.now());
   for (const groupId of QUEUE_GROUP_IDS) {
     for (const entry of queue?.groups?.[groupId] || []) {
       const variantId = String(entry.inputSourceId || entry.sourceVariantId || '');
@@ -5852,6 +6118,69 @@ async function beginStalledBatchRecovery(operationId, candidate) {
   }
 }
 
+function isLegacyObservationWithoutSendEvidence(slot) {
+  if (!slot?.entryId || !slot?.tabId || !slot?.leaseId || slot.downloadId) return false;
+  const state = String(slot.status || slot.phase || '').toUpperCase();
+  return (slot.finalCheckPending === true
+      || ['OBSERVING', 'GENERATING', 'WAITING_GENERATION', 'WAITING_ASSISTANT'].includes(state))
+    && !slot.generationSubmittedAt
+    && !currentLeasePhysicalSend(slot)
+    && !slot.chatUrl
+    && Number(slot.assistantCount || 0) === 0;
+}
+
+function isLegacyObservationSlot(slot) {
+  const status = String(slot?.status || slot?.phase || '').toUpperCase();
+  return Boolean(slot?.entryId && slot?.tabId && !slot.downloadId
+    && (slot.finalCheckPending === true
+      || ['OBSERVING', 'GENERATING', 'WAITING_GENERATION', 'WAITING_ASSISTANT'].includes(status)));
+}
+
+function markObservationNeedsManualAttention(run, queue, generationMemory, slot, reason, now = Date.now()) {
+  const entry = groupEntries(queue, run?.groupId).find((item) => item.sourceId === slot?.entryId);
+  if (!run || !slot?.entryId || slot.downloadId || entry?.status === 'done') return false;
+  const message = `${reason || 'Результат не удалось проверить автоматически'}. Чат и попытка сохранены; автоматическая повторная отправка отключена. Открой чат и продолжи после ручной проверки.`;
+  slot.observationExpired = true;
+  slot.finalCheckPending = false;
+  slot.finalCheckDeadlineAt = null;
+  slot.status = 'PAUSED';
+  slot.phase = SLOT_PHASES.NEEDS_ATTENTION;
+  slot.lastResult = 'NEEDS_ATTENTION';
+  slot.lastCheckState = 'NEEDS_ATTENTION';
+  slot.lastCheckError = message;
+  slot.nextRetryAt = null;
+  slot.failed = true;
+  if (entry) {
+    entry.status = 'error';
+    entry.autoRetryPending = false;
+    entry.nextRetryAt = null;
+    entry.lastError = message;
+    entry.errorClass = AUTOMATION_ERROR_CLASSES.TIMEOUT;
+    setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.RUNNING, {
+      statusSource: 'automatic',
+      generationStartedAt: slot.generationSubmittedAt || slot.lastSendClickedAt || new Date(now).toISOString(),
+      lastError: message,
+      lastRunId: run.operationId,
+      retryCount: Number(entry.retryCount || 0),
+      errorClass: AUTOMATION_ERROR_CLASSES.TIMEOUT,
+      nextRetryAt: null
+    });
+  }
+  run.pendingIds = (Array.isArray(run.pendingIds) ? run.pendingIds : []).filter((id) => id !== slot.entryId);
+  run.unresolvedError = true;
+  run.error = { message };
+  run.currentAction = `Ручная проверка нужна: ${entryDisplayName(entry, slot)}. Чат и результат сохранены.`;
+  recordRunEvent(run, 'submitted_observation_needs_attention', {
+    slotId: Number(slot.slotId),
+    entryId: slot.entryId,
+    generationId: slot.generationId || null,
+    chatUrl: slot.chatUrl || null,
+    reason: String(reason || 'observation_timeout').slice(0, 300),
+    autoResend: false
+  });
+  return true;
+}
+
 function auditActiveRun() {
   if (auditInFlight) return auditInFlight;
   auditInFlight = (async () => {
@@ -5871,7 +6200,14 @@ function auditActiveRun() {
       void appendLog('Ошибка внешней проверки постпроцесса', { error: error?.message || String(error) });
     });
 
-    const candidates = Object.values(run.slots || {}).filter(canAuditSlot);
+    const candidates = Object.values(run.slots || {}).filter((slot) => (
+      canAuditSlot(slot)
+      || (['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)
+        && slot?.entryId && slot?.tabId && slot?.leaseId
+        && !slot.downloadId && !slotGenerationSubmitted(slot)
+        && isStalledUnsubmittedPreparation(slot, Date.now(), PREPARATION_STALL_AFTER_MS))
+      || (run.state === 'PAUSED' && isLegacyObservationWithoutSendEvidence(slot))
+    ));
 
     if (!candidates.length) {
       await withStateLock(async () => {
@@ -5915,6 +6251,8 @@ function auditActiveRun() {
     // disconnected or modal-blocked page from delaying the other results.
     const results = await Promise.all(candidates.map(async (slot) => {
       try {
+        const submittedAtMs = Date.parse(slot.generationSubmittedAt || slot.lastSendClickedAt || '')
+          || Number(slot.physicalSendAtMs || 0);
         const response = await sendTabMessage(slot.tabId, {
           type: 'CHECK_GENERATION',
           operationId: run.operationId,
@@ -5924,9 +6262,14 @@ function auditActiveRun() {
           generationId: slot.generationId || null,
           outputFileName: slot.outputFileName || slot.lastEntryName || null,
           modelName: slot.lastModelName || null,
-          submittedAtMs: Date.parse(slot.generationSubmittedAt || '') || 0,
+          submittedAtMs,
           baselineAssistantCount: Number(slot.baselineAssistantCount || 0),
-          recover: Boolean(slot.generationSubmittedAt && slot.generationId && slot.leaseId)
+          chatUrl: slot.chatUrl || null,
+          recover: Boolean(slotGenerationSubmitted(slot) && slot.generationId && slot.leaseId && submittedAtMs > 0),
+          recoverUnsubmitted: isLegacyObservationWithoutSendEvidence(slot),
+          recoverObservationOnly: isLegacyObservationSlot(slot)
+            && !isLegacyObservationWithoutSendEvidence(slot)
+            && !slot.generationSubmittedAt && !slot.lastSendClickedAt && !(Number(slot.physicalSendAtMs || 0) > 0)
         }, SLOT_PROBE_TIMEOUT_MS);
         return { slot, response, error: null };
       } catch (error) {
@@ -5936,9 +6279,11 @@ function auditActiveRun() {
 
     const pauseRequests = [];
     const rateLimitRequests = [];
-    const expiredObservationTabs = [];
     const conversationLoadFailures = [];
     const transportRefreshes = [];
+    const safeUnsubmittedRepairs = [];
+    const stalledPreparationEntryIds = new Set();
+    const expiredAttentionSlotIds = [];
     let meaningfulProgress = false;
     let globalNoProgress = false;
     await withStateLock(async () => {
@@ -5949,7 +6294,9 @@ function auditActiveRun() {
       const checkedAt = new Date().toISOString();
       for (const result of results) {
         const slot = current.run.slots?.[result.slot.slotId];
-        if (!slot || slot.entryId !== result.slot.entryId) continue;
+        if (!slot || slot.entryId !== result.slot.entryId || slot.leaseId !== result.slot.leaseId) continue;
+        if (result.response?.ok && result.response.value?.leaseId
+          && String(result.response.value.leaseId) !== String(slot.leaseId || '')) continue;
         if (slot.downloadId || ['DONE', 'STOPPED'].includes(slot.status)) continue;
         if (slot.status === 'PAUSED' && !slot.finalCheckPending) continue;
         slot.lastCheckAt = checkedAt;
@@ -5957,9 +6304,59 @@ function auditActiveRun() {
         slot.lastHeartbeatAt = checkedAt;
         if (result.response?.ok) {
           const value = result.response.value || {};
+          const hadAssistantEvidence = Number(slot.assistantCount || 0) > Number(slot.baselineAssistantCount || 0);
+          const hasCurrentLeaseProbe = Boolean(value.leaseId)
+            && String(value.leaseId) === String(slot.leaseId || '');
+          if (!hasCurrentLeaseProbe && isLegacyObservationSlot(slot)) {
+            slot.lastCheckState = 'NO_CURRENT_LEASE';
+            slot.lastCheckError = 'Ожидаю проверку страницы с текущей арендой слота';
+            slot.legacyObservationStartedAt ||= checkedAt;
+            const legacyDeadline = Number(slot.legacyObservationDeadlineAt || 0)
+              || (Date.parse(slot.generationSubmittedAt || slot.lastSendClickedAt || '')
+                || Number(slot.physicalSendAtMs || 0)
+                || Date.parse(slot.legacyObservationStartedAt)) + FINAL_CHECK_TIMEOUT_MS;
+            slot.legacyObservationDeadlineAt = legacyDeadline;
+            const hasUnsentEvidence = isLegacyObservationWithoutSendEvidence(slot);
+            const progressAt = Date.parse(slot.lastProgressAt || slot.generationSubmittedAt || slot.lastSendClickedAt
+              || slot.legacyObservationStartedAt || '') || Date.now();
+            const refreshDue = hasUnsentEvidence || Date.now() - progressAt >= SUBMITTED_STALL_REFRESH_AFTER_MS;
+            if (refreshDue && String(slot.legacyProbeRefreshLeaseId || '') !== String(slot.leaseId)) {
+              slot.legacyProbeRefreshLeaseId = String(slot.leaseId);
+              slot.legacyProbeRefreshAt = checkedAt;
+              transportRefreshes.push({
+                slotId: slot.slotId, entryId: slot.entryId, tabId: slot.tabId,
+                leaseId: slot.leaseId, chatUrl: slot.chatUrl || null,
+                reason: hasUnsentEvidence ? 'legacy-unsubmitted-probe' : 'legacy-observation-probe'
+              });
+            }
+            if (Date.now() >= legacyDeadline && markObservationNeedsManualAttention(
+              current.run, current.queue, current.generationMemory, slot,
+              'Страница не вернула проверку с текущей арендой за 15 минут', Date.now()
+            )) expiredAttentionSlotIds.push(Number(slot.slotId));
+            continue;
+          }
           slot.noResponseSince = null;
           const reportedChatUrl = normalizeChatConversationUrl(value.chatUrl);
+          slot.pageProbeChatUrl = reportedChatUrl;
           if (reportedChatUrl) slot.chatUrl = reportedChatUrl;
+          if (value.leaseId && String(value.leaseId) === String(slot.leaseId || '')
+            && typeof value.generationSubmitted === 'boolean') {
+            slot.pageSubmissionLeaseId = String(value.leaseId);
+            // Submission is monotonic within a lease. A transient/stale false
+            // report cannot erase a prior exact-lease acceptance.
+            if (value.generationSubmitted === true || slot.pageGenerationSubmitted !== true) {
+              slot.pageGenerationSubmitted = value.generationSubmitted;
+            }
+            slot.pageProbeAt = checkedAt;
+            slot.pageProbeAssistantCount = Number(value.assistantCount || 0);
+            slot.pageProbeChatUrl = reportedChatUrl;
+            if (Number(value.physicalSendAtMs || 0) > 0) {
+              slot.physicalSendAtMs = Number(value.physicalSendAtMs);
+              slot.physicalSendLeaseId = String(value.leaseId);
+              slot.lastSendClickedAt = new Date(slot.physicalSendAtMs).toISOString();
+              slot.submissionObservationDeadlineAt ||= slot.physicalSendAtMs + FINAL_CHECK_TIMEOUT_MS;
+            }
+          }
           const previousProbe = {
             state: slot.lastCheckState,
             assistantCount: Number(slot.assistantCount || 0),
@@ -5985,10 +6382,59 @@ function auditActiveRun() {
           slot.imageCandidate = currentProbe.imageCandidate;
           slot.imageCandidateSource = currentProbe.imageSource;
           slot.lastCheckState = value.state || 'UNKNOWN';
+          if (!hadAssistantEvidence && isLegacyObservationWithoutSendEvidence(slot)
+            && pageProbeConfirmsUnsubmitted(slot, {
+              ...value,
+              leaseId: value.leaseId,
+              generationSubmitted: value.generationSubmitted,
+              assistantCount: value.assistantCount,
+              chatUrl: reportedChatUrl,
+              physicalSendAtMs: value.physicalSendAtMs
+            })) {
+            const entry = groupEntries(current.queue, current.run.groupId)
+              .find((item) => item.sourceId === slot.entryId);
+            if (entry && entry.status !== 'done') {
+              entry.status = 'pending';
+              entry.autoRetryPending = false;
+              entry.lastError = null;
+              entry.errorClass = null;
+              entry.nextRetryAt = null;
+              setGenerationMemoryStatus(current.generationMemory, entry, GENERATION_MEMORY_STATUSES.NOT_READY, {
+                statusSource: 'automatic', generationStartedAt: null, lastError: null,
+                lastRunId: current.run.operationId
+              });
+              if (!(current.run.pendingIds || []).includes(entry.sourceId)) current.run.pendingIds.unshift(entry.sourceId);
+            }
+            safeUnsubmittedRepairs.push({
+              slotId: Number(slot.slotId), entryId: slot.entryId, tabId: slot.tabId,
+              leaseId: slot.leaseId, generationId: slot.generationId || null
+            });
+            recordRunEvent(current.run, 'legacy_unsubmitted_slot_repaired', {
+              slotId: Number(slot.slotId), entryId: slot.entryId,
+              leaseId: slot.leaseId, generationId: slot.generationId || null
+            });
+            slot.entryId = null;
+            slot.leaseId = null;
+            slot.tabId = null;
+            slot.status = 'IDLE';
+            slot.phase = SLOT_PHASES.IDLE;
+            slot.downloadId = null;
+            slot.finalCheckPending = false;
+            slot.finalCheckDeadlineAt = null;
+            slot.preparedForSubmit = false;
+            slot.failed = false;
+            Object.assign(slot, freshSlotRevisionFields());
+            current.run.currentAction = `Восстановлена неподанная модель: ${entryDisplayName(entry, slot)}`;
+            continue;
+          }
           const probePhase = phaseForProbeState(value.state, {
             finalCheckPending: slot.finalCheckPending,
-            generationSubmitted: Boolean(slot.generationSubmittedAt),
-            downloadId: slot.downloadId
+            generationSubmitted: typeof value.generationSubmitted === 'boolean'
+              && String(value.leaseId || '') === String(slot.leaseId || '')
+              ? value.generationSubmitted
+              : slotGenerationSubmitted(slot),
+            downloadId: slot.downloadId,
+            preparedForSubmit: slot.preparedForSubmit
           });
           if (probePhase) slot.phase = probePhase;
           if (value.error) slot.lastCheckError = value.error;
@@ -6006,6 +6452,17 @@ function auditActiveRun() {
             slot.phase = SLOT_PHASES.OBSERVING;
             slot.lastCheckError = value.error || 'Не удалось загрузить этот разговор ChatGPT';
             conversationLoadFailures.push({ slotId: slot.slotId, entryId: slot.entryId, error: slot.lastCheckError });
+          }
+          if (slotGenerationSubmitted(slot)
+            && slot.chatUrl
+            && shouldRefreshStalledGeneration(slot, Date.now(), SUBMITTED_STALL_REFRESH_AFTER_MS)
+            && !transportRefreshes.some((item) => Number(item.slotId) === Number(slot.slotId))) {
+            slot.autoRefreshGenerationId = slot.generationId;
+            slot.autoRefreshAt = checkedAt;
+            transportRefreshes.push({
+              slotId: slot.slotId, entryId: slot.entryId, tabId: slot.tabId,
+              leaseId: slot.leaseId, chatUrl: slot.chatUrl, reason: 'submitted-stall'
+            });
           }
           if (slot.finalCheckPending) {
             slot.status = 'OBSERVING';
@@ -6026,11 +6483,14 @@ function auditActiveRun() {
           slot.noResponseSince ||= checkedAt;
           slot.checkFailures = Number(slot.checkFailures || 0) + 1;
           if (slot.checkFailures >= 3) slot.phase = SLOT_PHASES.TAB_LOST;
-          if (shouldRefreshUnresponsiveGeneration(slot)) {
+          if (slot.chatUrl && shouldRefreshUnresponsiveGeneration(slot)) {
             slot.autoRefreshGenerationId = slot.generationId;
             slot.autoRefreshAt = checkedAt;
             slot.checkFailures = 0;
-            transportRefreshes.push({ slotId: slot.slotId, entryId: slot.entryId, tabId: slot.tabId });
+            transportRefreshes.push({
+              slotId: slot.slotId, entryId: slot.entryId, tabId: slot.tabId,
+              leaseId: slot.leaseId, chatUrl: slot.chatUrl, reason: 'unresponsive-transport'
+            });
           }
           if (slot.finalCheckPending) {
             slot.status = 'OBSERVING';
@@ -6051,25 +6511,20 @@ function auditActiveRun() {
         // either page-side download state to avoid expiring a successful
         // result during that short hand-off window.
         const downloadInProgress = ['READY', 'DOWNLOADING'].includes(resultState) || Boolean(slot.downloadId);
-        if (slot.finalCheckPending && deadlineAt > 0 && Date.now() >= deadlineAt && !slot.downloadId && !downloadInProgress) {
-          slot.finalCheckPending = false;
-          slot.status = 'PAUSED';
-          slot.lastResult = 'ERROR';
-          slot.lastCheckState = 'ERROR';
-          slot.lastCheckError = `${slot.lastCheckError || 'Результат не найден'}; окно наблюдения завершено`;
-          const expiredEntry = groupEntries(current.queue, current.run.groupId).find((entry) => entry.sourceId === slot.entryId);
-          if (expiredEntry) {
-            expiredEntry.status = 'pending';
-            setGenerationMemoryStatus(current.generationMemory, expiredEntry, GENERATION_MEMORY_STATUSES.NOT_READY, {
-              statusSource: 'automatic',
-              generationStartedAt: null,
-              lastError: slot.lastCheckError,
-              lastRunId: current.run.operationId,
-              retryCount: Number(expiredEntry.retryCount || 0)
-            });
-          }
-          expiredObservationTabs.push(slot.tabId);
+        if (!downloadInProgress && shouldExpireSubmittedObservation(slot, Date.now())) {
+          if (markObservationNeedsManualAttention(
+            current.run, current.queue, current.generationMemory, slot,
+            'После отправки прошло 15 минут без скачанного результата', Date.now()
+          )) expiredAttentionSlotIds.push(Number(slot.slotId));
         }
+        if (slot.finalCheckPending && deadlineAt > 0 && Date.now() >= deadlineAt && !slot.downloadId && !downloadInProgress) {
+          if (!slot.observationExpired && markObservationNeedsManualAttention(
+            current.run, current.queue, current.generationMemory, slot,
+            'Окно наблюдения завершено без найденного результата', Date.now()
+          )) expiredAttentionSlotIds.push(Number(slot.slotId));
+        }
+        if (isStalledUnsubmittedPreparation(slot, Date.now(), PREPARATION_STALL_AFTER_MS)
+          && !slotGenerationSubmitted(slot)) stalledPreparationEntryIds.add(String(slot.entryId));
       }
       current.run.lastCheckAt = checkedAt;
       if (meaningfulProgress) {
@@ -6096,25 +6551,50 @@ function auditActiveRun() {
           && Date.now() - lastProgress >= GLOBAL_NO_PROGRESS_WINDOW_MS
           && candidates.length > 0;
       }
-      if (expiredObservationTabs.length) {
-        current.run.currentAction = 'Окно наблюдения завершено для слотов без результата.';
+      if (expiredAttentionSlotIds.length) {
+        current.run.currentAction = 'Некоторые отправленные генерации требуют ручной проверки; автоматическая повторная отправка отключена.';
       }
       finalizeDrainingRun(current.run, current.queue);
       await saveRunAndQueue(current.run, current.queue, current.history, current.generationMemory);
       await publishRun(current.run, current.queue);
     });
 
-    await Promise.all([...new Set(expiredObservationTabs.filter(Boolean))].map((tabId) => (
-      sendTabMessage(tabId, { type: 'STOP' }).catch(() => null)
-    )));
+    await Promise.all(safeUnsubmittedRepairs.map(async (repair) => {
+      await sendTabMessage(repair.tabId, {
+        type: 'STOP', operationId: run.operationId, slotId: repair.slotId,
+        entryId: repair.entryId, leaseId: repair.leaseId
+      }).catch(() => null);
+      if (repair.generationId) {
+        await cancelUnsubmittedGenerationRevision(repair.generationId, repair.entryId,
+          'legacy_probe_confirmed_not_submitted').catch(() => {});
+      }
+      const latest = await getStored();
+      const stillOwned = Object.values(latest.run?.slots || {}).some((slot) => Number(slot.tabId) === Number(repair.tabId))
+        || latest.run?.postprocessTabs?.[repair.tabId] || latest.run?.recoveryTabs?.[repair.tabId];
+      if (latest.run?.operationId === run.operationId && !stillOwned) {
+        const oldTab = await chrome.tabs.get(repair.tabId).catch(() => null);
+        if (isAutomationChatTab(oldTab, latest.run.automationWindowId)
+          && !normalizeChatConversationUrl(oldTab.url || oldTab.pendingUrl)) {
+          await chrome.tabs.remove(repair.tabId).catch(() => {});
+        }
+      }
+      if (!['RUNNING', 'STARTING', 'DRAINING'].includes(latest.run?.state)
+        || latest.run?.operationId !== run.operationId) return;
+      const next = await claimNext(run.operationId, repair.slotId);
+      if (next) void executeSlot(run.operationId, next.slot.slotId, next.entry.sourceId);
+    }));
 
     await Promise.all(transportRefreshes.map(async (item) => {
       try {
-        await reloadTabForRecovery(item.tabId, item.slotId, { force: true });
-        await appendLog('Зависшая вкладка обновлена один раз; проверяю существующий разговор без повторной отправки', {
+        await reloadTabForRecovery(item.tabId, item.slotId, {
+          force: true, leaseId: item.leaseId, entryId: item.entryId,
+          conversationUrl: item.chatUrl || null
+        });
+        await appendLog('Вкладка обновлена один раз; проверяю текущую аренду без повторной отправки', {
           operationId: run.operationId,
           slotId: item.slotId,
-          entryId: item.entryId
+          entryId: item.entryId,
+          reason: item.reason || 'unresponsive-transport'
         });
       } catch (error) {
         await appendLog('Не удалось обновить неотвечающую вкладку', {
@@ -6151,6 +6631,11 @@ function auditActiveRun() {
       });
     }
 
+    if (stalledPreparationEntryIds.size) {
+      const recovery = await schedulePreparationStallRecovery(run.operationId, [...stalledPreparationEntryIds]);
+      if (recovery?.scheduled || recovery?.terminal || recovery?.skipped) return;
+    }
+
     const latest = await getStored();
     const stalledCandidate = findStalledBatchRecoveryCandidate(latest.run, Date.now());
     if (stalledCandidate) {
@@ -6181,7 +6666,7 @@ async function claimNext(runId, slotId) {
     const { run, queue, generationMemory: rawGenerationMemory, history: rawHistory } = await getStored();
     const generationMemory = normalizeGenerationMemory(rawGenerationMemory);
     const history = normalizeHistory(rawHistory);
-    if (!run || run.operationId !== runId || run.state !== 'RUNNING') return null;
+    if (!run || run.operationId !== runId || run.state !== 'RUNNING' || run.clockStopped || run.stopBlocked) return null;
     const oldSlot = run.slots?.[slotId] || { slotId, tabId: null };
     if (oldSlot.entryId && !['IDLE', 'DONE', 'PAUSED'].includes(oldSlot.status)) return null;
     const entryId = run.pendingIds.shift();
@@ -6280,6 +6765,7 @@ async function processDueScheduledRetries(expectedRunId = null) {
     const stored = await getStored();
     const { run, queue } = stored;
     if (!run || (expectedRunId && run.operationId !== expectedRunId)
+      || run.clockStopped || run.stopBlocked
       || ['STOPPED', 'DONE'].includes(String(run.state || '').toUpperCase())) return null;
     const entries = groupEntries(queue, run.groupId);
     run.pendingIds ||= [];
@@ -6331,7 +6817,7 @@ async function processDueScheduledRetries(expectedRunId = null) {
     }
 
     if (!run.pendingIds.length) return null;
-    if (run.state === 'PAUSED') {
+    if (run.state === 'PAUSED' || (run.state === 'RUNNING' && run.status === 'RETRY_BACKOFF')) {
       run.state = 'RUNNING';
       run.status = 'RUNNING';
       run.pauseReason = null;
@@ -6639,6 +7125,7 @@ async function createOrReuseTab(runId, slotId) {
 
 async function executeSlot(runId, slotId, entryId) {
   let tabId = null;
+  let ownerLeaseId = null;
   try {
     const stored = await getStored();
     const run = stored.run;
@@ -6646,6 +7133,8 @@ async function executeSlot(runId, slotId, entryId) {
     const job = stored.job;
     const entry = groupEntries(queue, run?.groupId).find((item) => item.sourceId === entryId);
     if (!run || run.operationId !== runId || !entry || !job) throw new Error('Данные запуска устарели');
+    ownerLeaseId = run.slots?.[slotId]?.leaseId;
+    if (!ownerLeaseId || run.slots[slotId].entryId !== entryId || run.clockStopped || run.stopBlocked) return;
 
     // PREPARE has no intentional delay. Tabs are preallocated in parallel;
     // page readiness, input transfer, upload and prompt filling proceed as
@@ -6653,6 +7142,8 @@ async function executeSlot(runId, slotId, entryId) {
     tabId = await createOrReuseTab(runId, slotId);
     const beforePrepare = await getStored();
     const currentSlot = beforePrepare.run?.slots?.[slotId];
+    if (beforePrepare.run?.operationId !== runId || beforePrepare.run.state !== 'RUNNING'
+      || currentSlot?.entryId !== entryId || currentSlot.leaseId !== ownerLeaseId) return;
     if (beforePrepare.run?.operationId === runId && currentSlot?.entryId === entryId && !currentSlot.rendererBootstrappedAt) {
       const bootstrap = await bootstrapAutomationTab(tabId, beforePrepare.run.automationWindowId, { slotId, entryId });
       await withStateLock(async () => {
@@ -6773,12 +7264,12 @@ async function executeSlot(runId, slotId, entryId) {
     }));
     const inputFiles = Object.fromEntries(inputPayloadEntries.map(([role, file]) => [role, file]));
     try {
-      await sendToTab(tabId, { type: 'CACHE_FILES', operationId: runId, files: inputFiles }, 60000);
+      await sendToTab(tabId, { type: 'CACHE_FILES', operationId: runId, entryId, leaseId: ownerLeaseId, files: inputFiles }, 60000);
     } catch (batchError) {
       // Compatibility fallback for a stale tab listener. Still transfer the
       // files concurrently rather than serially role-by-role.
       await Promise.all(inputPayloadEntries.map(([role, file]) => (
-        sendToTab(tabId, { type: 'CACHE_FILE', operationId: runId, key: role, file }, 60000)
+        sendToTab(tabId, { type: 'CACHE_FILE', operationId: runId, entryId, leaseId: ownerLeaseId, key: role, file }, 60000)
       )));
     }
     await appendLog('Входные изображения переданы во вкладку', {
@@ -6795,12 +7286,13 @@ async function executeSlot(runId, slotId, entryId) {
       type: 'PREPARE_PAGE_CONTENT',
       operationId: runId,
       slotId,
-      entryId
+      entryId,
+      leaseId: ownerLeaseId
     }, PREPARE_PAGE_TIMEOUT_MS);
     await withStateLock(async () => {
       const current = await getStored();
       const slot = current.run?.slots?.[slotId];
-      if (!current.run || current.run.operationId !== runId || slot?.entryId !== entryId) return;
+      if (!current.run || current.run.operationId !== runId || slot?.entryId !== entryId || slot.leaseId !== ownerLeaseId || slot.tabId !== tabId) return;
       const rateLimitActive = Number(current.run.rateLimitPauseUntil || 0) > Date.now();
       slot.status = 'READY_TO_SEND';
       slot.phase = rateLimitActive ? SLOT_PHASES.RATE_LIMIT_PAUSE : SLOT_PHASES.WAITING_LAUNCH;
@@ -6826,20 +7318,14 @@ async function executeSlot(runId, slotId, entryId) {
   } catch (error) {
     const latest = await getStored().catch(() => ({ run: null }));
     const currentSlot = latest.run?.slots?.[slotId];
-    if (!latest.run || latest.run.operationId !== runId || !['RUNNING', 'DRAINING'].includes(latest.run.state) || currentSlot?.entryId !== entryId) return;
+    if (!latest.run || latest.run.operationId !== runId || !['RUNNING', 'DRAINING'].includes(latest.run.state) || currentSlot?.entryId !== entryId || currentSlot.leaseId !== ownerLeaseId || currentSlot.tabId !== tabId) return;
     const phase = currentSlot?.phase || currentSlot?.status;
     await pauseRunOnError(runId, error, {
       slotId,
       entryId,
       tabId,
-      generationSubmitted: Boolean(currentSlot?.generationSubmittedAt || [
-        SLOT_PHASES.PROMPT_SENT,
-        SLOT_PHASES.GENERATING,
-        SLOT_PHASES.OBSERVING,
-        SLOT_PHASES.IMAGE_FOUND,
-        SLOT_PHASES.DOWNLOADING,
-        SLOT_PHASES.VERIFYING_FILE
-      ].includes(phase)),
+      leaseId: ownerLeaseId,
+      generationSubmitted: slotGenerationSubmitted(currentSlot),
       errorClass: classifyAutomationError(error, { phase })
     });
   }
@@ -7290,19 +7776,23 @@ async function startRun(options = {}) {
   return { operationId: assignments.runId };
 }
 
-async function pauseRun(reason = 'USER') {
+async function pauseRun(reason = 'USER', expectedRunId = null) {
   const result = await withStateLock(async () => {
     const stored = await getStored();
     const { run, queue } = stored;
     const history = normalizeHistory(stored.history);
     const generationMemory = normalizeGenerationMemory(stored.generationMemory);
-    if (!run) return { runId: null, cancelTabIds: [], cancelRevisions: [], observing: false };
+    if (!run || (expectedRunId && run.operationId !== expectedRunId)) return { runId: null, cancelTabIds: [], cancelRevisions: [], observing: false };
 
     const stateBeforePause = run.state;
     const requestedPauseReason = String(reason || 'USER').toUpperCase();
     const pauseReason = ['ERROR', 'RESTART', 'IMAGE_LIMIT'].includes(requestedPauseReason)
       ? requestedPauseReason
       : 'USER';
+    if (pauseReason === 'USER' && run.stalledBatchRecovery?.kind === 'PREPARATION_STALL') {
+      run.stalledBatchRecovery.stage = 'MANUAL_PAUSE';
+      run.stalledBatchRecovery.dueAt = null;
+    }
     recordRunEvent(run, 'run_pause_requested', {
       requestedReason: requestedPauseReason,
       stateBefore: stateBeforePause,
@@ -7445,6 +7935,11 @@ async function stopRun() {
   const snapshot = await withStateLock(async () => {
     const stored = await getStored();
     if (stored.run) {
+      stopRunClock(stored.run, Date.now());
+      if (stored.run.stalledBatchRecovery?.kind === 'PREPARATION_STALL') {
+        stored.run.stalledBatchRecovery.stage = 'MANUAL_PAUSE';
+        stored.run.stalledBatchRecovery.dueAt = null;
+      }
       recordRunEvent(stored.run, 'run_stop_requested', {
         stateBefore: stored.run.state,
         submittedUnfinishedCount: Object.values(stored.run.slots || {}).filter((slot) => (
@@ -7505,12 +8000,21 @@ async function stopRun() {
     salvageReady: true,
     preserveLogs: true
   });
+  const stoppedAt = Date.now();
+  const stoppedElapsedMs = run ? elapsedRunClock(run, stoppedAt) : null;
   await updateRuntime({
     operationId: null,
     state: 'STOPPED',
     status: 'STOPPED',
     startedAt: run?.startedAt || null,
-    finishedAt: new Date().toISOString(),
+    finishedAt: new Date(stoppedAt).toISOString(),
+    ...(run ? {
+      clockVersion: Number(run.clockVersion || 1),
+      clockAccumulatedMs: Math.max(0, Number(run.clockAccumulatedMs || 0)),
+      clockActiveSinceMs: null,
+      clockStopped: true,
+      elapsedMs: stoppedElapsedMs
+    } : {}),
     runTotal,
     runCompleted,
     runRemaining: Math.max(0, runTotal - runCompleted),
@@ -8276,7 +8780,20 @@ async function clearGenerationHistory() {
   });
 }
 
+function errorContextMatchesSlot(run, context = {}) {
+  if (context.slotId == null && !context.entryId && !context.tabId) return true;
+  const slot = context.slotId == null
+    ? Object.values(run?.slots || {}).find((item) => item.entryId === context.entryId)
+    : run?.slots?.[context.slotId];
+  return Boolean(slot?.entryId)
+    && (!context.entryId || slot.entryId === context.entryId)
+    && (!context.tabId || Number(slot.tabId) === Number(context.tabId))
+    && (!context.leaseId || slot.leaseId === context.leaseId);
+}
+
 async function pauseRunOnError(runId, error, context = {}) {
+  const owner = (await getStored()).run;
+  if (!owner || owner.operationId !== runId || !errorContextMatchesSlot(owner, context)) return;
   const rateLimitFailure = context.rateLimit === true
     || context.errorClass === AUTOMATION_ERROR_CLASSES.RATE_LIMIT
     || classifyAutomationError(error, context) === AUTOMATION_ERROR_CLASSES.RATE_LIMIT;
@@ -8444,7 +8961,8 @@ async function pauseRunOnError(runId, error, context = {}) {
     const { run, queue } = stored;
     const history = normalizeHistory(stored.history);
     const generationMemory = normalizeGenerationMemory(stored.generationMemory);
-    if (!run || run.operationId !== runId || ['STOPPED', 'DONE'].includes(run.state)) return { tabIds: [] };
+    if (!run || run.operationId !== runId || ['STOPPED', 'DONE'].includes(run.state)
+      || !errorContextMatchesSlot(run, context)) return { tabIds: [] };
     const failure = {
       message: error?.message || String(error),
       at: new Date().toISOString(),
@@ -8703,7 +9221,7 @@ async function pauseRunOnError(runId, error, context = {}) {
     } catch (_) {}
   }));
   if (result.pauseRunForAttachmentStorm) {
-    await pauseRun('ERROR');
+    await schedulePreparationStallRecovery(runId, [context.entryId].filter(Boolean));
     return;
   }
   if (result.closeUnsubmittedTabId) {
@@ -8828,7 +9346,10 @@ async function recoverVisibleResults(run, { forceReload = false } = {}) {
 
 async function resumeRun(options = {}) {
   await assertManualExtensionUpdateNotApplying();
-  if (options?.conversationRecoveryInternal !== true && options?.stalledBatchRecoveryInternal !== true) {
+  const internalRecoveryResume = options?.conversationRecoveryInternal === true
+    || options?.stalledBatchRecoveryInternal === true
+    || options?.preparationStallRecoveryInternal === true;
+  if (!internalRecoveryResume) {
     await waitForStartupReconciliation();
   }
   const preferredWindowId = Number(options?.preferredWindowId || 0);
@@ -8848,20 +9369,27 @@ async function resumeRun(options = {}) {
       recordRunEvent(stored.run, 'run_resume_requested', {
         stateBefore: stored.run.state,
         source: options?.conversationRecoveryInternal === true ? 'conversation_recovery'
-          : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery' : 'user_or_ui'
+          : options?.preparationStallRecoveryInternal === true ? 'preparation_stall_recovery'
+            : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery' : 'user_or_ui'
       });
       await saveRunAndQueue(stored.run, stored.queue);
     }
     return stored;
   });
   if (!current.run || !['PAUSED', 'STOPPED'].includes(current.run.state)) throw new Error('Нет запуска, который можно продолжить');
+  if (internalRecoveryResume && (current.run.clockStopped || current.run.stopBlocked
+    || ['USER', 'RESTART'].includes(current.run.pauseReason))) {
+    throw new Error('Автопродолжение отменено пользователем');
+  }
   const stalledBatchStage = String(current.run.stalledBatchRecovery?.stage || '').toUpperCase();
-  if (['CLOSING', 'WAITING'].includes(stalledBatchStage)) {
+  const internalStalledBatchResume = options?.stalledBatchRecoveryInternal === true
+    || options?.preparationStallRecoveryInternal === true;
+  if (['CLOSING', 'WAITING'].includes(stalledBatchStage) && !internalStalledBatchResume) {
     recordRunEvent(current.run, 'run_resume_blocked', { reason: 'stalled_batch_recovery_in_progress', recoveryStage: stalledBatchStage });
     await saveRunAndQueue(current.run, current.queue);
     throw new Error('Автовосстановление набора уже выполняется. Дождись окончания пятиминутной паузы.');
   }
-  if (stalledBatchStage === 'RESTARTING' && options?.stalledBatchRecoveryInternal !== true) {
+  if (stalledBatchStage === 'RESTARTING' && !internalStalledBatchResume) {
     recordRunEvent(current.run, 'run_resume_blocked', { reason: 'stalled_batch_restart_in_progress', recoveryStage: stalledBatchStage });
     await saveRunAndQueue(current.run, current.queue);
     throw new Error('Идёт автоматический перезапуск очереди. Дождись его завершения.');
@@ -8924,6 +9452,15 @@ async function resumeRun(options = {}) {
       queue = { ...(queue || {}), groups: queueGroupsFromCatalog(persistedCatalog, queue?.groups || {}) };
     }
     if (!run || !['PAUSED', 'STOPPED'].includes(run.state)) throw new Error('Нет запуска, который можно продолжить');
+    syncRunClock(run, Date.now());
+    const clockStopLatched = run.clockStopped === true || Boolean(run.stopBlocked);
+    if (internalRecoveryResume && (clockStopLatched || ['USER', 'RESTART'].includes(run.pauseReason))) {
+      throw new Error('Автопродолжение отменено пользователем');
+    }
+    if (!internalRecoveryResume) {
+      run.preparationRecoveryAttempts = 0;
+      run.attachmentFailureBaselineAt = new Date().toISOString();
+    }
     ({ queue, history, memory: generationMemory } = syncQueueWithHistory(
       queue,
       history,
@@ -9045,7 +9582,7 @@ async function resumeRun(options = {}) {
     run.pauseReason = null;
     run.error = null;
     run.unresolvedError = false;
-    run.stopBlocked = null;
+    if (!internalRecoveryResume || !clockStopLatched) run.stopBlocked = null;
     if (String(run.conversationRecovery?.stage || '').toUpperCase() === 'FAILED') {
       run.conversationRecovery.stage = 'MANUAL_RESUME';
       run.conversationRecovery.manualResumeAt = new Date().toISOString();
@@ -9059,7 +9596,8 @@ async function resumeRun(options = {}) {
     run.lastActivityAt = new Date().toISOString();
     recordRunEvent(run, 'run_resumed', {
       source: options?.conversationRecoveryInternal === true ? 'conversation_recovery'
-        : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery' : 'user_or_ui',
+        : options?.preparationStallRecoveryInternal === true ? 'preparation_stall_recovery'
+          : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery' : 'user_or_ui',
       pendingCount: run.pendingIds.length,
       activeObservedSlots: Object.values(run.slots || {}).filter((slot) => slot.entryId && slotGenerationSubmitted(slot)).length,
       rateLimitPausePreserved: recoveredRateLimit || preservedRateLimitUntil > Date.now()
@@ -9079,6 +9617,13 @@ async function resumeRun(options = {}) {
       run.rateLimitPauseUntil = null;
       run.rateLimitPauseStartedAt = null;
       run.rateLimitReason = null;
+    }
+    if (!internalRecoveryResume || !clockStopLatched) {
+      resumeRunClock(run, Date.now());
+    } else {
+      run.clockVersion = 1;
+      run.clockStopped = true;
+      run.clockActiveSinceMs = null;
     }
     const assignments = [];
     const workerCount = normalizeWorkerCount(run.workerCount, DEFAULT_WORKERS);
@@ -10905,11 +11450,19 @@ async function storeDiagnostics(diagnostic) {
 
 async function handleStateEvent(message, sender) {
   const patch = message.patch || {};
+  const initialRun = (await chrome.storage.local.get('run')).run;
+  const initialSlot = initialRun?.operationId === message.operationId
+    ? initialRun.slots?.[message.slotId]
+    : null;
+  if (!initialSlot || initialSlot.entryId !== message.entryId
+    || !message.leaseId || String(initialSlot.leaseId || '') !== String(message.leaseId)
+    || (sender?.tab?.id != null && Number(initialSlot.tabId || 0) !== Number(sender.tab.id))) return;
   if (patch.state === 'CONVERSATION_LOAD_ERROR'
     || String(patch.errorClass || '').toUpperCase() === AUTOMATION_ERROR_CLASSES.CONVERSATION_LOAD_ERROR) {
     await beginConversationLoadRecovery(message.operationId, {
       slotId: message.slotId,
       entryId: message.entryId,
+      leaseId: message.leaseId,
       error: patch.error || 'Не удалось загрузить этот разговор ChatGPT'
     });
     return;
@@ -10919,6 +11472,8 @@ async function handleStateEvent(message, sender) {
       slotId: message.slotId,
       entryId: message.entryId,
       tabId: sender?.tab?.id || null,
+      leaseId: message.leaseId,
+      physicalSendAtMs: Number(patch.physicalSendAtMs || message.physicalSendAtMs || 0),
       rateLimit: patch.rateLimit === true,
       rateLimitBeforeAssistant: patch.rateLimitBeforeAssistant === true,
       generationSubmitted: patch.generationSubmitted === true,
@@ -10940,13 +11495,27 @@ async function handleStateEvent(message, sender) {
   await withStateLock(async () => {
     const { run } = await chrome.storage.local.get('run');
     if (!run || run.operationId !== message.operationId) return;
-    const slot = run.slots?.[message.slotId];
-    if (!slot || slot.entryId !== message.entryId) return;
+      const slot = run.slots?.[message.slotId];
+    if (!slot || slot.entryId !== message.entryId || String(slot.leaseId || '') !== String(message.leaseId || '')
+      || (sender?.tab?.id != null && Number(slot.tabId || 0) !== Number(sender.tab.id))) return;
 
     const pageState = String(patch.state || '').toUpperCase();
     slot.status = patch.state || slot.status;
     const now = new Date().toISOString();
     slot.lastHeartbeatAt = now;
+    const sameLeaseAlreadySubmitted = String(slot.pageSubmissionLeaseId || '') === String(message.leaseId)
+      && slot.pageGenerationSubmitted === true;
+    slot.pageSubmissionLeaseId = String(message.leaseId);
+    slot.pageGenerationSubmitted = patch.generationSubmitted === true || sameLeaseAlreadySubmitted;
+    slot.pageProbeAt = now;
+    if (Number.isFinite(Number(patch.assistantCount))) slot.pageProbeAssistantCount = Number(patch.assistantCount);
+    if (Number(message.physicalSendAtMs || patch.physicalSendAtMs || 0) > 0) {
+      const physicalSendAtMs = Number(message.physicalSendAtMs || patch.physicalSendAtMs);
+      slot.physicalSendAtMs = physicalSendAtMs;
+      slot.physicalSendLeaseId = String(message.leaseId);
+      slot.lastSendClickedAt = new Date(physicalSendAtMs).toISOString();
+      slot.submissionObservationDeadlineAt ||= physicalSendAtMs + FINAL_CHECK_TIMEOUT_MS;
+    }
     if (patch.phase) slot.phase = patch.phase;
     const reportedChatUrl = normalizeChatConversationUrl(message.chatUrl || sender?.tab?.url);
     if (reportedChatUrl) slot.chatUrl = reportedChatUrl;
@@ -10977,8 +11546,9 @@ async function handleStateEvent(message, sender) {
     if (pageState === 'PROMPT_SENT') slot.preparedForSubmit = false;
     const submittedNow = patch.generationSubmitted === true || pageState === 'PROMPT_SENT';
     if (submittedNow) {
-      const submittedAtMs = Number(patch.submittedAtMs || Date.now());
+      const submittedAtMs = Number(patch.submittedAtMs || patch.physicalSendAtMs || message.physicalSendAtMs || Date.now());
       if (!slot.generationSubmittedAt) slot.generationSubmittedAt = new Date(submittedAtMs).toISOString();
+      slot.submissionObservationDeadlineAt ||= submittedAtMs + FINAL_CHECK_TIMEOUT_MS;
       if (Number.isFinite(Number(patch.baselineAssistantCount))) {
         slot.baselineAssistantCount = Number(patch.baselineAssistantCount);
       }

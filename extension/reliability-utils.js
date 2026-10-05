@@ -45,6 +45,11 @@ export const CONVERSATION_LOAD_RECOVERY_DELAY_MS = 2 * 60 * 1000;
 export const GENERATION_TRANSPORT_REFRESH_AFTER_MS = 4 * 60 * 1000;
 export const STALLED_BATCH_RECOVERY_AFTER_MS = 15 * 60 * 1000;
 export const STALLED_BATCH_RECOVERY_DELAY_MS = 5 * 60 * 1000;
+// The two/four-file modes may fall back to sequential 60s transfers. Keep the
+// preparation watchdog beyond that bounded worst-case (~240s) so healthy
+// fallback uploads are not interrupted.
+export const PREPARATION_STALL_AFTER_MS = 5 * 60 * 1000;
+export const SUBMITTED_STALL_REFRESH_AFTER_MS = 4 * 60 * 1000;
 export const ATTACHMENT_FAILURE_CIRCUIT_WINDOW_MS = 10 * 60 * 1000;
 export const ATTACHMENT_FAILURE_CIRCUIT_THRESHOLD = 3;
 
@@ -62,15 +67,46 @@ export function shouldTripAttachmentFailureCircuitBreaker(
   if (!isUnsubmittedAttachmentFailure(failure)) return false;
 
   const since = Number(now) - Math.max(0, Number(windowMs) || ATTACHMENT_FAILURE_CIRCUIT_WINDOW_MS);
+  const recoveryBaseline = Date.parse(run?.attachmentFailureBaselineAt || '') || 0;
   const distinctEntries = new Set();
   for (const record of [...(Array.isArray(run?.errors) ? run.errors : []), failure]) {
     if (!isUnsubmittedAttachmentFailure(record)) continue;
     const at = Date.parse(record.at || '');
-    if (!Number.isFinite(at) || at < since || at > Number(now) + 60000) continue;
+    if (!Number.isFinite(at) || at < since || at > Number(now) + 60000 || (recoveryBaseline && at < recoveryBaseline)) continue;
     const key = String(record.entryId || record.slotId || '').trim();
     if (key) distinctEntries.add(key);
   }
   return distinctEntries.size >= Math.max(1, Number(threshold) || ATTACHMENT_FAILURE_CIRCUIT_THRESHOLD);
+}
+
+export function isStalledUnsubmittedPreparation(slot, now = Date.now(), thresholdMs = PREPARATION_STALL_AFTER_MS) {
+  if (!slot?.entryId || !slot?.tabId || slot.downloadId || slot.generationSubmittedAt || slot.observationExpired) return false;
+  if (slot.physicalSendAtMs > 0 || slot.pageGenerationSubmitted === true) return false;
+  if (['SENDING', 'PROMPT_SENT', 'WAITING_ASSISTANT', 'WAITING_GENERATION', 'GENERATING', 'WAITING_IMAGE', 'OBSERVING', 'DOWNLOADING'].includes(
+    String(slot.status || '').toUpperCase()
+  )) return false;
+  const phase = String(slot.phase || slot.status || '').toUpperCase();
+  if (!['PREPARING', 'UPLOADING'].includes(phase)) return false;
+  const lastProgress = Date.parse(slot.lastProgressAt || slot.lastActivityAt || slot.pageRunAcceptedAt || '');
+  return Number.isFinite(lastProgress) && lastProgress > 0
+    && Number(now) - lastProgress >= Number(thresholdMs);
+}
+
+export function shouldRefreshStalledGeneration(slot, now = Date.now(), thresholdMs = SUBMITTED_STALL_REFRESH_AFTER_MS) {
+  if (!slot?.tabId || !slot?.generationId || !slot?.leaseId || slot?.downloadId || slot.observationExpired) return false;
+  if (String(slot.autoRefreshGenerationId || '') === String(slot.generationId)) return false;
+  const submittedAt = Date.parse(slot.generationSubmittedAt || slot.lastSendClickedAt || '') || Number(slot.physicalSendAtMs || 0);
+  const lastProgress = Date.parse(slot.lastProgressAt || '') || submittedAt;
+  return submittedAt > 0 && Number.isFinite(lastProgress) && Number(now) - lastProgress >= Number(thresholdMs);
+}
+
+export function shouldExpireSubmittedObservation(slot, now = Date.now()) {
+  if (!slot?.entryId || slot.downloadId || slot.observationExpired || slot.revisionPersistBlocked) return false;
+  if (!slot.generationSubmittedAt && !slot.lastSendClickedAt && !(Number(slot.physicalSendAtMs || 0) > 0)) return false;
+  const deadline = Number(slot.submissionObservationDeadlineAt || 0)
+    || ((Date.parse(slot.generationSubmittedAt || slot.lastSendClickedAt || '') || Number(slot.physicalSendAtMs || 0))
+      + 15 * 60 * 1000);
+  return deadline > 0 && Number(now) >= deadline;
 }
 
 export function shouldRefreshUnresponsiveGeneration(slot, now = Date.now(), thresholdMs = GENERATION_TRANSPORT_REFRESH_AFTER_MS) {
@@ -81,7 +117,7 @@ export function shouldRefreshUnresponsiveGeneration(slot, now = Date.now(), thre
 }
 
 function isActiveStalledBatchSlot(slot) {
-  if (!slot?.entryId || !slot?.tabId || slot?.downloadId) return false;
+  if (!slot?.entryId || !slot?.tabId || slot?.downloadId || slot.observationExpired) return false;
   return !['DONE', 'STOPPED', 'IDLE'].includes(String(slot.status || '').toUpperCase());
 }
 
@@ -103,7 +139,7 @@ export function findStalledBatchRecoveryCandidate(
   const activeRun = ['RUNNING', 'STARTING', 'DRAINING'].includes(String(run?.state || '').toUpperCase())
     || (String(run?.state || '').toUpperCase() === 'PAUSED'
       && String(run?.pauseReason || '').toUpperCase() === 'ERROR');
-  if (!activeRun || run?.imageLimitDetected === true
+  if (!activeRun || run?.clockStopped || run?.stopBlocked || run?.imageLimitDetected === true
     || String(run?.status || '').toUpperCase() === 'RATE_LIMIT_PAUSE'
     || Number(run?.rateLimitPauseUntil || 0) > Number(now)) return null;
 

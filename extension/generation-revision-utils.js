@@ -68,23 +68,65 @@ export function freshSlotRevisionFields() {
     preparedAt: null,
     pageRunAcceptedAt: null,
     lastSendClickedAt: null,
+    physicalSendAtMs: null,
+    physicalSendLeaseId: null,
+    pageSubmissionLeaseId: null,
+    pageGenerationSubmitted: null,
+    pageProbeAssistantCount: null,
+    pageProbeChatUrl: null,
+    pageProbeAt: null,
+    submissionObservationDeadlineAt: null,
+    observationExpired: false,
     rendererBootstrappedAt: null,
     rendererBootstrapVisibility: null,
     noResponseSince: null,
     autoRefreshGenerationId: null,
     autoRefreshAt: null,
+    legacyProbeRefreshLeaseId: null,
+    legacyObservationStartedAt: null,
+    legacyObservationDeadlineAt: null,
+    legacyProbeRefreshAt: null,
     revisionPersistFailures: 0,
     revisionPersistRetryAt: null,
     revisionPersistBlocked: false
   };
 }
 
+export function currentLeasePhysicalSend(slot) {
+  if (!slot) return false;
+  const clickedAt = Date.parse(slot.lastSendClickedAt || '') || 0;
+  const preparedAt = Date.parse(slot.preparedAt || '') || 0;
+  const reportedAt = Number(slot.physicalSendAtMs || 0);
+  const reportedForLease = Boolean(slot.leaseId)
+    && String(slot.physicalSendLeaseId || '') === String(slot.leaseId);
+  return reportedForLease && Number.isFinite(reportedAt) && reportedAt > 0
+    || clickedAt > 0 && (preparedAt === 0 || clickedAt >= preparedAt);
+}
+
+export function pageProbeConfirmsUnsubmitted(slot, probe) {
+  if (!slot?.leaseId || !probe?.leaseId
+    || String(slot.leaseId) !== String(probe.leaseId)
+    || (String(slot.pageSubmissionLeaseId || '') === String(slot.leaseId)
+      && slot.pageGenerationSubmitted === true)
+    || probe.generationSubmitted !== false
+    || Number(probe.assistantCount) !== 0
+    || String(probe.chatUrl || '').trim()
+    || String(slot.chatUrl || '').trim()
+    || Number(slot.assistantCount || 0) !== 0
+    || Number(probe.physicalSendAtMs || 0) > 0
+    || slot.generationSubmittedAt || slot.downloadId
+    || currentLeasePhysicalSend(slot)) return false;
+  return true;
+}
+
 export function canAuditSlot(slot) {
   if (!slot?.entryId || !slot?.tabId || slot.downloadId) return false;
+  if (slot.observationExpired === true) return false;
   if (['STOPPED', 'DONE'].includes(slot.status)) return false;
   if (slot.finalCheckPending) return true;
-  // Old persisted runs predate pageRunAcceptedAt, but a submitted prompt is
-  // already safe to inspect after an extension update/restart.
+  // pageRunAcceptedAt means the page accepted preparation. It allows a probe,
+  // but it is never evidence that Send was clicked. Submission is determined
+  // separately from a current-lease Send marker or an explicit page report.
   if (!slot.pageRunAcceptedAt && !slot.generationSubmittedAt) return false;
   return !['PAUSED', 'WAITING_LAUNCH'].includes(slot.status);
 }

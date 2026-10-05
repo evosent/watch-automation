@@ -59,6 +59,7 @@ import {
   immutableRevisionTuple,
   verifiedRevisionMatchesEvent,
   freshSlotRevisionFields,
+  currentLeasePhysicalSend,
   canAuditSlot
 } from '../extension/generation-revision-utils.js';
 import { savedFactsStageMatchesReleasedOwner } from '../extension/facts-progress-utils.js';
@@ -579,7 +580,7 @@ test('prepared drafts stay unsent and facts draining waits for every worker slot
   const sendEnd = worker.indexOf('async function pauseStalledPreparedSlots', sendStart);
   const drainStart = worker.indexOf('function shouldEnterFactsDraining');
   const drainEnd = worker.indexOf('function hasUnresolvedSlotErrors', drainStart);
-  const context = { SLOT_PHASES: { SENDING: 'SENDING', PROMPT_SENT: 'PROMPT_SENT', GENERATING: 'GENERATING', OBSERVING: 'OBSERVING', IMAGE_FOUND: 'IMAGE_FOUND', DOWNLOADING: 'DOWNLOADING', VERIFYING_FILE: 'VERIFYING_FILE' } };
+  const context = { currentLeasePhysicalSend, SLOT_PHASES: { SENDING: 'SENDING', PROMPT_SENT: 'PROMPT_SENT', GENERATING: 'GENERATING', OBSERVING: 'OBSERVING', IMAGE_FOUND: 'IMAGE_FOUND', DOWNLOADING: 'DOWNLOADING', VERIFYING_FILE: 'VERIFYING_FILE' } };
   runInNewContext(`${worker.slice(sendStart, sendEnd)}\n${worker.slice(drainStart, drainEnd)}\nglobalThis.isSubmitted = slotGenerationSubmitted; globalThis.mayDrain = shouldEnterFactsDraining;`, context);
   const draft = { entryId: 'watch-b', preparedForSubmit: true, status: 'OBSERVING', phase: 'OBSERVING', finalCheckPending: true,
     preparedAt: '2026-09-28T07:00:00Z', lastSendClickedAt: '2026-09-27T20:00:00Z' };
@@ -608,6 +609,7 @@ test('interrupted prepared slots return to the saved plan without a Send click',
   const cancelled = [];
   const context = {
     SLOT_PHASES: { WAITING_LAUNCH: 'WAITING_LAUNCH', SENDING: 'SENDING', PROMPT_SENT: 'PROMPT_SENT', GENERATING: 'GENERATING', OBSERVING: 'OBSERVING', IMAGE_FOUND: 'IMAGE_FOUND', DOWNLOADING: 'DOWNLOADING', VERIFYING_FILE: 'VERIFYING_FILE' },
+    currentLeasePhysicalSend,
     GENERATION_MEMORY_STATUSES: { NOT_READY: 'not_ready' },
     withStateLock: async (fn) => fn(), getStored: async () => stored,
     normalizeHistory: (value) => value, normalizeGenerationMemory: (value) => value,
@@ -913,7 +915,7 @@ test('send spacing clock uses physical Send click while acceptance is asynchrono
   const adapter = await readFile(path.join(extensionDir, 'chatgpt-adapter.js'), 'utf8');
   assert.match(adapter, /async function clickSendPrompt/);
   assert.match(adapter, /async function waitForPromptAcceptance/);
-  assert.match(content, /void confirmSendAndMonitor\(click, signal\)/);
+  assert.match(content, /void confirmSendAndMonitor\(click, signal, owner\)/);
   assert.match(content, /sendClickedAtMs: click\.sendClickedAtMs/);
   assert.match(worker, /const sendClickedAt = Number\(submitted\?\.sendClickedAtMs/);
   assert.match(worker, /lastGenerationLaunchAt = Math\.max\([^\n]*sendClickedAt\)/);
@@ -1330,7 +1332,7 @@ test('stalled recovery preserves the silence timer across its one tab refresh an
   const auditStart = worker.indexOf('function auditActiveRun()');
   const auditEnd = worker.indexOf('async function claimNext(', auditStart);
   const audit = worker.slice(auditStart, auditEnd);
-  const refreshStart = audit.indexOf('if (shouldRefreshUnresponsiveGeneration(slot))');
+  const refreshStart = audit.indexOf('if (slot.chatUrl && shouldRefreshUnresponsiveGeneration(slot))');
   const refreshEnd = audit.indexOf('if (slot.finalCheckPending)', refreshStart);
   assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
   assert.doesNotMatch(audit.slice(refreshStart, refreshEnd), /slot\.noResponseSince\s*=\s*null/);
@@ -1853,7 +1855,7 @@ test('unsubmitted attachment failures close their worker tab and stop a repeated
   assert.match(retryUtils, /ATTACHMENT_FAILURE_CIRCUIT_WINDOW_MS = 10 \* 60 \* 1000/);
   assert.match(errorHandler, /shouldTripAttachmentFailureCircuitBreaker\(run, failure\)/);
   assert.match(errorHandler, /closeUnsubmittedTabId/);
-  assert.match(errorHandler, /if \(result\.pauseRunForAttachmentStorm\)\s*\{\s*await pauseRun\('ERROR'\)/);
+  assert.match(errorHandler, /if \(result\.pauseRunForAttachmentStorm\)\s*\{\s*await schedulePreparationStallRecovery\(runId/);
   assert.match(errorHandler, /chrome\.tabs\.remove\(result\.closeUnsubmittedTabId\)/);
   assert.match(pauseHandler, /const pauseReason = \['ERROR', 'RESTART', 'IMAGE_LIMIT'\]/);
   assert.match(pauseHandler, /run\.status = observing \? 'PAUSED_RECOVERING' : \(pauseReason === 'ERROR' \? 'PAUSED_ON_ERROR' : 'PAUSED'\)/);
@@ -1993,7 +1995,7 @@ test('OCR recovery is scoped to an active run and never opens windows on idle st
 test('generation Send can confirm a consumed composer when ChatGPT user-turn DOM is late', async () => {
   const content = await readFile(path.join(extensionDir, 'content-script.js'), 'utf8');
   const block = content.slice(content.indexOf('async function confirmSendAndMonitor'), content.indexOf('async function submitPreparedRun'));
-  assert.match(block, /expectedPrompt: runCache\?\.job\?\.prompt \|\| null/);
+  assert.match(block, /expectedPrompt: owner\?\.job\?\.prompt \|\| null/);
   const adapter = await readFile(path.join(extensionDir, 'chatgpt-adapter.js'), 'utf8');
   assert.match(adapter, /mode: 'composer-consumed'/);
 });

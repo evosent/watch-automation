@@ -16,15 +16,23 @@
   const FACTS_ACCEPTANCE_RETRY_TIMEOUT_MS = 15000;
   const FACTS_RESPONSE_TIMEOUT_MS = 900000;
 
-  function context() {
+  function context(owner = runCache) {
     return {
-      operationId: runCache?.operationId,
-      slotId: runCache?.slotId,
-      entryId: runCache?.entryId,
-      generationId: runCache?.job?.generationId || runCache?.factsExtraction?.generationId || null,
-      entryName: runCache?.job?.outputFileName,
+      operationId: owner?.operationId,
+      slotId: owner?.slotId,
+      leaseId: owner?.leaseId || null,
+      generationId: owner?.job?.generationId || owner?.factsExtraction?.generationId || null,
+      entryId: owner?.entryId,
+      entryName: owner?.job?.outputFileName,
+      physicalSendAtMs: Number(owner?.physicalSendAtMs || 0),
       chatUrl: currentConversationUrl()
     };
+  }
+
+  function pageMessageMatchesOwner(message) {
+    return Boolean(runCache) && runCache.operationId === message.operationId
+      && (!message.entryId || runCache.entryId === message.entryId)
+      && (!message.leaseId || runCache.leaseId === message.leaseId);
   }
 
   function recordAutomationEvent(action) {
@@ -38,27 +46,35 @@
     } catch (_) {}
   }
 
-  async function emitState(patch) {
+  async function emitState(patch, owner = runCache) {
+    if (owner && runCache !== owner) return;
+    const reportedPatch = {
+      ...patch,
+      generationSubmitted: patch?.generationSubmitted ?? Boolean(owner?.promptSent),
+      physicalSendAtMs: Number(patch?.physicalSendAtMs ?? owner?.physicalSendAtMs ?? 0)
+    };
     recordAutomationEvent({
       type: 'state',
-      state: patch?.state,
+      state: reportedPatch.state,
       details: {
-        step: patch?.step || null,
-        attachmentCount: patch?.attachmentCount ?? null,
-        downloadId: patch?.downloadId ?? null,
-        generationSubmitted: patch?.generationSubmitted ?? runCache?.promptSent ?? false,
-        buildId: runCache?.buildId || null
+        step: reportedPatch.step || null,
+        attachmentCount: reportedPatch.attachmentCount ?? null,
+        downloadId: reportedPatch.downloadId ?? null,
+        generationSubmitted: reportedPatch.generationSubmitted,
+        physicalSendAtMs: reportedPatch.physicalSendAtMs || null,
+        buildId: owner?.buildId || null
       }
     });
     // UI/storage telemetry is deliberately fire-and-forget. Waiting for the
     // service worker to serialize chrome.storage writes used to add seconds
     // between physical page operations across six concurrent workers.
-    postRuntimeMessage({ type: 'STATE_EVENT', ...context(), patch });
+    postRuntimeMessage({ type: 'STATE_EVENT', ...context(owner), patch: reportedPatch });
   }
 
-  async function emitLog(message, extra = {}) {
+  async function emitLog(message, extra = {}, owner = runCache) {
+    if (owner && runCache !== owner) return;
     recordAutomationEvent({ type: 'log', name: message, details: extra });
-    postRuntimeMessage({ type: 'LOG_EVENT', ...context(), message, extra });
+    postRuntimeMessage({ type: 'LOG_EVENT', ...context(owner), message, extra });
   }
 
   function compactText(value, max = 4000) {
@@ -355,19 +371,21 @@
     return true;
   }
 
-  async function requestGeneratedDownload(generated) {
-    if (!runCache?.job) throw new Error('Run cache is not prepared');
-    if (runCache.downloadId != null) return { downloadId: runCache.downloadId };
-    if (runCache.downloadPromise) return runCache.downloadPromise;
+  async function requestGeneratedDownload(generated, owner = runCache) {
+    if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
+    if (!owner?.job) throw new Error('Run cache is not prepared');
+    if (owner.downloadId != null) return { downloadId: owner.downloadId };
+    if (owner.downloadPromise) return owner.downloadPromise;
 
-    runCache.downloadPromise = (async () => {
+    owner.downloadPromise = (async () => {
       const imageDetectedAtMs = Date.now();
       await emitLog('Generated image detected', {
         width: generated.width,
         height: generated.height,
         alt: generated.alt
-      });
-      await emitState({ state: 'REQUESTING_DOWNLOAD', step: '9/9' });
+      }, owner);
+      await emitState({ state: 'REQUESTING_DOWNLOAD', step: '9/9' }, owner);
+      if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
 
       // Postcheck is page-local and does not depend on the file reaching disk.
       // Launch it in parallel with download setup so neither custom output nor
@@ -377,14 +395,16 @@
       const source = String(generated?.src || '');
       const downloadMessage = (dataUrl, sourceMode = 'direct-url') => ({
         type: 'DOWNLOAD_GENERATED',
-        operationId: runCache.operationId,
-        slotId: runCache.slotId,
-        entryId: runCache.entryId,
-        recovery: runCache.recovery === true,
+        operationId: owner.operationId,
+        slotId: owner.slotId,
+        leaseId: owner.leaseId || null,
+        entryId: owner.entryId,
+        generationId: owner.job?.generationId || null,
+        recovery: owner.recovery === true,
         url: source,
         dataUrl: dataUrl || null,
         sourceMode,
-        outputFileName: runCache.job.outputFileName || null,
+        outputFileName: owner.job.outputFileName || null,
         chatUrl: currentConversationUrl()
       });
 
@@ -408,6 +428,7 @@
       // setup was rejected before a download id was created.
       if (!response?.ok) {
         prepared = await prepareGeneratedImage(generated);
+        if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
         if (prepared.dataUrl) {
           try {
             response = await chrome.runtime.sendMessage(downloadMessage(prepared.dataUrl, prepared.sourceMode));
@@ -418,43 +439,46 @@
       }
 
       if (!response?.ok) throw new Error(response?.error || 'Could not save generated image');
+      if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
 
       if (response.completed === true && response.mode === 'custom') {
-        await emitLog('Saved to custom output folder', { outputPath: response.outputPath || null });
+        await emitLog('Saved to custom output folder', { outputPath: response.outputPath || null }, owner);
         return { completed: true, mode: 'custom', outputPath: response.outputPath || null };
       }
-      runCache.downloadId = response.downloadId;
+      owner.downloadId = response.downloadId;
       await emitLog('Download requested', {
         downloadId: response.downloadId,
         sourceMode: response.sourceMode || 'direct-url',
         imageToDownloadRequestMs: Date.now() - imageDetectedAtMs
-      });
-      await emitState({ state: 'DOWNLOADING', status: 'RUNNING', downloadId: response.downloadId, progress: true });
+      }, owner);
+      await emitState({ state: 'DOWNLOADING', status: 'RUNNING', downloadId: response.downloadId, progress: true }, owner);
       return { downloadId: response.downloadId, mode: response.mode || 'downloads' };
     })();
 
     try {
-      return await runCache.downloadPromise;
+      return await owner.downloadPromise;
     } catch (error) {
-      runCache.downloadPromise = null;
-      runCache.downloadId = null;
+      owner.downloadPromise = null;
+      owner.downloadId = null;
       throw error;
     }
   }
 
-  async function inspectCurrentGeneration() {
-    if (!runCache?.job) return { state: 'NO_RUN' };
+  async function inspectCurrentGeneration(owner = runCache) {
+    if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
+    if (!owner?.job) return { state: 'NO_RUN', generationSubmitted: false };
     // A rate-limit modal must not hide a result that already exists behind it.
     // Dismiss and report the shared send gate, then inspect/download the current
     // conversation normally in the same audit pass.
-    const rateLimit = await checkAndDismissRateLimit({ dismiss: !runCache?.sendConfirmationPending });
-    const result = A().inspectGeneratedImage({ baselineAssistantCount: runCache.baselineAssistantCount || 0 });
+    const rateLimit = await checkAndDismissRateLimit({ dismiss: !owner.sendConfirmationPending });
+    if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
+    const result = A().inspectGeneratedImage({ baselineAssistantCount: owner.baselineAssistantCount || 0 });
     result.chatUrl = currentConversationUrl();
     if (result.state === 'READY') {
       runCache.imageCandidateSrc = null;
       runCache.imageCandidateSince = 0;
       runCache.imageCandidateAttempts = 0;
-      const download = await requestGeneratedDownload(result);
+      const download = await requestGeneratedDownload(result, owner);
       const next = { ...result, state: 'DOWNLOADING', downloadId: download.downloadId, generationSubmitted: true };
       inspectionProgress(next, { force: true });
       return { ...next, progress: true };
@@ -464,30 +488,31 @@
       // The response already contains an image element. Its authenticated
       // source may still be loading, so keep observing without a text-only
       // deadline.
-      runCache.auditSettledWithoutImageAt = 0;
+      owner.auditSettledWithoutImageAt = 0;
       const source = String(result.src || '');
       const now = Date.now();
-      if (source && source !== runCache.imageCandidateSrc) {
-        runCache.imageCandidateSrc = source;
-        runCache.imageCandidateSince = now;
-        runCache.imageCandidateAttempts = 0;
+      if (source && source !== owner.imageCandidateSrc) {
+        owner.imageCandidateSrc = source;
+        owner.imageCandidateSince = now;
+        owner.imageCandidateAttempts = 0;
       }
-      const candidateSince = Number(runCache.imageCandidateSince || 0);
+      const candidateSince = Number(owner.imageCandidateSince || 0);
       if (source && candidateSince > 0 && now - candidateSince >= IMAGE_CANDIDATE_GRACE_MS) {
         try {
-          const download = await requestGeneratedDownload(result);
+          const download = await requestGeneratedDownload(result, owner);
           const next = { ...result, state: 'DOWNLOADING', downloadId: download.downloadId, generationSubmitted: true };
           inspectionProgress(next, { force: true });
           return { ...next, progress: true };
         } catch (error) {
-          runCache.imageCandidateAttempts = Number(runCache.imageCandidateAttempts || 0) + 1;
+          if (runCache !== owner) throw error;
+          owner.imageCandidateAttempts = Number(owner.imageCandidateAttempts || 0) + 1;
           // Start a fresh grace window for a transient authenticated-request
           // failure. The slot stays observable and later audits can retry.
           runCache.imageCandidateSince = now;
           await emitLog('Кандидат изображения пока не скачан, повторю проверку', {
             error: error?.message || String(error),
-            attempt: runCache.imageCandidateAttempts
-          });
+            attempt: owner.imageCandidateAttempts
+          }, owner);
         }
       }
     } else if (result.state === 'WAITING_IMAGE') {
@@ -497,8 +522,8 @@
       // the image tool mounts. Only real non-empty prose may become TEXT_ONLY.
       if (result.outcome === 'TEXT_ONLY' && responseText.length >= 12) {
         const now = Date.now();
-        runCache.auditSettledWithoutImageAt ||= now;
-        if (now - runCache.auditSettledWithoutImageAt > TEXT_ONLY_RESPONSE_GRACE_MS) {
+        owner.auditSettledWithoutImageAt ||= now;
+        if (now - owner.auditSettledWithoutImageAt > TEXT_ONLY_RESPONSE_GRACE_MS) {
           return {
             state: 'ERROR',
             error: 'TEXT_ONLY_RESPONSE: assistant response finished without generated image',
@@ -507,15 +532,17 @@
           };
         }
       } else {
-        runCache.auditSettledWithoutImageAt = 0;
+        owner.auditSettledWithoutImageAt = 0;
       }
     } else {
-      runCache.auditSettledWithoutImageAt = 0;
+      owner.auditSettledWithoutImageAt = 0;
     }
     const progress = inspectionProgress(result);
     return {
       ...result,
-      generationSubmitted: Boolean(runCache.promptSent),
+      generationSubmitted: Boolean(owner.promptSent),
+      leaseId: owner.leaseId || null,
+      physicalSendAtMs: Number(owner.physicalSendAtMs || 0),
       rateLimit: Boolean(rateLimit.detected),
       rateLimitDismissed: Boolean(rateLimit.dismissed),
       rateLimitText: rateLimit.text || null,
@@ -539,37 +566,47 @@
     return order;
   }
 
-  async function reportRunError(error) {
+  async function reportRunError(error, owner = runCache) {
+    if (!owner || runCache !== owner) return;
     const stopped = error?.name === 'AbortError' || String(error?.message || '').includes('Aborted');
-    if (!stopped) await emitDiagnostics(error.message);
-    await emitLog(stopped ? 'Run stopped' : 'ERROR', { error: error.message, responseText: error.responseText || null });
+    if (stopped) return;
+    await emitDiagnostics(error.message);
+    if (runCache !== owner) return;
+    await emitLog('ERROR', { error: error.message, responseText: error.responseText || null }, owner);
+    const confirmedSend = Boolean(owner.promptSent || owner.downloadId != null);
+    const ambiguousPhysicalSend = Number(owner.physicalSendAtMs || error.sendClickedAtMs || 0) > 0
+      && error.rateLimitBeforeAssistant !== true;
     await emitState({
-      state: stopped ? 'STOPPED' : 'ERROR',
-      status: stopped ? 'STOPPED' : 'ERROR',
+      state: 'ERROR',
+      status: 'ERROR',
       error: error.message,
       responseText: error.responseText || null,
-      generationSubmitted: Boolean(runCache?.promptSent),
-      preparedForSubmit: Boolean(runCache?.preparedForSubmit),
+      generationSubmitted: confirmedSend || ambiguousPhysicalSend,
+      preparedForSubmit: Boolean(owner.preparedForSubmit),
       errorClass: error.code || null,
       rateLimit: error.code === 'RATE_LIMIT',
       rateLimitBeforeAssistant: error.rateLimitBeforeAssistant === true
-    });
+    }, owner);
   }
 
   async function prepareRunForSubmit() {
+    const owner = runCache;
     const order = validateRunInputs();
-    const { job, files } = runCache;
-    if (runCache.promptSent) return { prepared: true, alreadySubmitted: true, attachmentCount: order.length };
-    if (runCache.preparedForSubmit) return { prepared: true, alreadyPrepared: true, attachmentCount: order.length };
+    const { job, files } = owner;
+    if (owner.promptSent) return { prepared: true, alreadySubmitted: true, attachmentCount: order.length };
+    if (owner.preparedForSubmit) return { prepared: true, alreadyPrepared: true, attachmentCount: order.length };
 
     controller?.abort();
-    controller = new AbortController();
-    const signal = controller.signal;
+    const runController = new AbortController();
+    controller = runController;
+    owner.controller = runController;
+    const signal = runController.signal;
     const debugOverlay = job.debugOverlay === true;
     try {
       const prepStartedAt = Date.now();
       const prep = await A().ensureNewChat({ debugOverlay, signal });
-      void emitLog('New chat ready', { ...(prep || {}), durationMs: Date.now() - prepStartedAt });
+      if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
+      void emitLog('New chat ready', { ...(prep || {}), durationMs: Date.now() - prepStartedAt }, owner);
 
       const prompt = String(job.prompt || '')
         .replaceAll('[вставь нужную модель часов]', job.modelName)
@@ -589,6 +626,7 @@
       const promptStartedAt = Date.now();
       const promptPromise = A().setComposerText(prompt, { signal });
       const [result, filled] = await Promise.all([uploadPromise, promptPromise]);
+      if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
       const uploadDurationMs = Date.now() - uploadStartedAt;
       void emitLog('Page inputs prepared', {
         uploadMode: result.mode || null,
@@ -600,18 +638,19 @@
         inputMode: job.inputMode || String(order.length),
         attachmentOrder: order,
         promptSelector: filled?.selector || null
-      });
+      }, owner);
 
       // Some ChatGPT composer builds re-render after attachment processing.
       // Verify text survived; only reinsert when the upload actually wiped it.
       if (typeof A().composerHasText === 'function' && !A().composerHasText(prompt)) {
         await A().setComposerText(prompt, { signal });
-        void emitLog('Prompt restored after attachment rerender', { characters: prompt.length });
+        if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
+        void emitLog('Prompt restored after attachment rerender', { characters: prompt.length }, owner);
       }
 
-      runCache.preparedForSubmit = true;
-      runCache.preparedAt = Date.now();
-      runCache.lastProgressAt = Date.now();
+      owner.preparedForSubmit = true;
+      owner.preparedAt = Date.now();
+      owner.lastProgressAt = Date.now();
       void emitState({
         state: 'READY_TO_SEND',
         status: 'RUNNING',
@@ -619,23 +658,26 @@
         attachmentCount: result.count,
         preparedForSubmit: true,
         progress: true
-      });
+      }, owner);
       void emitLog('Page fully prepared; waiting only for global Send gate', {
         attachmentCount: result.count,
         characters: prompt.length,
         totalPrepareDurationMs: Date.now() - prepStartedAt,
-        preparedAt: new Date(runCache.preparedAt).toISOString()
-      });
-      return { prepared: true, attachmentCount: result.count, preparedAtMs: runCache.preparedAt };
+        preparedAt: new Date(owner.preparedAt).toISOString()
+      }, owner);
+      return { prepared: true, attachmentCount: result.count, preparedAtMs: owner.preparedAt };
     } catch (error) {
-      await reportRunError(error);
+      if (controller === runController) runController.abort();
+      if (runCache !== owner) return { cancelled: true };
+      await reportRunError(error, owner);
       throw error;
     }
   }
 
-  async function monitorSubmittedGeneration(sent, signal) {
+  async function monitorSubmittedGeneration(sent, signal, owner = runCache) {
     try {
-      void emitState({ state: 'WAITING_GENERATION', step: '9/9', generationSubmitted: true, progress: true });
+      if (runCache !== owner) return;
+      void emitState({ state: 'WAITING_GENERATION', step: '9/9', generationSubmitted: true, progress: true }, owner);
       const generated = await A().waitForGeneratedImage({
         baselineAssistantCount: sent.baselineAssistantCount,
         timeout: runCache?.job?.generationTimeoutMs || 900000,
@@ -650,26 +692,29 @@
           });
         }
       });
-      await requestGeneratedDownload(generated);
+      if (runCache !== owner) return;
+      await requestGeneratedDownload(generated, owner);
     } catch (error) {
-      await reportRunError(error);
+      await reportRunError(error, owner);
     }
   }
 
-  async function confirmSendAndMonitor(click, signal) {
-    runCache.sendConfirmationPending = true;
+  async function confirmSendAndMonitor(click, signal, owner = runCache) {
+    if (runCache !== owner) return;
+    owner.sendConfirmationPending = true;
     try {
       const accepted = await A().waitForPromptAcceptance({
         baselineAssistantCount: click.baselineAssistantCount,
         baselineUserCount: click.baselineUserCount,
         sendClickedAtMs: click.sendClickedAtMs,
-        expectedPrompt: runCache?.job?.prompt || null,
+        expectedPrompt: owner?.job?.prompt || null,
         signal
       });
-      runCache.baselineAssistantCount = click.baselineAssistantCount;
-      runCache.promptSent = true;
-      runCache.preparedForSubmit = false;
-      runCache.generationSubmittedAt = new Date().toISOString();
+      if (runCache !== owner) return;
+      owner.baselineAssistantCount = click.baselineAssistantCount;
+      owner.promptSent = true;
+      owner.preparedForSubmit = false;
+      owner.generationSubmittedAt = new Date().toISOString();
       void emitState({
         state: 'PROMPT_SENT',
         step: '8/9',
@@ -677,54 +722,59 @@
         submittedAtMs: click.sendClickedAtMs,
         baselineAssistantCount: click.baselineAssistantCount,
         progress: true
-      });
+      }, owner);
       void emitLog('Prompt accepted by ChatGPT', {
         baselineAssistantCount: click.baselineAssistantCount,
         baselineUserCount: click.baselineUserCount,
         sendClickedAtMs: click.sendClickedAtMs,
         acceptanceDelayMs: Date.now() - click.sendClickedAtMs
-      });
-      void monitorSubmittedGeneration({ ...click, ...accepted }, signal);
+      }, owner);
+      void monitorSubmittedGeneration({ ...click, ...accepted }, signal, owner);
     } catch (error) {
+      if (runCache !== owner) return;
       // A rate-limit rejection occurred after the physical click but before a
       // user turn was created. Keep the fully prepared page reusable so only
       // Send is retried after the shared cooldown.
       if (error?.code === 'RATE_LIMIT' && error.rateLimitBeforeAssistant === true) {
-        runCache.promptSent = false;
-        runCache.preparedForSubmit = true;
+        owner.promptSent = false;
+        owner.preparedForSubmit = true;
       }
-      await reportRunError(error);
+      await reportRunError(error, owner);
     } finally {
-      if (runCache) runCache.sendConfirmationPending = false;
+      if (owner) owner.sendConfirmationPending = false;
     }
   }
 
   async function submitPreparedRun() {
+    const owner = runCache;
     validateRunInputs();
-    if (!runCache?.preparedForSubmit) {
+    if (!owner?.preparedForSubmit) {
       const error = new Error('Page is not prepared for Send');
       error.code = 'NOT_PREPARED';
       throw error;
     }
-    if (runCache.promptSent) {
+    if (owner.promptSent) {
       return {
         submitted: true,
         alreadySubmitted: true,
-        sendClickedAtMs: Number(runCache.submittedAtMs || Date.parse(runCache.generationSubmittedAt || '') || Date.now())
+        sendClickedAtMs: Number(owner.submittedAtMs || Date.parse(owner.generationSubmittedAt || '') || Date.now())
       };
     }
     if (!controller || controller.signal.aborted) controller = new AbortController();
     const signal = controller.signal;
     try {
       const click = await A().clickSendPrompt({ debugOverlay: runCache.job.debugOverlay === true, signal });
-      runCache.preparedForSubmit = false;
-      runCache.lastProgressAt = click.sendClickedAtMs;
-      runCache.submittedAtMs = click.sendClickedAtMs;
-      void emitState({ state: 'SENDING', step: '8/9', preparedForSubmit: false, progress: true });
-      void emitLog('Send clicked', { ...click });
+      if (runCache !== owner) return { submitted: true, staleLease: true, sendClickedAtMs: click.sendClickedAtMs };
+      owner.physicalSendAtMs = Number(click.sendClickedAtMs || Date.now());
+      owner.preparedForSubmit = false;
+      owner.lastProgressAt = click.sendClickedAtMs;
+      owner.submittedAtMs = click.sendClickedAtMs;
+      void emitState({ state: 'SENDING', step: '8/9', preparedForSubmit: false, progress: true,
+        generationSubmitted: false, physicalSendAtMs: owner.physicalSendAtMs }, owner);
+      void emitLog('Send clicked', { ...click }, owner);
       // Do not hold the global Send gate while ChatGPT creates the user turn.
       // Confirmation/rate-limit detection continues asynchronously.
-      void confirmSendAndMonitor(click, signal);
+      void confirmSendAndMonitor(click, signal, owner);
       return {
         submitted: true,
         sendClicked: true,
@@ -733,7 +783,9 @@
         baselineUserCount: click.baselineUserCount
       };
     } catch (error) {
-      await reportRunError(error);
+      if (runCache !== owner) return { cancelled: true };
+      if (Number(error.sendClickedAtMs || 0) > 0) owner.physicalSendAtMs = Number(error.sendClickedAtMs);
+      await reportRunError(error, owner);
       throw error;
     }
   }
@@ -1021,6 +1073,10 @@
       return true;
     }
     if (message.type === 'STOP') {
+      if (message.leaseId && !pageMessageMatchesOwner(message)) {
+        sendResponse({ ok: true, staleLease: true });
+        return;
+      }
       controller?.abort();
       controller = null;
       sendResponse({ ok: true });
@@ -1043,6 +1099,8 @@
       return true;
     }
     if (message.type === 'PREPARE_PAGE_RUN') {
+      controller?.abort();
+      controller = new AbortController();
       runCache = {
         operationId: message.operationId,
         slotId: message.slotId,
@@ -1055,6 +1113,7 @@
         preparedForSubmit: false,
         preparedAt: null,
         submittedAtMs: null,
+        physicalSendAtMs: null,
         generationSubmittedAt: null,
         sendConfirmationPending: false,
         lastProgressAt: Date.now(),
@@ -1075,7 +1134,7 @@
       return;
     }
     if (message.type === 'CACHE_FILES') {
-      if (!runCache || runCache.operationId !== message.operationId) {
+      if (!pageMessageMatchesOwner(message)) {
         sendResponse({ ok: false, error: { message: 'Operation mismatch while caching files' } });
         return;
       }
@@ -1087,7 +1146,7 @@
       return;
     }
     if (message.type === 'CACHE_FILE') {
-      if (!runCache || runCache.operationId !== message.operationId) {
+      if (!pageMessageMatchesOwner(message)) {
         sendResponse({ ok: false, error: { message: 'Operation mismatch while caching file' } });
         return;
       }
@@ -1096,7 +1155,7 @@
       return;
     }
     if (message.type === 'PREPARE_PAGE_CONTENT') {
-      if (!runCache || runCache.operationId !== message.operationId) {
+      if (!pageMessageMatchesOwner(message)) {
         sendResponse({ ok: false, error: { message: 'Operation mismatch before preparation' } });
         return;
       }
@@ -1107,7 +1166,7 @@
       return true;
     }
     if (message.type === 'SUBMIT_PAGE_RUN') {
-      if (!runCache || runCache.operationId !== message.operationId) {
+      if (!pageMessageMatchesOwner(message)) {
         sendResponse({ ok: false, error: { message: 'Operation mismatch before submit' } });
         return;
       }
@@ -1217,14 +1276,56 @@
       return;
     }
     if (message.type === 'CHECK_GENERATION') {
-      const cachedGenerationId = String(runCache?.job?.generationId || '');
+      const owner = runCache;
+      const cachedGenerationId = String(owner?.job?.generationId || '');
       const requestedGenerationId = String(message.generationId || '');
-      const identityMismatch = !runCache
-        || runCache.operationId !== message.operationId
-        || runCache.entryId !== message.entryId
+      const identityMismatch = !owner
+        || owner.operationId !== message.operationId
+        || owner.entryId !== message.entryId
         || (requestedGenerationId && cachedGenerationId && cachedGenerationId !== requestedGenerationId)
-        || (message.leaseId && runCache.leaseId && runCache.leaseId !== message.leaseId);
+        || (message.leaseId && owner.leaseId && owner.leaseId !== message.leaseId);
       if (identityMismatch) {
+        // Legacy persisted OBSERVING slots may have no submission timestamp
+        // even though their real page context was lost during an update. This
+        // recovery mode may inspect the existing page for one exact worker
+        // lease; it never prepares files or clicks Send. The worker only uses
+        // it for slots with no persisted conversation/assistant/send evidence.
+        const unsubmittedObservation = message.recoverUnsubmitted === true
+          && Boolean(message.leaseId)
+          && !Number(message.submittedAtMs || 0)
+          && !message.chatUrl;
+        const submittedObservationOnly = message.recoverObservationOnly === true
+          && Boolean(message.leaseId)
+          && !Number(message.submittedAtMs || 0);
+        if (unsubmittedObservation || submittedObservationOnly) {
+          runCache = {
+            operationId: message.operationId,
+            slotId: Number(message.slotId),
+            leaseId: String(message.leaseId),
+            entryId: message.entryId,
+            job: {
+              generationId: requestedGenerationId || null,
+              outputFileName: message.outputFileName || null,
+              modelName: message.modelName || null
+            },
+            recovery: true,
+            promptSent: submittedObservationOnly,
+            preparedForSubmit: false,
+            physicalSendAtMs: 0,
+            baselineAssistantCount: Number(message.baselineAssistantCount || 0),
+            files: {},
+            downloadPromise: null,
+            downloadId: null,
+            auditSettledWithoutImageAt: 0,
+            imageCandidateSrc: null,
+            imageCandidateSince: 0,
+            imageCandidateAttempts: 0,
+            lastInspectionSignature: '',
+            factsExtraction: null,
+            factsStageSeq: 0
+          };
+          window.WatchDomRecorder?.setContext?.(context());
+        } else {
         // A content-script reinjection clears its in-memory cache. Recover only
         // observation for a generation that the worker has durably recorded as
         // submitted and still owns by lease + immutable generation identity.
@@ -1250,6 +1351,7 @@
           promptSent: true,
           preparedForSubmit: false,
           submittedAtMs,
+          physicalSendAtMs: submittedAtMs,
           generationSubmittedAt: new Date(submittedAtMs).toISOString(),
           baselineAssistantCount: Number(message.baselineAssistantCount || 0),
           files: {},
@@ -1270,9 +1372,23 @@
           entryId: message.entryId,
           generationId: requestedGenerationId
         } });
+        }
       }
-      inspectCurrentGeneration()
-        .then((value) => sendResponse({ ok: true, value }))
+      const probeOwner = runCache;
+      inspectCurrentGeneration(probeOwner)
+        .then((value) => {
+          if (runCache !== probeOwner) {
+            sendResponse({ ok: false, error: { message: 'Operation lease changed during generation check' } });
+            return;
+          }
+          sendResponse({ ok: true, value: {
+            ...value,
+            leaseId: probeOwner.leaseId || null,
+            generationSubmitted: Boolean(probeOwner.promptSent),
+            physicalSendAtMs: Number(probeOwner.physicalSendAtMs || 0),
+            chatUrl: currentConversationUrl()
+          } });
+        })
         .catch((error) => sendResponse({ ok: false, error: { message: error.message, responseText: error.responseText || null } }));
       return true;
     }

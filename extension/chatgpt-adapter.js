@@ -216,24 +216,46 @@
   }
 
   async function uploadFile({ dataUrl, name, type, expectedCount, debugOverlay = true, signal }) {
-    const inputInfo = R().resolve('fileInput', { visibleOnly: false });
-    if (!inputInfo.element) throw new Error('Image file input not found');
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (!R().resolve('fileInput', { visibleOnly: false }).element) throw new Error('Image file input not found');
     const plus = R().resolve('composerPlus').element;
     if (debugOverlay && plus) await O().highlightTarget(plus, { label: `Upload #${expectedCount}: ${name}` });
-    const blob = await (await fetch(dataUrl)).blob();
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const blob = await (await fetch(dataUrl, { signal })).blob();
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const file = new File([blob], name, { type: type || blob.type || 'image/png', lastModified: Date.now() });
     const dt = new DataTransfer();
     dt.items.add(file);
-    const input = inputInfo.element;
+    // ChatGPT may replace the composer while the overlay or blob is being
+    // prepared. Dispatch only to the resolver's current, connected input.
+    const currentInputInfo = R().resolve('fileInput', { visibleOnly: false });
+    const input = currentInputInfo.element;
+    if (!input || input.isConnected === false) throw new Error('Current image file input was remounted during upload');
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const dispatchDetails = {
+      stage: 'dispatch', selector: currentInputInfo.selector || null,
+      inputConnected: input.isConnected !== false, multiple: input.multiple === true,
+      expectedCount, baselineCount: R().attachmentTiles().length
+    };
+    recordAdapterAction({ type: 'upload-dispatch', details: dispatchDetails });
     input.files = dt.files;
     input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
     input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-    const tiles = await waitForDomCondition({
-      name: `attachment count ${expectedCount}`, timeout: 60000, signal,
-      predicate: () => { const xs = R().attachmentTiles(); return xs.length >= expectedCount ? xs : null; }
-    });
+    let tiles;
+    try {
+      tiles = await waitForDomCondition({
+        name: `attachment count ${expectedCount}`, timeout: 60000, signal,
+        predicate: () => { const xs = R().attachmentTiles(); return xs.length >= expectedCount ? xs : null; }
+      });
+    } catch (error) {
+      recordAdapterAction({ type: 'upload-dispatch-failed', details: {
+        ...dispatchDetails, stage: signal?.aborted ? 'aborted-wait' : 'attachment-wait',
+        actualCount: R().attachmentTiles().length, error: error?.message || String(error)
+      } });
+      throw error;
+    }
     recordAdapterAction({ type: 'upload-file', name, details: { expectedCount, actualCount: tiles.length } });
-    return { count: tiles.length, selector: inputInfo.selector };
+    return { count: tiles.length, selector: currentInputInfo.selector };
   }
 
   async function uploadFiles({ files = [], debugOverlay = true, signal } = {}) {
@@ -243,6 +265,7 @@
       return uploadFile({ ...list[0], expectedCount: 1, debugOverlay, signal });
     }
 
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const inputInfo = R().resolve('fileInput', { visibleOnly: false });
     if (!inputInfo.element) throw new Error('Image file input not found');
 
@@ -273,33 +296,66 @@
     const startedAt = Date.now();
     const dataTransfer = new DataTransfer();
     for (const fileData of list) {
-      const blob = await (await fetch(fileData.dataUrl)).blob();
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const blob = await (await fetch(fileData.dataUrl, { signal })).blob();
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       dataTransfer.items.add(new File(
         [blob],
         fileData.name,
         { type: fileData.type || blob.type || 'image/png', lastModified: Date.now() }
       ));
     }
-    const input = inputInfo.element;
+    const freshInputInfo = R().resolve('fileInput', { visibleOnly: false });
+    const input = freshInputInfo.element;
+    if (!input || input.isConnected === false) throw new Error('Current image file input was remounted during upload');
+    if (input.multiple !== true) {
+      const perFile = [];
+      let count = baselineCount;
+      for (const file of list) {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        const startedAt = Date.now();
+        const result = await uploadFile({ ...file, expectedCount: count + 1, debugOverlay, signal });
+        count = result.count;
+        perFile.push({ ...result, durationMs: Date.now() - startedAt });
+      }
+      return { count, selector: freshInputInfo.selector, mode: 'sequential', perFile };
+    }
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const dispatchDetails = {
+      stage: 'dispatch', selector: freshInputInfo.selector || null,
+      inputConnected: input.isConnected !== false, multiple: input.multiple === true,
+      baselineCount, expectedCount: list.length
+    };
+    recordAdapterAction({ type: 'upload-dispatch', name: list.map((file) => file.name).join(', '), details: dispatchDetails });
     input.files = dataTransfer.files;
     input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
     input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-    const tiles = await waitForDomCondition({
-      name: `attachment batch ${list.length}`,
-      timeout: 90000,
-      signal,
-      predicate: () => {
-        const xs = R().attachmentTiles();
-        return xs.length >= baselineCount + list.length ? xs : null;
-      }
-    });
+    let tiles;
+    try {
+      tiles = await waitForDomCondition({
+        name: `attachment batch ${list.length}`,
+        timeout: 90000,
+        signal,
+        predicate: () => {
+          const xs = R().attachmentTiles();
+          return xs.length >= baselineCount + list.length ? xs : null;
+        }
+      });
+    } catch (error) {
+      recordAdapterAction({ type: 'upload-dispatch-failed', details: {
+        ...dispatchDetails, stage: signal?.aborted ? 'aborted-batch-wait' : 'attachment-batch-wait',
+        actualCount: R().attachmentTiles().length, error: error?.message || String(error)
+      } });
+      throw error;
+    }
+    dispatchDetails.actualCount = tiles.length;
     const durationMs = Date.now() - startedAt;
     recordAdapterAction({
       type: 'upload-files-batch',
       name: list.map((file) => file.name).join(', '),
-      details: { expectedCount: list.length, actualCount: tiles.length, durationMs }
+      details: { ...dispatchDetails, stage: 'dispatched', durationMs }
     });
-    return { count: tiles.length, selector: inputInfo.selector, mode: 'batch', durationMs };
+    return { count: tiles.length, selector: freshInputInfo.selector, mode: 'batch', durationMs };
   }
 
   function normalizePromptText(text) {

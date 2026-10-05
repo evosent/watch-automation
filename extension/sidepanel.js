@@ -48,6 +48,7 @@ import {
   normalizeGenerationPauseMinutes,
   normalizeRateLimitIgnoreMinutes
 } from './reliability-utils.js';
+import { elapsedRunClock } from './run-clock-utils.js';
 
 const $ = (id) => document.getElementById(id);
 const referenceFiles = new Map();
@@ -1477,17 +1478,27 @@ function renderRunStatus(pause = countdown(runtime.rateLimitPauseUntil)) {
   $('runProgressTrack').setAttribute('aria-valuetext', `${completed} из ${total}`);
   $('runProgressBar').style.width = `${percent}%`;
 
-  const startedAt = state === 'IDLE' ? NaN : Date.parse(runtime.startedAt || '');
-  const finishedAt = Date.parse(runtime.finishedAt || '');
-  const terminal = ['DONE', 'STOPPED'].includes(state);
-  const endAt = terminal && Number.isFinite(finishedAt)
-    ? finishedAt
-    : (terminal && Number(runtime.updatedAt) > 0 ? Number(runtime.updatedAt) : Date.now());
-  const elapsedMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(0, endAt - startedAt) : null;
+  // GET_RUNTIME_FAST returns only the run identity/state under `run`; its
+  // flattened runtime still carries the full persisted clock snapshot.
+  const clockRun = runtime.run?.startedAt ? runtime.run : runtime;
+  const hasClockStart = Boolean(clockRun?.startedAt || runtime.startedAt);
+  const persistedElapsedValue = clockRun?.elapsedMs ?? runtime.elapsedMs;
+  const persistedElapsed = Number(persistedElapsedValue);
+  const hasPersistedElapsed = persistedElapsedValue != null && Number.isFinite(persistedElapsed);
+  const hasPersistedClock = Number(clockRun?.clockVersion) >= 1
+    && Number.isFinite(Number(clockRun?.clockAccumulatedMs));
+  const elapsedMs = state === 'IDLE' || !hasClockStart
+    ? null
+    : hasPersistedClock
+      ? elapsedRunClock(clockRun, Date.now())
+      : hasPersistedElapsed
+        ? Math.max(0, persistedElapsed)
+        : elapsedRunClock(clockRun, Date.now());
   $('runElapsed').textContent = elapsedMs == null ? '—' : formatDuration(elapsedMs);
   $('runAverage').textContent = completed > 0 && elapsedMs != null
     ? `${formatDuration(elapsedMs / completed)} / фото`
     : '—';
+  $('runAverage').title = 'Активное время прогона, делённое на число готовых изображений; время пауз не учитывается.';
 }
 
 function compact(value, max = 88) {
