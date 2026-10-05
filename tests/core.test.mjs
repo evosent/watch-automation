@@ -1389,14 +1389,12 @@ test('stalled recovery preserves the silence timer across its one tab refresh an
   assert.match(worker, /let resetRunPromise = null/);
 });
 
-test('opening the gallery automatically recovers missing revision facts and may open their saved ChatGPT chats', async () => {
+test('opening or refreshing the gallery never launches historical specification recovery', async () => {
   const gallery = await readFile(path.join(extensionDir, 'gallery.js'), 'utf8');
   const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
-  assert.match(gallery, /scheduleRevisionFactsRecovery\(currentRevisions\)/);
-  assert.match(gallery, /chrome\.runtime\.sendMessage\(\{ type: 'RECOVER_GALLERY_FACTS', generationIds \}\)/);
-  assert.match(worker, /async function recoverGalleryFacts\(/);
-  assert.match(worker, /async function recoverRevisionFactsUnlocked\(/);
-  assert.match(worker, /chrome\.tabs\.create\(\{ windowId: host\.id, url: recoveryUrl, active: false \}\)/);
+  assert.doesNotMatch(gallery, /RECOVER_GALLERY_FACTS|scheduleRevisionFactsRecovery|factsRecoveryAttempted/);
+  assert.doesNotMatch(worker, /function recoverGalleryFacts|function recoverRevisionFactsUnlocked/);
+  assert.match(gallery, /records = galleryRecordsFromCatalog/);
 });
 
 test('load-error classification and recovery delay are stable and explicit', () => {
@@ -1990,39 +1988,37 @@ test('SAVED is emitted only after the persistent revision write completes', asyn
   assert.match(block, /generationId не совпадает/);
 });
 
-test('gallery recovery reads the existing conversation and writes only the exact immutable revision', async () => {
+test('legacy gallery recovery requests acknowledge disabled without touching tabs or memory', async () => {
   const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
-  const gallery = await readFile(path.join(extensionDir, 'gallery.js'), 'utf8');
-  const start = worker.indexOf('async function recoverRevisionFactsUnlocked');
-  const end = worker.indexOf('function recoverRevisionFacts(', start);
-  const recovery = worker.slice(start, end);
-  assert.match(recovery, /chrome\.tabs\.create\(\{ windowId: host\.id, url: recoveryUrl, active: false \}\)/);
-  assert.match(recovery, /await bootstrapAutomationTab\(tabId, host\.id/);
-  assert.doesNotMatch(recovery, /chrome\.windows\.create|chrome\.windows\.remove/);
-  assert.match(recovery, /type: 'PULSE_FACTS_EXTRACTION'/);
-  assert.doesNotMatch(recovery, /START_FACTS_EXTRACTION|EXTRACT_GENERATION_FACTS|buildFactsExtractionPrompt|clickSendPrompt/);
-  assert.match(worker, /persistRecoveredRevisionFacts/);
-  assert.match(worker, /await getGenerationRevision\(generationIdValue\)/);
-  assert.match(worker, /generationId: current\.generationId/);
-  assert.match(worker, /outputPath: current\.outputPath/);
-  assert.match(worker, /outputHash: current\.outputHash/);
-  assert.match(worker, /chatUrl: current\.chatUrl/);
-  assert.match(gallery, /type: 'RECOVER_GALLERY_FACTS'/);
-  assert.match(gallery, /record\?\.generationId/);
+  const start = worker.indexOf("if (message?.type === 'RECOVER_GALLERY_FACTS')");
+  const end = worker.indexOf("if (message?.type === 'DOWNLOAD_GENERATED')", start);
+  const handler = worker.slice(start, end);
+  let response;
+  const calls = [];
+  const result = runInNewContext(`(function () { ${handler} })()`, {
+    message: { type: 'RECOVER_GALLERY_FACTS', generationIds: ['old-revision'] },
+    sendResponse: (value) => { response = value; },
+    chrome: { tabs: { create: () => calls.push('tab') }, storage: { local: { set: () => calls.push('write') } } }
+  });
+  assert.equal(result, false);
+  assert.equal(response.ok, true);
+  assert.equal(response.value.disabled, true);
+  assert.equal(response.value.recovered, 0);
+  assert.deepEqual(calls, []);
 });
 
-test('OCR recovery is scoped to an active run and never opens windows on idle startup', async () => {
+test('persisted historical OCR alarms are retired on upgrade, startup and worker wake', async () => {
   const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
-  assert.match(worker, /REVISION_FACTS_RECOVERY_ALARM_NAME/);
-  assert.match(worker, /scheduleRevisionFactsRecoveryAfterUpgrade\(\)\.catch/);
-  assert.match(worker, /async function recoverTimedOutRevisionFacts\(\)/);
-  assert.match(worker, /if \(!currentRunId\) return \{ skipped: true, reason: 'no_active_run' \}/);
-  assert.match(worker, /revision\.operationId === currentRunId/);
-  assert.match(worker, /await getAllGenerationRevisions\(\)/);
-  assert.match(worker, /Timeout waiting for settled assistant text/);
-  assert.match(worker, /await recoverGalleryFacts\(generationIds\)/);
-  assert.match(worker, /chrome\.alarms\.get\(REVISION_FACTS_RECOVERY_ALARM_NAME\)/);
-  assert.match(worker, /marker\.buildId === EXTENSION_BUILD_ID && marker\.completedAt/);
+  assert.doesNotMatch(worker, /scheduleRevisionFactsRecoveryAfterUpgrade|recoverTimedOutRevisionFacts/);
+  assert.match(worker, /clearLegacyRevisionFactsRecoveryAlarm\(\)\.catch/);
+  const start = worker.indexOf('async function clearLegacyRevisionFactsRecoveryAlarm');
+  const end = worker.indexOf('function startFactsExtractionDetached', start);
+  const calls = [];
+  await runInNewContext(`${worker.slice(start, end)}; clearLegacyRevisionFactsRecoveryAlarm();`, {
+    REVISION_FACTS_RECOVERY_ALARM_NAME: 'watch-automation-revision-facts-recovery',
+    chrome: { alarms: { clear: async (name) => { calls.push(name); return true; } } }
+  });
+  assert.deepEqual(calls, ['watch-automation-revision-facts-recovery']);
 });
 
 test('generation Send can confirm a consumed composer when ChatGPT user-turn DOM is late', async () => {
@@ -2048,7 +2044,7 @@ test('accepted OCR timeout retains its own tab for late full JSON and closes on 
   assert.match(result, /owner\.recoveryDeadlineAt = Date\.now\(\) \+ FINAL_CHECK_TIMEOUT_MS/);
   assert.match(result, /stage: 'RECEIVING_RESPONSE'/);
   assert.match(result, /startFactsPulseMonitor\(0\)/);
-  const pulse = worker.slice(worker.indexOf('async function pulsePostprocessTabs'), worker.indexOf('async function persistRecoveredRevisionFacts'));
+  const pulse = worker.slice(worker.indexOf('async function pulsePostprocessTabs'), worker.indexOf('async function clearLegacyRevisionFactsRecoveryAlarm'));
   assert.match(pulse, /Number\(owner\.recoveryDeadlineAt \|\| 0\)/);
   assert.match(pulse, /await cleanupPostprocessTab\(runSnapshot\.operationId, owner\.tabId\)/);
   assert.match(worker, /if \(patch\.factsStatus !== 'ok' && revisionFactsAreComplete\(revision\)\) return/);

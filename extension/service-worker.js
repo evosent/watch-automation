@@ -160,8 +160,6 @@ const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
 const FACTS_START_ACK_TIMEOUT_MS = 8000;
 const FACTS_FAST_PULSE_INTERVAL_MS = 1500;
-const REVISION_FACTS_RECOVERY_TIMEOUT_MS = 60000;
-const REVISION_FACTS_RECOVERY_CONCURRENCY = 3;
 const MAX_POSTPROCESS_TABS = 3;
 const DOM_DIAGNOSTICS_MODES = Object.freeze({
   OFF: 'off',
@@ -193,7 +191,6 @@ let lastAnySendAt = 0;
 const activeLaunchTasks = new Map();
 const imageLimitTasks = new Map();
 const activeFactsSendTasks = new Map();
-const revisionFactsRecoveryTasks = new Map();
 const conversationRecoveryRuns = new Set();
 const stalledBatchRecoveryRuns = new Set();
 // In-memory bridge between chrome.downloads.download() and the deferred state
@@ -2562,7 +2559,7 @@ async function submitPreparedSlot(operationId, slotId, entryId, tabId) {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   ensureDevReloadAlarm();
-  scheduleRevisionFactsRecoveryAfterUpgrade().catch(() => {});
+  clearLegacyRevisionFactsRecoveryAlarm().catch(() => {});
   scheduleInterruptedRunRecovery('Расширение было перезапущено');
 });
 
@@ -3463,23 +3460,36 @@ async function recoverInterruptedRun(reason) {
   }
 }
 
-chrome.runtime.onStartup.addListener(() => {
-  ensureDevReloadAlarm();
-  scheduleRevisionFactsRecoveryAfterUpgrade().catch(() => {});
-  void (async () => {
+let browserSessionInitialization = null;
+
+function initializeBrowserSessionTasks() {
+  if (browserSessionInitialization) return browserSessionInitialization;
+  browserSessionInitialization = (async () => {
+    const key = 'watchAutomationBrowserSessionInitialized';
+    const session = chrome.storage.session;
+    const marker = session ? await session.get(key) : {};
+    if (marker[key]) return rehydrateWorkerWake();
+    // storage.session survives MV3 worker suspension and clears with the
+    // browser session. Reconcile before reconstructing any Send tasks.
     const stored = await getStored();
     if (stored.sessionResetIntent) {
       await resumeInterruptedSessionReset(stored.sessionResetIntent);
-      return;
-    }
-    const { run } = stored;
-    const batchStage = String(run?.stalledBatchRecovery?.stage || '').toUpperCase();
-    if (['CLOSING', 'WAITING', 'RESTARTING', 'FAILED'].includes(batchStage)) {
+    } else if (['CLOSING', 'WAITING', 'RESTARTING', 'FAILED'].includes(
+      String(stored.run?.stalledBatchRecovery?.stage || '').toUpperCase()
+    )) {
       await rehydrateWorkerWake();
-      return;
+    } else {
+      await scheduleInterruptedRunRecovery('Браузер был перезапущен');
     }
-    await scheduleInterruptedRunRecovery('Браузер был перезапущен');
-  })().catch((error) => appendLog('Ошибка восстановления после запуска браузера', { error: error.message }));
+    if (session) await session.set({ [key]: true });
+  })();
+  return browserSessionInitialization;
+}
+
+chrome.runtime.onStartup.addListener(() => {
+  ensureDevReloadAlarm();
+  clearLegacyRevisionFactsRecoveryAlarm().catch(() => {});
+  initializeBrowserSessionTasks().catch((error) => appendLog('Ошибка восстановления после запуска браузера', { error: error.message }));
 });
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
@@ -3512,7 +3522,7 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
     return;
   }
   if (alarm.name === REVISION_FACTS_RECOVERY_ALARM_NAME) {
-    recoverTimedOutRevisionFacts().catch((error) => appendLog('Ошибка восстановления готовых OCR-ответов', { error: error.message }));
+    clearLegacyRevisionFactsRecoveryAlarm().catch(() => {});
     return;
   }
   if (alarm.name !== AUDIT_ALARM_NAME) return;
@@ -3616,11 +3626,11 @@ async function initializeDevReloadState() {
 ensureDevReloadAlarm();
 initializeDevReloadState().catch(() => {});
 reconcileManualExtensionUpdateLock().catch(() => {});
-scheduleRevisionFactsRecoveryAfterUpgrade().catch(() => {});
+clearLegacyRevisionFactsRecoveryAlarm().catch(() => {});
 restoreRateLimitResumeAlarm().catch(() => {});
 // A cold MV3 worker wake is normal lifecycle, not an interrupted browser run.
 // Rehydrate lost in-memory Send/audit tasks without forcing a manual Continue.
-rehydrateWorkerWake().catch((error) => appendLog('Ошибка восстановления задач после пробуждения service worker', { error: error.message }).catch(() => {}));
+initializeBrowserSessionTasks().catch((error) => appendLog('Ошибка восстановления задач после пробуждения service worker', { error: error.message }).catch(() => {}));
 startFactsPulseMonitor(250);
 pollDevControl('startup').catch(() => {});
 
@@ -10207,285 +10217,10 @@ async function pulsePostprocessTabs(runSnapshot) {
   return { checked: liveOwners.length, completed, expired: expired.length };
 }
 
-async function persistRecoveredRevisionFacts(revision, rawText, telemetry = {}) {
-  const generationIdValue = String(revision?.generationId || '');
-  if (!generationIdValue) throw new Error('Recovery revision has no generationId');
-  const current = await getGenerationRevision(generationIdValue);
-  if (!current) throw new Error(`Generation revision ${generationIdValue} was not found`);
-  if (String(current.sourceId || '') !== String(revision.sourceId || '')) {
-    throw new Error('Recovery sourceId does not match the persisted revision');
-  }
-  if (current.reviewStatus === 'rejected') {
-    return { generationId: generationIdValue, sourceId: current.sourceId, skipped: true, reason: 'revision_rejected' };
-  }
-  if (current.factsStatus === 'ok' && current.facts?.status === 'ok') {
-    return { generationId: generationIdValue, sourceId: current.sourceId, duplicate: true };
-  }
-
-  // Every field used here comes from the same immutable revision. Recovery is
-  // allowed to fill only its facts slot; it cannot rebind a response to the
-  // current SKU projection or to another physical PNG.
-  const facts = normalizeExtractedFacts(current, rawText, {
-    generationId: current.generationId,
-    outputPath: current.outputPath || null,
-    outputHash: current.outputHash || null,
-    chatUrl: current.chatUrl || null
-  });
-  facts.factsJobId = current.factsJobId
-    || stableHash({ generationId: current.generationId, outputHash: current.outputHash || null, recovery: true });
-  facts.pageDurationMs = Number(telemetry.durationMs || 0) || null;
-  facts.completion = 'gallery-recovery-existing-response';
-  facts.recoveredAt = new Date().toISOString();
-
-  const saved = {
-    ...current,
-    factsJobId: facts.factsJobId,
-    factsStatus: 'ok',
-    facts,
-    factsSavedAt: facts.extractedAt,
-    chatUrl: facts.chatUrl || current.chatUrl || null,
-    responseFingerprint: facts.responseFingerprint || null,
-    factsRecovery: {
-      recoveredAt: facts.recoveredAt,
-      assistantTurnId: telemetry.assistantTurnId || null,
-      assistantCount: Number(telemetry.assistantCount || 0),
-      responseChars: Number(telemetry.characters || String(rawText || '').length),
-      visibilityState: telemetry.visibilityState || null
-    }
-  };
-  const persisted = await persistGenerationFactsRevision({ ...saved, status: 'READY' });
-  if (!persisted?.matched || persisted?.latest !== true) {
-    return { generationId: generationIdValue, sourceId: current.sourceId, skipped: true, reason: 'generation_superseded' };
-  }
-  await updateFactsMetadata(current.sourceId, generationIdValue, {
-    factsStatus: 'ok',
-    factsUpdatedAt: facts.extractedAt,
-    factsError: null,
-    factsWarnings: facts.warnings,
-    chatUrl: facts.chatUrl || null
-  });
-  await updateFactsStage({
-    operationId: current.operationId,
-    entryId: current.sourceId,
-    generationId: generationIdValue,
-    factsJobId: facts.factsJobId
-  }, null, { stage: 'SAVED', generationId: generationIdValue, chatUrl: facts.chatUrl });
-  await withStateLock(async () => {
-    const stored = await getStored();
-    if (stored.run?.operationId !== current.operationId || stored.run.status !== 'DONE_WITH_FACTS_ERRORS') return;
-    const remaining = Object.values(stored.run.factsProgress || {})
-      .some((progress) => String(progress?.stage || '').toUpperCase() === 'ERROR');
-    if (remaining) return;
-    stored.run.status = 'DONE';
-    stored.run.currentAction = 'Все спецификации восстановлены и сохранены.';
-    await saveRunAndQueue(stored.run, stored.queue);
-    await publishRun(stored.run, stored.queue);
-  });
-  void appendLog('Спецификация восстановлена из готового ответа ChatGPT', {
-    sourceId: current.sourceId,
-    generationId: generationIdValue,
-    factsJobId: facts.factsJobId,
-    responseFingerprint: facts.responseFingerprint,
-    warnings: facts.warnings
-  });
-  return { generationId: generationIdValue, sourceId: current.sourceId, recovered: true, warnings: facts.warnings };
-}
-
-async function recoverRevisionFactsUnlocked(generationIdValue) {
-  const revision = await getGenerationRevision(String(generationIdValue || ''));
-  if (!revision) throw new Error(`Generation revision ${generationIdValue} was not found`);
-  if (revision.reviewStatus === 'rejected') {
-    return { generationId: revision.generationId, sourceId: revision.sourceId, skipped: true, reason: 'revision_rejected' };
-  }
-  if (revision.factsStatus === 'ok' && revision.facts?.status === 'ok') {
-    return { generationId: revision.generationId, sourceId: revision.sourceId, duplicate: true };
-  }
-  const recoveryUrl = automationConversationUrl(revision.chatUrl || revision.facts?.chatUrl);
-  if (!recoveryUrl) throw new Error('У revision отсутствует корректный URL ChatGPT-чата');
-
-  const factsJobId = String(revision.factsJobId
-    || stableHash({ generationId: revision.generationId, outputHash: revision.outputHash || null, recovery: true }));
-  const operationId = `revision-recovery:${revision.generationId}`;
-  let tabId = null;
-  try {
-    const host = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).catch(() => null);
-    if (!host?.id) throw new Error('Нет открытого окна Chrome для восстановления OCR');
-    const tab = await chrome.tabs.create({ windowId: host.id, url: recoveryUrl, active: false });
-    tabId = Number(tab?.id || 0) || null;
-    if (!tabId) throw new Error('Chrome не создал вкладку восстановления');
-    await withStateLock(async () => {
-      const stored = await getStored();
-      if (stored.run?.operationId !== revision.operationId) return;
-      stored.run.recoveryTabs ||= {};
-      stored.run.recoveryTabs[String(tabId)] = { generationId: revision.generationId, sourceId: revision.sourceId };
-      await saveRunAndQueue(stored.run, stored.queue);
-    });
-    await bootstrapAutomationTab(tabId, host.id, { slotId: -1, entryId: revision.sourceId });
-
-    const loaded = await chrome.tabs.get(tabId).catch(() => null);
-    if (normalizeChatConversationUrl(loaded?.url) !== normalizeChatConversationUrl(revision.chatUrl)) {
-      throw new Error('ChatGPT не открыл сохранённый conversation URL');
-    }
-
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < REVISION_FACTS_RECOVERY_TIMEOUT_MS) {
-      let tabState = await chrome.tabs.get(tabId).catch(() => null);
-      if (!tabState) throw new Error('Вкладка восстановления была закрыта');
-      if (tabState.frozen === true || tabState.discarded === true) {
-        await chrome.tabs.reload(tabId);
-        await waitTabReady(tabId, REVISION_FACTS_RECOVERY_TIMEOUT_MS);
-        tabState = await chrome.tabs.get(tabId).catch(() => tabState);
-      }
-      const response = await sendTabMessage(tabId, {
-        type: 'PULSE_FACTS_EXTRACTION',
-        operationId,
-        slotId: -1,
-        entryId: revision.sourceId,
-        generationId: revision.generationId,
-        factsJobId,
-        modelName: revision.modelName || revision.fileName || null,
-        outputFileName: revision.outputFileName || null,
-        baselineAssistantCount: 0,
-        baselineUserCount: 0,
-        userTurnId: null,
-        recover: true
-      }, 5000).catch(() => null);
-      const value = response?.ok ? response.value : null;
-      if (value?.complete === true && String(value.text || '').trim()) {
-        return persistRecoveredRevisionFacts(revision, String(value.text), {
-          ...value,
-          durationMs: Date.now() - startedAt,
-          discarded: tabState?.discarded === true,
-          frozen: tabState?.frozen === true,
-          autoDiscardable: tabState?.autoDiscardable !== false
-        });
-      }
-      await sleep(750);
-    }
-    throw new Error('Готовый полный JSON не найден в сохранённом ChatGPT-чате');
-  } finally {
-    if (tabId) await chrome.tabs.remove(tabId).catch(() => {});
-    if (tabId) await withStateLock(async () => {
-      const stored = await getStored();
-      if (stored.run?.recoveryTabs?.[String(tabId)]) {
-        delete stored.run.recoveryTabs[String(tabId)];
-        await saveRunAndQueue(stored.run, stored.queue);
-      }
-    }).catch(() => {});
-  }
-}
-
-function recoverRevisionFacts(generationIdValue) {
-  const key = String(generationIdValue || '');
-  if (!key) return Promise.reject(new Error('generationId is required'));
-  if (revisionFactsRecoveryTasks.has(key)) return revisionFactsRecoveryTasks.get(key);
-  const task = recoverRevisionFactsUnlocked(key).finally(() => {
-    if (revisionFactsRecoveryTasks.get(key) === task) revisionFactsRecoveryTasks.delete(key);
-  });
-  revisionFactsRecoveryTasks.set(key, task);
-  return task;
-}
-
-async function recoverGalleryFacts(generationIds = []) {
-  const ids = [...new Set((generationIds || []).map((value) => String(value || '')).filter(Boolean))].slice(0, 100);
-  const results = new Array(ids.length);
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < ids.length) {
-      const index = cursor++;
-      const generationIdValue = ids[index];
-      try {
-        results[index] = await recoverRevisionFacts(generationIdValue);
-      } catch (error) {
-        results[index] = { generationId: generationIdValue, error: error?.message || String(error) };
-        void appendLog('Не удалось восстановить спецификацию из сохранённого чата', results[index]);
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(REVISION_FACTS_RECOVERY_CONCURRENCY, ids.length) }, worker));
-  return {
-    requested: ids.length,
-    recovered: results.filter((item) => item?.recovered === true).length,
-    duplicate: results.filter((item) => item?.duplicate === true).length,
-    failed: results.filter((item) => item?.error).length,
-    results
-  };
-}
-
-async function scheduleRevisionFactsRecoveryAfterUpgrade() {
-  if (!chrome.alarms?.create) return { scheduled: false };
-  const stored = await getStored();
-  if (stored.sessionResetIntent) return { scheduled: false, reason: 'session_reset_pending' };
-  const { run } = stored;
-  if (!run || !['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)) {
-    return { scheduled: false, reason: 'no_active_run' };
-  }
-  const key = 'revisionFactsRecoveryMigration';
-  const storedMigration = await chrome.storage.local.get(key);
-  const marker = storedMigration[key] || {};
-  if (marker.buildId === EXTENSION_BUILD_ID && marker.completedAt) {
-    return { scheduled: false, duplicate: true };
-  }
-  const existing = await chrome.alarms.get(REVISION_FACTS_RECOVERY_ALARM_NAME).catch(() => null);
-  if (marker.buildId === EXTENSION_BUILD_ID && existing) return { scheduled: false, duplicate: true };
-  await chrome.storage.local.set({
-    [key]: {
-      buildId: EXTENSION_BUILD_ID,
-      scheduledAt: new Date().toISOString(),
-      completedAt: null,
-      result: null
-    }
-  });
-  await chrome.alarms.create(REVISION_FACTS_RECOVERY_ALARM_NAME, { when: Date.now() + 5000 });
-  return { scheduled: true };
-}
-
-async function recoverTimedOutRevisionFacts() {
-  const stored = await getStored();
-  // Historical OCR errors are retried explicitly from the gallery. A stopped
-  // or completed run must never open ChatGPT tabs on browser/extension launch.
-  const currentRunId = ['RUNNING', 'STARTING', 'DRAINING'].includes(stored.run?.state)
-    ? stored.run.operationId
-    : null;
-  if (!currentRunId) return { skipped: true, reason: 'no_active_run' };
-  const revisions = await getAllGenerationRevisions();
-  const ownedGenerationIds = new Set(Object.values(stored.run?.postprocessTabs || {})
-    .map((owner) => String(owner.generationId || '')));
-  const generationIds = revisions
-    .filter((revision) => revision?.generationId
-      && revision.operationId === currentRunId
-      && !ownedGenerationIds.has(String(revision.generationId))
-      && normalizeChatConversationUrl(revision.chatUrl || revision.facts?.chatUrl)
-      && revision.factsStatus !== 'ok'
-      && revision.facts?.status !== 'ok'
-      && /Timeout waiting for settled assistant text|FACTS_JSON_(?:INCOMPLETE|PARSE)/i.test(String(revision.facts?.error || '')))
-    .map((revision) => String(revision.generationId));
-  const result = generationIds.length
-    ? await recoverGalleryFacts(generationIds)
-    : { requested: 0, recovered: 0, duplicate: 0, failed: 0, results: [] };
-  await chrome.storage.local.set({
-    revisionFactsRecoveryMigration: {
-      buildId: EXTENSION_BUILD_ID,
-      scheduledAt: null,
-      completedAt: new Date().toISOString(),
-      result: {
-        requested: result.requested,
-        recovered: result.recovered,
-        duplicate: result.duplicate,
-        failed: result.failed
-      }
-    }
-  });
-  await withStateLock(async () => {
-    const current = await getStored();
-    if (current.run?.operationId !== currentRunId) return;
-    if (finalizeDrainingRun(current.run, current.queue)) {
-      await saveRunAndQueue(current.run, current.queue);
-      await publishRun(current.run, current.queue);
-    }
-  });
-  void appendLog('Автовосстановление готовых OCR-ответов завершено', result);
-  return result;
+// Legacy gallery/upgrade rescans are disabled. Keep existing run-owned
+// postprocessing intact and retire persisted alarms from older installations.
+async function clearLegacyRevisionFactsRecoveryAlarm() {
+  if (chrome.alarms?.clear) await chrome.alarms.clear(REVISION_FACTS_RECOVERY_ALARM_NAME);
 }
 
 function startFactsExtractionDetached(context) {
@@ -11867,10 +11602,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'RECOVER_GALLERY_FACTS') {
-    recoverGalleryFacts(message.generationIds)
-      .then((value) => sendResponse({ ok: true, value }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
-    return true;
+    // Older gallery tabs may still send this request after an update.
+    // Acknowledge without opening chats or changing generation records.
+    sendResponse({ ok: true, value: { disabled: true, requested: 0, recovered: 0, failed: 0, results: [] } });
+    return false;
   }
   if (message?.type === 'DOWNLOAD_GENERATED') {
     startGeneratedDownload(message).then((result) => sendResponse({ ok: true, ...(result || {}) })).catch((error) => sendResponse({ ok: false, error: error.message }));

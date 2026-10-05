@@ -12,7 +12,7 @@ import {
   getAllModelCatalog, replaceModelCatalog, adoptLegacyGenerationRevisions
 } from './idb.js';
 import { factsDisplayState, effectiveFactsWarnings, sortGalleryRecords } from './gallery-utils.js';
-import { galleryRecordsFromCatalog, currentRevisionsForCatalog } from './gallery-revision-utils.js';
+import { galleryRecordsFromCatalog } from './gallery-revision-utils.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 160;
@@ -30,8 +30,6 @@ let zoom = 1;
 const thumbUrls = new Map();
 const loadingThumbs = new Map();
 let toastTimer = null;
-let factsRecoveryAttempted = false;
-let factsRecoveryInFlight = false;
 
 function thumbnailCacheKey(record) {
   return [
@@ -271,7 +269,6 @@ async function loadState() {
     }
   }
   records = galleryRecordsFromCatalog(catalog, currentRevisionRecords);
-  const currentRevisions = currentRevisionsForCatalog(catalog, currentRevisionRecords);
 
   const customPermission = await permission(outputHandle, 'read');
   const pieces = [`Карточек из памяти: ${records.length}`, `PNG в папке: ${physicalPngs}`];
@@ -296,39 +293,6 @@ async function loadState() {
   if (fileStatus && (watcherError || (outputDestination?.mode === 'custom' && customPermission !== 'granted'))) fileStatus.open = true;
   populateBrands();
   applyFilters();
-  scheduleRevisionFactsRecovery(currentRevisions);
-}
-
-function scheduleRevisionFactsRecovery(revisionRecords) {
-  if (factsRecoveryAttempted || factsRecoveryInFlight) return;
-  const generationIds = (revisionRecords || [])
-    .filter((record) => record?.generationId
-      && record?.chatUrl
-      && record?.factsStatus !== 'ok'
-      && record?.facts?.status !== 'ok')
-    .map((record) => String(record.generationId));
-  if (!generationIds.length) return;
-
-  factsRecoveryAttempted = true;
-  factsRecoveryInFlight = true;
-  const baseStatus = $('folderStatus').textContent;
-  $('folderStatus').textContent = `${baseStatus} · восстанавливаю готовые спецификации: ${generationIds.length}`;
-  chrome.runtime.sendMessage({ type: 'RECOVER_GALLERY_FACTS', generationIds })
-    .then((response) => {
-      if (!response?.ok) throw new Error(response?.error || 'Восстановление спецификаций завершилось ошибкой');
-      const result = response.value || {};
-      if (Number(result.recovered || 0) > 0) {
-        showToast(`Спецификации восстановлены: ${result.recovered}`);
-        clearThumbCache();
-        return loadState();
-      }
-      if (Number(result.failed || 0) > 0) {
-        showToast(`Готовый JSON пока не найден в ${result.failed} чатах`, 'error');
-      }
-      return null;
-    })
-    .catch(showError)
-    .finally(() => { factsRecoveryInFlight = false; });
 }
 
 function populateBrands() {
@@ -809,7 +773,6 @@ function exportFactsCsv() {
 }
 
 $('refreshGallery').addEventListener('click', () => {
-  factsRecoveryAttempted = false;
   clearThumbCache();
   loadState().catch(showError);
 });

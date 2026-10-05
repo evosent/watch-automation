@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync, spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { inflateRawSync } from 'node:zlib';
@@ -8,6 +8,166 @@ export const UPDATE_REPOSITORY = 'evosent/watch-automation';
 export const UPDATE_ASSET_NAME = 'watch-automation-update.zip';
 export const UPDATE_PACKAGE_MANIFEST = 'watch-automation-update-package.json';
 export const UPDATE_STATE_FILE = '.watch-automation-update-state.json';
+export const AUTOMATION_STARTUP_URL = 'https://chatgpt.com/?watch_automation=1';
+export const AUTOMATION_LAUNCHER_TEMPLATE_MARKER = 'WATCH_AUTOMATION_STARTUP_TABS_V1';
+
+const CHROME_STARTUP_URLS_PREF_VALUE = 4;
+const STARTUP_PROFILE_DIRECTORY = 'Default';
+const STARTUP_PREFERENCES_FILE = 'Preferences';
+const STARTUP_LAUNCHER_TEMPLATE = 'extension/local-service/launcher-templates/launch-automation-profile.cmd';
+const STARTUP_LAUNCHER_DESTINATION = 'launch-automation-profile.cmd';
+
+function normalizeAutomationProfilePath(profilePath) {
+  const resolved = path.resolve(String(profilePath || ''));
+  if (path.basename(resolved).toLowerCase() !== 'chromeprofile'
+    || path.basename(path.dirname(resolved)).toLowerCase() !== 'watchautomation') {
+    throw new Error('Startup preparation is limited to the WatchAutomation ChromeProfile');
+  }
+  return resolved;
+}
+
+function powershellExitCode(script) {
+  try {
+    execFileSync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script
+    ], { stdio: 'ignore', windowsHide: true, timeout: 5000 });
+    return 0;
+  } catch (error) {
+    if (Number.isInteger(error?.status)) return error.status;
+    throw new Error(`Не удалось безопасно проверить процессы Chrome: ${error?.message || error}`);
+  }
+}
+
+export function isAutomationProfileChromeRunning(profilePath) {
+  if (process.platform !== 'win32') return false;
+  const profile = normalizeAutomationProfilePath(profilePath);
+  const encodedProfile = Buffer.from(profile, 'utf8').toString('base64');
+  const script = String.raw`
+$profile = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedProfile}'))
+$escaped = [regex]::Escape($profile)
+$pattern = '(?:^|\s)--user-data-dir=(?:"' + $escaped + '"|' + $escaped + ')(?:\s|$)'
+try {
+  $active = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction Stop | Where-Object { $_.CommandLine -and $_.CommandLine -match $pattern })
+} catch { exit 2 }
+if ($active.Count) { exit 1 }
+exit 0
+`;
+  const status = powershellExitCode(script);
+  if (status === 0) return false;
+  if (status === 1) return true;
+  throw new Error('Не удалось определить, закрыт ли Chrome-профиль WatchAutomation');
+}
+
+async function waitForAutomationProfileChromeToClose(profilePath, {
+  isChromeRunning = isAutomationProfileChromeRunning,
+  timeoutMs = 15000,
+  pollMs = 100,
+  now = Date.now,
+  sleep = (duration) => new Promise((resolve) => setTimeout(resolve, duration))
+} = {}) {
+  const deadline = now() + Math.max(0, Number(timeoutMs) || 0);
+  while (isChromeRunning(profilePath)) {
+    const remaining = deadline - now();
+    if (remaining <= 0) throw new Error('Chrome ещё использует профиль WatchAutomation; Preferences оставлены без изменений');
+    await sleep(Math.min(Math.max(10, Number(pollMs) || 100), remaining));
+  }
+}
+
+async function atomicReplace(filePath, contents) {
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporaryPath, contents);
+    await fs.rename(temporaryPath, filePath);
+  } catch (error) {
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+export async function prepareAutomationBrowserStartup(profilePath, options = {}) {
+  const profileRoot = normalizeAutomationProfilePath(profilePath);
+  await waitForAutomationProfileChromeToClose(profileRoot, options);
+
+  const defaultProfileRoot = path.join(profileRoot, STARTUP_PROFILE_DIRECTORY);
+  const preferencesPath = path.join(defaultProfileRoot, STARTUP_PREFERENCES_FILE);
+  await fs.mkdir(defaultProfileRoot, { recursive: true });
+  let preferences = {};
+  try {
+    const contents = (await fs.readFile(preferencesPath, 'utf8')).replace(/^\uFEFF/, '');
+    preferences = JSON.parse(contents);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw new Error('Chrome Preferences повреждён или недоступен; файл не изменён');
+  }
+  if (!preferences || typeof preferences !== 'object' || Array.isArray(preferences)) {
+    throw new Error('Chrome Preferences имеет неподдерживаемую структуру; файл не изменён');
+  }
+  if (preferences.session == null) preferences.session = {};
+  if (typeof preferences.session !== 'object' || Array.isArray(preferences.session)) {
+    throw new Error('Раздел session в Chrome Preferences имеет неподдерживаемую структуру; файл не изменён');
+  }
+  if (preferences.profile == null) preferences.profile = {};
+  if (typeof preferences.profile !== 'object' || Array.isArray(preferences.profile)) {
+    throw new Error('Раздел profile в Chrome Preferences имеет неподдерживаемую структуру; файл не изменён');
+  }
+
+  const currentUrls = preferences.session.urls_to_restore_on_startup;
+  const alreadyPrepared = preferences.session.restore_on_startup === CHROME_STARTUP_URLS_PREF_VALUE
+    && Array.isArray(currentUrls) && currentUrls.length === 1 && currentUrls[0] === AUTOMATION_STARTUP_URL
+    && preferences.profile?.exit_type === 'Normal' && preferences.profile?.exited_cleanly === true;
+  if (alreadyPrepared) return { changed: false, startupUrlCount: 1 };
+
+  preferences.session.restore_on_startup = CHROME_STARTUP_URLS_PREF_VALUE;
+  preferences.session.urls_to_restore_on_startup = [AUTOMATION_STARTUP_URL];
+  preferences.profile.exit_type = 'Normal';
+  preferences.profile.exited_cleanly = true;
+  await atomicReplace(preferencesPath, JSON.stringify(preferences));
+  return { changed: true, startupUrlCount: 1 };
+}
+
+function isAutomationLauncherRunning(projectRoot) {
+  if (process.platform !== 'win32') return false;
+  const root = path.resolve(projectRoot);
+  const encodedRoot = Buffer.from(root, 'utf8').toString('base64');
+  const script = String.raw`
+$root = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedRoot}'))
+$pattern = '(?i)(?:launch-automation-profile|START_AUTOGENERATION)\.cmd'
+try {
+  $active = @(Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction Stop | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_.CommandLine -match $pattern })
+} catch { exit 2 }
+if ($active.Count) { exit 1 }
+exit 0
+`;
+  const status = powershellExitCode(script);
+  if (status === 0) return false;
+  if (status === 1) return true;
+  throw new Error('Не удалось определить, завершился ли launcher WatchAutomation');
+}
+
+export async function repairAutomationLauncherFromTemplate(projectRoot, {
+  isLauncherRunning = isAutomationLauncherRunning,
+  timeoutMs = 30000,
+  pollMs = 100,
+  now = Date.now,
+  sleep = (duration) => new Promise((resolve) => setTimeout(resolve, duration))
+} = {}) {
+  const root = path.resolve(projectRoot);
+  const templatePath = path.join(root, ...STARTUP_LAUNCHER_TEMPLATE.split('/'));
+  const destinationPath = path.join(root, STARTUP_LAUNCHER_DESTINATION);
+  const [templateContents, currentContents] = await Promise.all([
+    fs.readFile(templatePath),
+    fs.readFile(destinationPath, 'utf8').catch((error) => error?.code === 'ENOENT' ? '' : Promise.reject(error))
+  ]);
+  if (currentContents.includes(AUTOMATION_LAUNCHER_TEMPLATE_MARKER)) return { changed: false };
+
+  const deadline = now() + Math.max(0, Number(timeoutMs) || 0);
+  while (isLauncherRunning(root)) {
+    const remaining = deadline - now();
+    if (remaining <= 0) throw new Error('Launcher WatchAutomation ещё выполняется; root launcher оставлен без изменений');
+    await sleep(Math.min(Math.max(10, Number(pollMs) || 100), remaining));
+  }
+  await atomicReplace(destinationPath, templateContents);
+  return { changed: true };
+}
 
 const MAX_ARCHIVE_BYTES = 160 * 1024 * 1024;
 const MAX_UNPACKED_BYTES = 220 * 1024 * 1024;
@@ -365,6 +525,8 @@ try {
     if ($remaining.Count) { Wait-Process -Id @($remaining | Select-Object -ExpandProperty ProcessId) -Timeout 10 -ErrorAction SilentlyContinue }
     if (@(Get-ManagedBrowsers).Count) { throw 'Previous automation browser did not stop' }
   }
+  $startupPreparation = & $config.nodeExecutable $config.watcherPath '--prepare-browser-startup' $config.profilePath 2>&1
+  if ($LASTEXITCODE -ne 0) { throw ('Automation browser startup preparation failed: ' + ($startupPreparation -join ' ')) }
   $arguments = @(('--user-data-dir="' + $config.profilePath + '"'), '--no-first-run', '--no-default-browser-check', '--disable-sync',
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
     '--disable-features=IntensiveWakeUpThrottling,FreezingOnBatterySaver,InfiniteTabsFreezing,InfiniteTabsFreezingOnMemoryPressure,CalculateNativeWinOcclusion',

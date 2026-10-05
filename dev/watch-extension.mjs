@@ -5,7 +5,9 @@ import { createReadStream, promises as fs, watch as watchFiles } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
-import { createUpdateManager, installedUpdateStatus, scheduleApplicationRestart, UPDATE_STATE_FILE } from './update-utils.mjs';
+import { createUpdateManager, installedUpdateStatus, scheduleApplicationRestart, UPDATE_STATE_FILE,
+  AUTOMATION_LAUNCHER_TEMPLATE_MARKER, prepareAutomationBrowserStartup,
+  repairAutomationLauncherFromTemplate } from './update-utils.mjs';
 import { createResultsTransferManager } from '../extension/local-service/results-transfer.mjs';
 import {
   controlCommandMatchesClient,
@@ -1259,6 +1261,35 @@ function close() {
 process.once('SIGINT', close);
 process.once('SIGTERM', close);
 
-await rescan('startup');
-startHttpServer();
-startFileWatcher();
+async function startAutomationStartupMaintenance() {
+  if (process.platform !== 'win32' || !process.env.LOCALAPPDATA) return;
+  const profilePath = path.join(process.env.LOCALAPPDATA, 'WatchAutomation', 'ChromeProfile');
+  const rootLauncher = await fs.readFile(path.join(PROJECT_ROOT, 'launch-automation-profile.cmd'), 'utf8').catch(() => '');
+  if (!rootLauncher.includes(AUTOMATION_LAUNCHER_TEMPLATE_MARKER)) {
+    void prepareAutomationBrowserStartup(profilePath, { timeoutMs: 20000, pollMs: 100 })
+      .then(({ changed }) => {
+        if (changed) console.info('[watch-extension] Browser startup profile prepared.');
+      })
+      .catch(() => console.warn('[watch-extension] Browser startup profile was left unchanged.'));
+  }
+  void repairAutomationLauncherFromTemplate(PROJECT_ROOT, { timeoutMs: 30000, pollMs: 100 })
+    .then(({ changed }) => {
+      if (changed) console.info('[watch-extension] Root launcher repaired from the packaged template.');
+    })
+    .catch(() => console.warn('[watch-extension] Root launcher repair was skipped.'));
+}
+
+if (process.argv[2] === '--prepare-browser-startup') {
+  try {
+    const result = await prepareAutomationBrowserStartup(process.argv[3]);
+    console.log(`Browser startup prepared; startup URL count: ${result.startupUrlCount}.`);
+  } catch {
+    console.error('Browser startup preparation failed; Preferences were left unchanged.');
+    process.exitCode = 1;
+  }
+} else {
+  await rescan('startup');
+  startHttpServer();
+  startFileWatcher();
+  void startAutomationStartupMaintenance();
+}
