@@ -959,6 +959,26 @@ export async function getAllGenerationRevisions() {
   } finally { db.close(); }
 }
 
+// A result package becomes visible as a single catalog/revision/facts commit.
+export async function mergeResultsDatabase(plan) {
+  const db = await openDb();
+  try {
+    return await transactionResult(db, [REVISION_STORE, MODEL_STORE, FACTS_STORE], (tx) => {
+      const revisions = tx.objectStore(REVISION_STORE);
+      const models = tx.objectStore(MODEL_STORE);
+      const facts = tx.objectStore(FACTS_STORE);
+      for (const revision of plan.revisions) revisions.put(revision);
+      const byId = new Map(plan.revisions.map((revision) => [revision.generationId, revision]));
+      for (const model of plan.models) {
+        models.put(model);
+        const revision = byId.get(model.latestReadyGenerationId);
+        if (revision?.factsStatus === 'ok') facts.put({ ...revision.facts, sourceId: model.skuKey, updatedAt: new Date().toISOString() });
+      }
+      return { revisions: plan.revisions.length, models: plan.models.length };
+    }, 'Results import write', 60000);
+  } finally { db.close(); }
+}
+
 export async function getGenerationRevisionsForSource(sourceId) {
   if (!sourceId) return [];
   const db = await openDb();

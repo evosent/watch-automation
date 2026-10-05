@@ -12,6 +12,7 @@ import {
 } from './idb.js';
 import { factsDisplayState, effectiveFactsWarnings, sortGalleryRecords } from './gallery-utils.js';
 import { galleryRecordsFromCatalog, currentRevisionsForCatalog } from './gallery-revision-utils.js';
+import { initResultsTransfer } from './results-transfer-ui.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 160;
@@ -803,6 +804,7 @@ $('refreshGallery').addEventListener('click', () => {
 });
 $('exportFactsCsv')?.addEventListener('click', exportFactsCsv);
 $('exportFactsJson')?.addEventListener('click', exportFactsJson);
+initResultsTransfer({ reload: () => { clearThumbCache(); return loadState(); } });
 $('search').addEventListener('input', applyFilters);
 ['brandFilter', 'saleFilter', 'qualityFilter', 'factsFilter', 'sortOrder'].forEach((id) => $(id)?.addEventListener('change', applyFilters));
 $('loadMore').addEventListener('click', () => { shown += PAGE_SIZE; render(); });

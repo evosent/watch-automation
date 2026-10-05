@@ -25,6 +25,7 @@ import {
   pendingEntryIdsForFilter,
   parseFilterSelectionId,
   queueGroupsFromCatalog,
+  modelCatalogRecordsFromGroups,
   queueStatusForGenerationMemoryStatus,
   referenceDescriptorForPath,
   sourceIdFor,
@@ -38,8 +39,9 @@ import {
   getGenerationRevision, getAllGenerationRevisions, getAllModelCatalog, upsertGenerationRevision,
   beginGenerationRevision, cancelUnsubmittedGenerationRevision,
   persistGenerationImageRevision, persistGenerationFactsRevision,
-  rejectGenerationRevision, saveRunDiagnostics
+  rejectGenerationRevision, saveRunDiagnostics, mergeResultsDatabase
 } from './idb.js';
+import { transferableRevision, planResultsMerge, resultsImportPreview } from './results-transfer-utils.js';
 import { buildInputPlan, normalizeInputMode, DEFAULT_INPUT_MODE } from './input-plan.js';
 import { verifiedRevisionMatchesEvent, freshSlotRevisionFields, canAuditSlot } from './generation-revision-utils.js';
 import { factsStageMatchesOwner, savedFactsStageMatchesReleasedOwner } from './facts-progress-utils.js';
@@ -133,7 +135,7 @@ const SLOT_PROBE_TIMEOUT_MS = 8000;
 const GLOBAL_NO_PROGRESS_WINDOW_MS = 300000;
 const MAX_RUN_EVENTS = 600;
 const OUTPUT_VERIFY_TIMEOUT_MS = 2000;
-const EXTENSION_BUILD_ID = '2026-10-05.1';
+const EXTENSION_BUILD_ID = '2026-10-05.2';
 const PROMPT_PIPELINE_VERSION = '6';
 const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
@@ -316,6 +318,11 @@ async function rehydrateWorkerWake() {
   // browser/extension restart and must never turn a live unattended run into a
   // manual PAUSED state. Recreate only the in-memory tasks that suspension can
   // lose; persisted slot/page ownership remains authoritative.
+  const importState = await chrome.storage.local.get('resultsImportJournal');
+  if (importState.resultsImportJournal) {
+    await completeResultsImport();
+    return;
+  }
   const stored = await getStored();
   if (stored.sessionResetIntent) {
     void resumeInterruptedSessionReset(stored.sessionResetIntent).catch((error) => appendLog(
@@ -3460,7 +3467,8 @@ async function pollDevReload(source = 'poll') {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DEV_RELOAD_POLL_TIMEOUT_MS);
   try {
-    const updateState = await chrome.storage.local.get('manualExtensionUpdateLock').catch(() => ({}));
+    const updateState = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']).catch(() => ({}));
+    if (updateState.resultsImportJournal) return { ok: true, deferred: true, reason: 'results_import' };
     if (updateState.manualExtensionUpdateLock?.active) {
       return { ok: true, deferred: true, reason: 'manual_update' };
     }
@@ -3547,7 +3555,8 @@ async function pollDevReload(source = 'poll') {
     }
 
     return await withStateLock(async () => {
-      const latest = await chrome.storage.local.get('manualExtensionUpdateLock');
+      const latest = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']);
+      if (latest.resultsImportJournal) return { ok: true, deferred: true, reason: 'results_import' };
       if (latest.manualExtensionUpdateLock?.active) {
         return { ok: true, changed: true, deferred: true, reason: 'manual_update' };
       }
@@ -3649,6 +3658,8 @@ async function reconcileManualExtensionUpdateLock(status = null, installedState 
 }
 
 async function assertManualExtensionUpdateNotApplying() {
+  const importState = await chrome.storage.local.get('resultsImportJournal');
+  if (importState.resultsImportJournal) throw new Error('Завершается импорт результатов. Дождись его завершения в галерее.');
   const stored = await chrome.storage.local.get('manualExtensionUpdateLock');
   if (!stored.manualExtensionUpdateLock?.active) return;
   try {
@@ -3674,7 +3685,8 @@ function applyManualExtensionUpdate(targetVersion = '') {
     const claim = await withStateLock(async () => {
       const { run } = await getStored();
       if (runHasActiveAutomationWork(run)) return { deferred: true, reason: 'Рабочие вкладки ещё заняты.' };
-      const stored = await chrome.storage.local.get(['manualExtensionUpdateLock', 'devAutoReload']);
+      const stored = await chrome.storage.local.get(['manualExtensionUpdateLock', 'devAutoReload', 'resultsImportJournal']);
+      if (stored.resultsImportJournal) throw new Error('Дождись завершения импорта результатов');
       const previous = stored.manualExtensionUpdateLock;
       if (previous?.active && previous.targetVersion && targetVersion && previous.targetVersion !== targetVersion) {
         return { deferred: true, reason: 'Завершается установка другого пакета.' };
@@ -6981,7 +6993,8 @@ async function startRun(options = {}) {
     throw new Error(`Предварительная проверка не пройдена: ${failed || 'проверь входные данные'}`);
   }
   const assignments = await withStateLock(async () => {
-    const updateLock = await chrome.storage.local.get('manualExtensionUpdateLock');
+    const updateLock = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']);
+    if (updateLock.resultsImportJournal) throw new Error('Завершается импорт результатов');
     if (updateLock.manualExtensionUpdateLock?.active) {
       throw new Error('Установка обновления расширения началась. Дождись её завершения.');
     }
@@ -7676,6 +7689,91 @@ async function importGenerationMemorySnapshot(snapshot = {}) {
     await appendLog(`Память импортирована: ${count} записей`);
     return { count };
   });
+}
+
+async function resultsTransferRequest(route, { method = 'GET', body = null, id = '' } = {}) {
+  const identity = await getDevControlClientIdentity();
+  const query = new URLSearchParams({ ...identity, id });
+  const response = await fetchWithTimeout(`http://127.0.0.1:17321/results-transfer/${route}?${query}`, {
+    method, cache: 'no-store', ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {})
+  }, 30000);
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) throw new Error(payload.error || 'Ошибка локального сервиса передачи результатов');
+  return payload.value;
+}
+
+async function prepareResultsExport(operationId = '') {
+  const revisions = (await getAllGenerationRevisions()).filter((record) => transferableRevision(record)
+    && (!operationId || record.operationId === operationId));
+  if (!revisions.length) throw new Error('Нет сохранённых результатов для выбранного прогона');
+  return resultsTransferRequest('export', { method: 'POST', body: { records: revisions } });
+}
+
+async function completeResultsImport() {
+  return withStateLock(async () => {
+    const { resultsImportJournal: journal } = await chrome.storage.local.get('resultsImportJournal');
+    if (!journal) return { skipped: true };
+    const installed = await resultsTransferRequest('verify', { id: journal.id });
+    const stored = await getStored();
+    if (runHasActiveAutomationWork(stored.run)) throw new Error('Импорт ожидает завершения активного прогона');
+    const [revisions, savedCatalog] = await Promise.all([getAllGenerationRevisions(), getAllModelCatalog({ includeRemoved: true })]);
+    const catalog = savedCatalog.length ? savedCatalog : modelCatalogRecordsFromGroups(stored.queue?.groups || {});
+    const plan = planResultsMerge(installed.items, { ...stored, revisions, catalog });
+    if (!savedCatalog.length) plan.models = [...new Map([...catalog, ...plan.models].map((model) => [model.skuKey, model])).values()];
+    const summary = journal.summary || plan.summary;
+    await chrome.storage.local.set({ resultsImportJournal: { ...journal, phase: 'database', summary } });
+    await mergeResultsDatabase(plan);
+    await saveRunAndQueue(stored.run || null, plan.queue, plan.history, plan.generationMemory);
+    await chrome.storage.local.set({ lastResultsImport: { id: journal.id, completedAt: new Date().toISOString(), summary } });
+    await chrome.storage.local.remove('resultsImportJournal');
+    await resultsTransferRequest('finish', { id: journal.id, method: 'POST' }).catch(() => {});
+    return summary;
+  });
+}
+
+async function importInstalledResults(id) {
+  const job = await resultsTransferRequest('status', { id });
+  if (job.kind !== 'import' || job.phase !== 'installed') throw new Error('Сначала дождись установки PNG в папку результатов');
+  await withStateLock(async () => {
+    const stored = await getStored();
+    const locks = await chrome.storage.local.get(['resultsImportJournal', 'manualExtensionUpdateLock']);
+    if (runHasActiveAutomationWork(stored.run)) throw new Error('Перед импортом заверши или сбрось активный прогон');
+    if (locks.manualExtensionUpdateLock?.active) throw new Error('Сначала дождись установки обновления расширения');
+    if (locks.resultsImportJournal && locks.resultsImportJournal.id !== id) throw new Error('Сначала заверши предыдущий импорт');
+    await chrome.storage.local.set({ resultsImportJournal: { ...(locks.resultsImportJournal || {}), id,
+      items: job.items, startedAt: locks.resultsImportJournal?.startedAt || new Date().toISOString() } });
+  });
+  return completeResultsImport();
+}
+
+async function claimResultsImport(id) {
+  const job = await resultsTransferRequest('status', { id });
+  if (job.kind !== 'import' || !job.items || !['ready', 'installing', 'installed', 'error'].includes(job.phase)) throw new Error('Сначала проверь архив результатов');
+  return withStateLock(async () => {
+    const stored = await getStored();
+    const locks = await chrome.storage.local.get(['resultsImportJournal', 'manualExtensionUpdateLock']);
+    if (runHasActiveAutomationWork(stored.run)) throw new Error('Перед импортом заверши или сбрось активный прогон');
+    if (locks.manualExtensionUpdateLock?.active) throw new Error('Дождись установки обновления расширения');
+    if (locks.resultsImportJournal && locks.resultsImportJournal.id !== id) throw new Error('Завершается предыдущий импорт');
+    if (!locks.resultsImportJournal) await chrome.storage.local.set({ resultsImportJournal: { id, startedAt: new Date().toISOString() } });
+    return { id };
+  });
+}
+
+async function resultsTransferInfo() {
+  const [revisions, stored, pending, identity] = await Promise.all([getAllGenerationRevisions(), getStored(),
+    chrome.storage.local.get(['resultsImportJournal', 'lastResultsImport']), getDevControlClientIdentity()]);
+  const eligible = revisions.filter(transferableRevision);
+  const runs = new Map();
+  for (const record of eligible) {
+    const id = String(record.operationId || '');
+    if (!id) continue;
+    const old = runs.get(id) || { id, count: 0, date: record.completedAt || record.generatedAt || record.downloadedAt || '' };
+    old.count++; runs.set(id, old);
+  }
+  return { identity, count: eligible.length, runs: [...runs.values()].sort((a, b) => b.date.localeCompare(a.date)),
+    active: runHasActiveAutomationWork(stored.run), pendingId: pending.resultsImportJournal?.id || null,
+    lastImport: pending.lastResultsImport || null };
 }
 
 async function fastRuntimeState() {
@@ -8813,7 +8911,8 @@ async function resumeRun(options = {}) {
   }));
   const observedEntryIds = new Set(recovered.filter((item) => item.observe).map((item) => item.entryId));
   const assignments = await withStateLock(async () => {
-    const updateLock = await chrome.storage.local.get('manualExtensionUpdateLock');
+    const updateLock = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']);
+    if (updateLock.resultsImportJournal) throw new Error('Завершается импорт результатов');
     if (updateLock.manualExtensionUpdateLock?.active) {
       throw new Error('Установка обновления расширения началась. Дождись её завершения.');
     }
@@ -10978,6 +11077,26 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (['GET_RESULTS_TRANSFER_INFO', 'EXPORT_RESULTS_PACKAGE', 'PREVIEW_RESULTS_IMPORT', 'CLAIM_RESULTS_IMPORT',
+    'COMMIT_RESULTS_IMPORT', 'RESUME_RESULTS_IMPORT'].includes(message?.type)) {
+    if (sender?.tab?.url && !sender.tab.url.startsWith(chrome.runtime.getURL(''))) {
+      sendResponse({ ok: false, error: 'Передача результатов доступна из галереи расширения' }); return false;
+    }
+    (async () => {
+      if (message.type === 'GET_RESULTS_TRANSFER_INFO') return resultsTransferInfo();
+      if (message.type === 'EXPORT_RESULTS_PACKAGE') return prepareResultsExport(String(message.operationId || ''));
+      if (message.type === 'PREVIEW_RESULTS_IMPORT') {
+        const job = await resultsTransferRequest('status', { id: message.id });
+        if (job.kind !== 'import' || !['ready', 'installed'].includes(job.phase)) throw new Error('Проверка архива ещё выполняется');
+        return resultsImportPreview(job.items, await getAllGenerationRevisions());
+      }
+      if (message.type === 'COMMIT_RESULTS_IMPORT') return importInstalledResults(message.id);
+      if (message.type === 'CLAIM_RESULTS_IMPORT') return claimResultsImport(message.id);
+      return completeResultsImport();
+    })().then((value) => sendResponse({ ok: true, value }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
   if (message?.type === 'DEV_RELOAD_POLL') {
     Promise.all([
       pollDevReload('side-panel'),

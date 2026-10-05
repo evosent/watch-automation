@@ -61,6 +61,11 @@ test('update package archive permits extension, prompt, and reference files', ()
   const entries = inspectUpdateArchive(storedZipEntry('input-ref-images/brands/Casio/ref.png'));
   assert.deepEqual(entries.map((entry) => entry.name), ['input-ref-images/brands/Casio/ref.png']);
   assert.equal(entries[0].uncompressedSize, Buffer.byteLength('sample'));
+  for (const name of ['extension/local-service/results-transfer.mjs', 'extension/local-service/results-archive.mjs',
+    'extension/results-transfer-utils.js', 'extension/results-transfer-ui.js']) {
+    assert.equal(inspectUpdateArchive(storedZipEntry(name))[0].name, name,
+      'result-transfer dependencies stay inside the legacy updater extension-path allowlist');
+  }
 });
 
 test('update package archive rejects traversal and incoming watch photos', () => {

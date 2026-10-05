@@ -1,6 +1,7 @@
 # Watch Card ChatGPT Browser Automation
 
 Инструкции по выпуску и установке обновлений находятся в [`docs/updates.md`](docs/updates.md).
+Передача PNG и прогресса между пользователями через ZIP описана в [`docs/results-transfer.md`](docs/results-transfer.md).
 
 Локальное Chrome Extension для пакетной генерации карточек часов через ChatGPT.
 Расширение запускает от двух до шести независимых вкладок. Количество рабочих

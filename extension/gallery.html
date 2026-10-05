@@ -17,6 +17,7 @@
         </div>
       </div>
       <div class="topbar-actions">
+        <button id="resultsTransferOpen" class="button secondary" type="button">Передача результатов</button>
         <button id="exportFactsCsv" class="button secondary" type="button">Экспорт CSV</button>
         <button id="exportFactsJson" class="button secondary" type="button">Экспорт JSON</button>
         <button id="refreshGallery" class="button" type="button">Обновить файлы</button>
@@ -138,6 +139,25 @@
     </div>
   </dialog>
 
+  <dialog id="resultsTransferDialog" class="results-transfer-dialog">
+    <h2>Передача результатов</h2>
+    <p>Архив содержит PNG из папки WatchAutomation в «Загрузках» и память об этих результатах. Импорт добавит фотографии туда же и объединит прогресс с вашей базой.</p>
+    <section>
+      <h3>Экспорт</h3>
+      <label for="resultsExportScope">Какие результаты передать</label>
+      <select id="resultsExportScope"></select>
+      <button id="resultsExport" class="button" type="button">Собрать и скачать архив</button>
+    </section>
+    <section>
+      <h3>Импорт</h3>
+      <input id="resultsImportFile" type="file" accept=".zip,application/zip" aria-label="Архив результатов">
+      <button id="resultsImportCheck" class="button secondary" type="button">Проверить архив</button>
+      <button id="resultsImportApply" class="button" type="button" hidden>Импортировать и объединить</button>
+      <button id="resultsImportResume" class="button" type="button" hidden>Завершить импорт</button>
+    </section>
+    <p id="resultsTransferStatus" role="status" aria-live="polite"></p>
+    <button id="resultsTransferClose" class="button secondary" type="button">Закрыть</button>
+  </dialog>
   <div id="toast" class="toast" hidden></div>
   <script type="module" src="gallery.js"></script>
 </body>

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { createUpdateManager, UPDATE_STATE_FILE } from './update-utils.mjs';
+import { createResultsTransferManager } from '../extension/local-service/results-transfer.mjs';
 import {
   controlCommandMatchesClient,
   extensionIdFromOrigin,
@@ -18,8 +19,8 @@ const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const EXTENSION_ROOT = path.join(PROJECT_ROOT, 'extension');
 const HOST = process.env.WATCH_AUTOMATION_HOST || '127.0.0.1';
 const PORT = Number(process.env.WATCH_AUTOMATION_PORT || 17321);
-const WATCHER_API_VERSION = 10;
-const WATCHER_BUILD_ID = '2026-10-05.1';
+const WATCHER_API_VERSION = 11;
+const WATCHER_BUILD_ID = '2026-10-05.2';
 const DEBOUNCE_MS = Number(process.env.WATCH_AUTOMATION_DEBOUNCE_MS || 650);
 const POLL_MS = Number(process.env.WATCH_AUTOMATION_POLL_MS || 5000);
 const DOM_LIBRARY_ROOT = path.join(PROJECT_ROOT, 'diagnostics', 'dom-library');
@@ -78,6 +79,7 @@ const updateManager = createUpdateManager(PROJECT_ROOT, {
     await rescan('manual-update');
   }
 });
+const resultsTransfers = createResultsTransferManager({ outputRoot: defaultOutputRoot });
 
 function relativePath(filePath) {
   return path.relative(EXTENSION_ROOT, filePath).split(path.sep).join('/');
@@ -774,13 +776,13 @@ async function listDiagnosticFiles() {
   return result;
 }
 
-function readRequestBody(request) {
+function readRequestBody(request, maximumBytes = MAX_DOM_REQUEST_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
     request.on('data', (chunk) => {
       total += chunk.length;
-      if (total > MAX_DOM_REQUEST_BYTES) {
+      if (total > maximumBytes) {
         reject(new Error('Request body is too large'));
         request.destroy();
         return;
@@ -881,6 +883,47 @@ function stopStaleWindowsWatcherOnPort() {
 function startHttpServer() {
   server = createServer((request, response) => {
     const requestUrl = new URL(request.url || '/', `http://${HOST}:${PORT}`);
+    if (requestUrl.pathname.startsWith('/results-transfer/')) {
+      const origin = String(request.headers.origin || '');
+      const client = normalizeExtensionUpdateClient({ origin,
+        extensionId: requestUrl.searchParams.get('extensionId'), clientId: requestUrl.searchParams.get('clientId') });
+      if (!client) { jsonResponse(response, 403, { ok: false, error: 'Передача результатов доступна из расширения' }); return; }
+      if (request.method === 'OPTIONS') {
+        response.writeHead(204, { 'Access-Control-Allow-Origin': origin || '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' });
+        response.end(); return;
+      }
+      const id = requestUrl.searchParams.get('id');
+      const owner = client.clientKey;
+      let task;
+      if (request.method === 'POST' && requestUrl.pathname === '/results-transfer/export') {
+        task = readRequestBody(request, 16 * 1024 * 1024).then((payload) => resultsTransfers.startExport(payload.records, owner));
+      } else if (request.method === 'POST' && requestUrl.pathname === '/results-transfer/import') {
+        task = resultsTransfers.uploadImport(request, owner);
+      } else if (request.method === 'POST' && requestUrl.pathname === '/results-transfer/install') {
+        task = resultsTransfers.install(id, owner);
+      } else if (request.method === 'GET' && requestUrl.pathname === '/results-transfer/status') {
+        task = resultsTransfers.status(id, owner);
+      } else if (request.method === 'GET' && requestUrl.pathname === '/results-transfer/verify') {
+        task = resultsTransfers.verifyInstalled(id, owner);
+      } else if (request.method === 'POST' && requestUrl.pathname === '/results-transfer/finish') {
+        task = resultsTransfers.finishImport(id, owner);
+      } else if (request.method === 'GET' && requestUrl.pathname === '/results-transfer/archive') {
+        resultsTransfers.archivePath(id, owner).then(async (filePath) => {
+          response.writeHead(200, { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/zip',
+            'Content-Length': (await fs.stat(filePath)).size, 'Cache-Control': 'no-store' });
+          const stream = createReadStream(filePath);
+          stream.once('close', () => {
+            if (response.writableFinished) void resultsTransfers.finishExport(id, owner).catch(() => {});
+          });
+          stream.on('error', () => response.destroy()); stream.pipe(response);
+        }).catch((error) => jsonResponse(response, 400, { ok: false, error: error.message }));
+        return;
+      } else { jsonResponse(response, 404, { ok: false, error: 'Неизвестный маршрут передачи' }); return; }
+      task.then((value) => jsonResponse(response, 200, { ok: true, value }))
+        .catch((error) => jsonResponse(response, 400, { ok: false, error: error.message }));
+      return;
+    }
     if (requestUrl.pathname.startsWith('/update')) {
       const origin = String(request.headers.origin || '');
       const updateClient = normalizeExtensionUpdateClient({
