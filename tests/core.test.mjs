@@ -1767,7 +1767,11 @@ test('package integrity: SHA256SUMS entries exist and match the shipped source t
     const file = path.join(root, relative.trim());
     try {
       const bytes = await readFile(file);
-      const actual = createHash('sha256').update(bytes).digest('hex');
+      // Git checkouts on Windows can convert LF to CRLF. Source integrity
+      // uses canonical LF for text; release ZIP hashes verify exact bytes.
+      const isText = relative.trim() === '.gitignore' || /\.(?:md|m?js|json|html|css|cmd|ps1|txt|ya?ml)$/i.test(relative.trim());
+      const canonical = isText ? Buffer.from(bytes.toString('utf8').replace(/\r\n/g, '\n')) : bytes;
+      const actual = createHash('sha256').update(canonical).digest('hex');
       if (actual !== expected.toLowerCase()) failures.push(`${relative.trim()}: checksum mismatch`);
     } catch {
       failures.push(`${relative.trim()}: missing`);
