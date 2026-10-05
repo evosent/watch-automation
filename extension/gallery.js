@@ -1,3 +1,4 @@
+import { initResultsTransfer } from './results-transfer-ui.js';
 import {
   WATCH_BRAND_FILTERS,
   QUEUE_GROUP_IDS,
@@ -12,7 +13,6 @@ import {
 } from './idb.js';
 import { factsDisplayState, effectiveFactsWarnings, sortGalleryRecords } from './gallery-utils.js';
 import { galleryRecordsFromCatalog, currentRevisionsForCatalog } from './gallery-revision-utils.js';
-import { initResultsTransfer } from './results-transfer-ui.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 160;
@@ -290,7 +290,10 @@ async function loadState() {
   } else {
     pieces.push('нет доступа к выбранной папке — восстанови разрешение в основном расширении');
   }
+  $('diskCount').textContent = String(physicalPngs + archivedPngs);
   $('folderStatus').textContent = pieces.join(' · ');
+  const fileStatus = $('folderStatus').closest('details');
+  if (fileStatus && (watcherError || (outputDestination?.mode === 'custom' && customPermission !== 'granted'))) fileStatus.open = true;
   populateBrands();
   applyFilters();
   scheduleRevisionFactsRecovery(currentRevisions);
@@ -344,6 +347,9 @@ function applyFilters() {
   const sale = $('saleFilter').value;
   const quality = $('qualityFilter').value;
   const factsFilter = $('factsFilter')?.value || 'all';
+  const activeFilters = [sale, quality, factsFilter].filter((value) => value !== 'all').length;
+  $('activeFilterCount').textContent = String(activeFilters);
+  $('activeFilterCount').hidden = activeFilters === 0;
   filtered = records.filter((record) => {
     const haystack = `${record.modelName || ''} ${record.fileName || ''} ${record.outputFileName || ''} ${record.facts?.utp1 || ''} ${record.facts?.utp2 || ''} ${record.facts?.waterResistance || ''} ${record.facts?.caseSize || ''}`.toLowerCase();
     if (query && !haystack.includes(query)) return false;
@@ -387,16 +393,16 @@ function render() {
     const factsState = factsDisplayState(record);
     const warnings = factsState.warnings;
     const factsChip = factsState.kind === 'ok'
-      ? '<span class="chip good">текст ✓</span>'
+      ? '<span class="chip good">Текст ✓</span>'
       : factsState.kind === 'warning'
-        ? `<span class="chip warning">⚠ ${warnings.length}</span>`
+        ? `<span class="chip warning" title="Замечания к тексту карточки">⚠ ${warnings.length}</span>`
         : factsState.kind === 'error'
           ? '<span class="chip error">ошибка</span>'
           : factsState.kind === 'pending'
             ? '<span class="chip muted">обработка…</span>'
             : '<span class="chip muted">нет данных</span>';
     return `<article class="card" data-source-id="${escapeHtml(record.sourceId)}">
-      <div class="thumb" data-open="1">
+      <div class="thumb" data-open="1" role="button" tabindex="0" aria-label="Открыть ${escapeHtml(record.modelName || record.fileName || 'карточку')}">
         <div class="thumb-placeholder">Загрузка превью…</div>
         <img alt="${escapeHtml(record.modelName || record.fileName || '')}" loading="lazy">
         <div class="thumb-badges"><span class="chip">${escapeHtml(meta.brand)}</span>${record.versionCount > 1 ? `<span class="chip">версий ${record.versionCount}</span>` : ''}${factsChip}</div>
@@ -406,7 +412,7 @@ function render() {
         <div class="card-meta"><span>${escapeHtml(meta.sale)}</span><span>${escapeHtml(formatDate(record.generatedAt))}</span></div>
         ${factsState.hasContent ? `<div class="card-facts">${escapeHtml(record.facts?.utp1 || '—')} · ${escapeHtml(record.facts?.waterResistance || '—')} · ${escapeHtml(record.facts?.caseSize || '—')}</div>` : ''}
       </div>
-      <div class="card-actions"><button class="button reject" type="button" data-action="reject">✕ Брак · перегенерировать</button></div>
+      <div class="card-actions"><button class="button reject" type="button" data-action="reject">В брак и перегенерацию</button></div>
     </article>`;
   }).join('');
 
@@ -414,6 +420,11 @@ function render() {
     const sourceId = card.dataset.sourceId;
     const record = records.find((item) => item.sourceId === sourceId);
     card.querySelectorAll('[data-open="1"]').forEach((node) => node.addEventListener('click', () => openViewerBySource(sourceId)));
+    card.querySelector('.thumb').addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      openViewerBySource(sourceId);
+    });
     card.querySelector('[data-action="reject"]')?.addEventListener('click', (event) => { event.stopPropagation(); reject(record).catch(showError); });
     queueThumbnail(record, card.querySelector('img'), card.querySelector('.thumb-placeholder'));
   });
@@ -633,7 +644,7 @@ function renderFactsPanel(record) {
   }
   const warnings = effectiveFactsWarnings(facts);
   panel.innerHTML = `
-    <div class="facts-title">Текст карточки</div>
+    <div class="facts-title">Спецификация</div>
     <dl class="facts-grid">
       <div><dt>Бренд</dt><dd>${escapeHtml(facts.titleBrand || '—')}</dd></div>
       <div><dt>Серия</dt><dd>${escapeHtml(facts.titleSeries || '—')}</dd></div>
@@ -805,6 +816,7 @@ $('refreshGallery').addEventListener('click', () => {
 $('exportFactsCsv')?.addEventListener('click', exportFactsCsv);
 $('exportFactsJson')?.addEventListener('click', exportFactsJson);
 initResultsTransfer({ reload: () => { clearThumbCache(); return loadState(); } });
+if (location.hash === '#transfer') $('resultsTransferOpen').click();
 $('search').addEventListener('input', applyFilters);
 ['brandFilter', 'saleFilter', 'qualityFilter', 'factsFilter', 'sortOrder'].forEach((id) => $(id)?.addEventListener('change', applyFilters));
 $('loadMore').addEventListener('click', () => { shown += PAGE_SIZE; render(); });

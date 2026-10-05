@@ -14,22 +14,30 @@
         <div class="brand-copy">
           <h1>Автогенерация</h1>
         </div>
-        <a class="expand-workspace" href="sidepanel.html" target="_blank" rel="noopener" title="Открыть рабочее окно на весь экран" aria-label="Открыть рабочее окно на весь экран">↗</a>
+        <a class="expand-workspace" href="sidepanel.html" target="_blank" rel="noopener" title="Открыть в отдельной вкладке" aria-label="Открыть в отдельной вкладке">↗</a>
+        <div class="health-cluster" aria-label="Состояние системы">
+          <span class="health-item" title="Состояние расширения">
+            <span id="statusSignal" class="health-signal is-ready" aria-hidden="true"></span>
+            <strong id="status">OK</strong>
+          </span>
+          <span class="health-item" title="Пауза отправки">
+            <span id="pauseSignal" class="health-signal is-ready" aria-hidden="true"></span>
+            <strong id="pauseStatus">OK</strong>
+          </span>
+        </div>
       </div>
 
       <nav class="workspace-tabs" aria-label="Разделы панели">
-        <button class="workspace-tab is-active" type="button" data-workspace-tab="queues" aria-selected="true">Очереди</button>
-        <button class="workspace-tab" type="button" data-workspace-tab="run" aria-selected="false">Прогон</button>
-        <button class="workspace-tab" type="button" data-workspace-tab="settings" aria-selected="false">Настройки</button>
+        <button class="workspace-tab" type="button" data-workspace-tab="models" aria-selected="false">Очереди</button>
+        <button class="workspace-tab is-active" type="button" data-workspace-tab="run" aria-selected="true">Прогон</button>
+        <button class="workspace-tab" type="button" data-workspace-tab="service" aria-selected="false">Настройки</button>
       </nav>
-      <div class="header-actions">
-        <button id="openDownloadsFolder" class="secondary header-folder-button" type="button" title="Открыть папку с результатами">Папка результатов</button>
-        <button id="openGallery" class="gallery-launch" type="button" title="Галерея, импорт и экспорт архивов результатов">
-          <span class="gallery-launch-icon" aria-hidden="true">▦</span>
-          <span class="gallery-launch-label">Результаты</span>
-          <span class="gallery-launch-arrow" aria-hidden="true">↗</span>
-        </button>
-      </div>
+      <div class="header-actions"><button id="openDownloadsFolder" class="secondary" type="button">Папка результатов</button>
+      <button id="openGallery" class="gallery-launch" type="button" title="Открыть галерею генераций в отдельной вкладке">
+        <span class="gallery-launch-icon" aria-hidden="true">▦</span>
+        <span class="gallery-launch-label">Результаты</span>
+        <span class="gallery-launch-arrow" aria-hidden="true">↗</span>
+      </button></div>
     </header>
 
     <div id="feedback" class="feedback" role="status" aria-live="polite" hidden>
@@ -39,26 +47,19 @@
     </div>
 
     <div class="workspace">
-      <section class="workspace-view" data-workspace-view="run" hidden>
+      <section class="workspace-view" data-workspace-view="run">
         <section class="panel-card launch-card">
-          <div class="card-heading launch-summary-heading">
-            <div>
-              <span class="eyebrow">ВЫБРАННАЯ ОЧЕРЕДЬ</span>
-              <h2 id="launchTitle">Выберите часть очереди</h2>
-            </div>
-            <button type="button" class="text-button" data-workspace-tab="queues">Изменить</button>
-          </div>
-          <div id="launchSelectionPath" class="selection-path" aria-live="polite"></div>
-          <div id="launchQueueSummary" class="selection-summary" aria-live="polite">Сначала выберите очередь, категорию, бренд и часть.</div>
-          <div id="preflightSummary" class="preflight-summary" role="status" aria-live="polite">Перед стартом выполню проверку файлов, референсов и локального сервиса.</div>
+          <div class="card-heading"><h2 id="launchTitle">Выберите часть очереди</h2><button type="button" class="text-button" data-workspace-tab="models">Выбрать</button></div>
+          <div id="launchSelectionPath" class="selection-path"></div>
+          <div id="launchQueueSummary" class="selection-summary"></div>
+          <div id="preflightSummary" class="preflight-summary" role="status" aria-live="polite" hidden></div>
           <textarea id="prompt" hidden readonly aria-hidden="true"></textarea>
         </section>
 
         <section class="panel-card run-status-card" aria-labelledby="runStatusTitle">
           <div class="run-status-heading">
             <div>
-              <span class="eyebrow">СТАТУС</span>
-              <h2 id="runStatusTitle">Ход прогона</h2>
+              <h2 id="runStatusTitle">Текущий прогон</h2>
             </div>
             <span id="stateBadge" class="state-badge">ГОТОВО</span>
           </div>
@@ -97,61 +98,31 @@
 
       </section>
 
-      <section class="workspace-view" data-workspace-view="queues">
-        <div class="queue-selection-state" aria-hidden="true" hidden>
-            <label class="field"><span>Список запуска</span>
-              <select id="runQueueMode">
-                <option value="">Выберите очередь</option>
-                <option value="regular">Обычная очередь</option>
-                <option value="regeneration">Перегенерация брака</option>
-              </select>
-            </label>
-            <label class="field"><span>Статус и качество</span>
-              <select id="runGroupFilter" aria-label="Статус и качество модели">
-                <option value="">Выберите точную категорию</option>
-                <option value="in_sale_good">В продаже · хорошее</option>
-                <option value="in_sale_bad">В продаже · плохое</option>
-                <option value="not_in_sale_good">Не в продаже · хорошее</option>
-                <option value="not_in_sale_bad">Не в продаже · плохое</option>
-              </select>
-            </label>
-            <label class="field"><span>Бренд</span>
-              <select id="runBrandFilter" aria-label="Бренд для запуска"><option value="">Выберите один бренд</option></select>
-            </label>
-            <label class="field"><span>Часть очереди</span>
-              <select id="runPart" aria-label="Часть очереди"><option value="">Сначала задайте фильтры</option></select>
-            </label>
-        </div>
-
+      <section class="workspace-view" data-workspace-view="models" hidden>
         <div class="playlist-layout">
-          <section class="playlist-library" aria-label="Обзор очередей и прогресса">
-            <div class="card-heading models-heading"><h2>Очереди</h2><span id="memoryTreeSummary" class="summary-meta">Загрузка прогресса…</span></div>
-            <div class="queue-modes" aria-label="Фильтр обзора очередей">
+          <section class="playlist-library" aria-label="Очереди генерации">
+            <div class="card-heading"><h2>Очереди</h2><span id="memoryTreeSummary" class="summary-meta"></span></div>
+            <div class="queue-modes" aria-label="Тип очереди">
               <button type="button" data-playlist-mode="regular" aria-pressed="true">Основная <span id="regularQueueCount"></span></button>
               <button type="button" data-playlist-mode="regeneration" aria-pressed="false">Перегенерация <span id="repairQueueCount"></span></button>
             </div>
-            <input id="playlistSearch" type="search" placeholder="Найти бренд или модель" aria-label="Поиск в дереве очередей" autocomplete="off">
-            <div id="memoryTree" class="memory-tree" aria-live="polite"></div>
+            <input id="playlistSearch" type="search" placeholder="Найти бренд или модель" aria-label="Поиск очереди" autocomplete="off">
+            <div id="memoryTree" class="memory-tree"></div>
           </section>
-
-          <section class="panel-card models-card" aria-label="Модели выбранной части">
-            <div class="card-heading models-heading"><h2 id="selectedPartTitle">Выберите часть</h2><span id="memoryVisibleCount" class="section-chip">Показано 0/0</span></div>
+          <section class="panel-card models-card">
+            <div class="card-heading models-heading"><h2 id="selectedPartTitle">Выберите часть</h2><span id="memoryVisibleCount" class="section-chip"></span></div>
             <div id="selectedPartPath" class="selection-path"></div>
             <div id="selectedPartProgress" class="part-progress" hidden>
               <div class="part-progress-heading"><strong id="partProgressCount"></strong><span id="partProgressPercent"></span></div>
               <div id="partProgressTrack" class="run-progress-track" role="progressbar" aria-label="Готовность выбранной части" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="partProgressBar" class="run-progress-bar"></div></div>
             </div>
-            <div id="memoryStats" class="memory-stats" aria-live="polite"></div>
-            <button id="useSelectedPart" class="secondary use-part-button" type="button" hidden>Использовать эту часть для запуска</button>
+            <div id="memoryStats" class="memory-stats"></div>
+            <button id="useSelectedPart" class="secondary" type="button" hidden>Выбрать для запуска</button>
             <div class="model-filters">
               <input id="memorySearch" type="search" placeholder="Поиск в части" aria-label="Поиск модели в выбранной части" autocomplete="off">
-              <select id="memoryStatusFilter" aria-label="Фильтр статуса модели">
-                <option value="all">Все статусы</option>
-                <option value="not_ready">Не готово</option>
-                <option value="running">В работе</option>
-                <option value="image_saved">Фото сохранено · ждёт спецификацию</option>
-                <option value="facts_pending">Получение спецификации</option>
-                <option value="ready">Готово</option>
+              <select id="memoryStatusFilter" aria-label="Статус модели">
+                <option value="all">Все статусы</option><option value="not_ready">Не готово</option><option value="running">В работе</option>
+                <option value="image_saved">Фото сохранено</option><option value="facts_pending">Получение спецификации</option><option value="ready">Готово</option>
               </select>
             </div>
             <div class="memory-table-head" aria-hidden="true"><span>Модель</span><span>Результат</span></div>
@@ -160,45 +131,42 @@
         </div>
       </section>
 
-      <section class="workspace-view" data-workspace-view="settings" hidden>
-        <details class="panel-card disclosure" id="generationSettingsDisclosure">
+      <section class="workspace-view" data-workspace-view="service" hidden>
+        <details class="panel-card disclosure" id="promptDisclosure">
           <summary>
             <span class="summary-copy">
-              <span class="eyebrow">ЗАПУСК</span>
-              <strong>Параметры генерации</strong>
+              <strong>Генерация</strong><span id="promptStatus" class="status-text">загрузка</span>
             </span>
           </summary>
-          <div class="disclosure-body">
-            <div class="launch-grid compact-launch-options">
-              <label class="field"><span>Вкладки</span>
-                <select id="workerCount">
-                  <option value="2">2</option>
-                  <option value="3">3</option>
-                  <option value="4" selected>4</option>
-                  <option value="5">5</option>
-                  <option value="6">6</option>
-                </select>
-              </label>
-              <label class="field"><span>Фото за запуск</span>
-                <input type="number" id="runLimit" min="1" max="100" step="1" value="100" inputmode="numeric">
-              </label>
-              <label class="field"><span>Референсы</span>
-                <select id="inputMode" title="Сколько изображений прикладывать к генерации">
-                  <option value="2" selected>2 · шаблон + часы</option>
-                  <option value="3">3 · шаблон + Ozon + часы</option>
-                  <option value="4">4 · legacy</option>
-                </select>
-              </label>
-            </div>
-            <p class="service-copy">Эти параметры сохраняются в черновике и блокируются на время активного прогона.</p>
+          <div class="disclosure-body compact-body">          <div class="launch-grid">
+            <label class="field"><span>Рабочие вкладки</span>
+              <select id="workerCount">
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4" selected>4</option>
+                <option value="5">5</option>
+                <option value="6">6</option>
+              </select>
+            </label>
+            <label class="field"><span>Фото за запуск</span>
+              <input type="number" id="runLimit" min="1" max="100" step="1" value="100" inputmode="numeric">
+            </label>
+            <label class="field field-wide"><span>Референсы</span>
+              <select id="inputMode" title="Сколько изображений прикладывать к генерации">
+                <option value="2" selected>2 · шаблон + часы</option>
+                <option value="3">3 · шаблон + Ozon + часы</option>
+                <option value="4">4 · шаблон + Ozon + лого + часы</option>
+              </select>
+            </label>
+          </div>
+            <div class="info-row"><span>Схема</span><strong>Base Prompt v5 + профиль бренда</strong></div>
+            <div class="info-row"><span>Режим</span><strong>2 / 3 / 4 изображения</strong></div>
           </div>
         </details>
-
         <details class="panel-card disclosure" id="updateDisclosure">
           <summary>
             <span class="summary-copy">
-              <span class="eyebrow">ОБНОВЛЕНИЕ</span>
-              <strong>Версия расширения</strong>
+              <strong>Обновление</strong>
             </span>
             <span id="extensionVersion" class="summary-meta">проверяю…</span>
           </summary>
@@ -208,14 +176,13 @@
               <button id="updateExtension" class="secondary" type="button">Проверить и обновить</button>
               <button id="retryExtensionRestart" class="primary" type="button" hidden>Повторить перезапуск</button>
             </div>
-            <p id="updateStatus" class="update-status" role="status" aria-live="polite">Проверка запускается вручную из этого раздела.</p>
+            <p id="updateStatus" class="update-status" role="status" aria-live="polite"></p>
           </div>
         </details>
 
         <details class="panel-card disclosure" id="timingDisclosure">
           <summary>
             <span class="summary-copy">
-              <span class="eyebrow">ИНТЕРВАЛЫ</span>
               <strong>Паузы генерации</strong>
             </span>
           </summary>
@@ -256,7 +223,6 @@
         <details class="panel-card disclosure" id="sourcesDisclosure">
           <summary>
             <span class="summary-copy">
-              <span class="eyebrow">ДАННЫЕ</span>
               <strong>Файлы и результаты</strong>
             </span>
             <span id="folderStatus" class="summary-meta">проверяю…</span>
@@ -303,10 +269,9 @@
         <details class="panel-card disclosure" id="diagnosticsDisclosure">
           <summary>
             <span class="summary-copy">
-              <span class="eyebrow">СИСТЕМА</span>
               <strong>Диагностика</strong>
             </span>
-            <span id="domDiagnosticsStatus" class="summary-meta" role="status" aria-live="polite">выключена</span>
+            <span id="domDiagnosticsStatus" class="summary-meta">выключена</span>
           </summary>
           <div class="disclosure-body">
             <label class="field"><span>Сбор DOM</span>
@@ -329,46 +294,34 @@
               <button id="refreshRunDiagnostics" class="secondary muted" type="button">Обновить список</button>
               <button id="exportRunDiagnostics" class="secondary" type="button" disabled>Скачать прогон JSON</button>
             </div>
-            <p id="runDiagnosticsStatus" class="service-copy" aria-live="polite">Каждый запуск хранится отдельно.</p>
+            <p id="runDiagnosticsStatus" class="service-copy" aria-live="polite"></p>
           </div>
         </details>
 
         <details class="panel-card disclosure" id="historyDisclosure">
           <summary>
             <span class="summary-copy">
-              <span class="eyebrow">ПАМЯТЬ</span>
               <strong>История и данные</strong>
             </span>
             <span id="historyStatus" class="summary-meta">История сохраняется</span>
           </summary>
           <div class="disclosure-body">
             <div class="service-actions two-col">
+              <button id="openResultsTransfer" class="secondary" type="button">Передать результаты · ZIP</button>
               <button id="memoryExport" class="secondary" type="button">Экспорт памяти</button>
               <button id="memoryImport" class="secondary" type="button">Импорт памяти</button>
               <input id="memoryImportFile" type="file" accept="application/json,.json" hidden>
+
               <a href="#" id="clearHistory" class="danger-link">Очистить историю</a>
             </div>
           </div>
         </details>
 
-        <details class="panel-card disclosure" id="promptDisclosure">
-          <summary>
-            <span class="summary-copy">
-              <span class="eyebrow">ПРОМПТ</span>
-              <strong>Конфигурация генерации</strong>
-            </span>
-          </summary>
-          <div class="disclosure-body compact-body">
-            <div class="info-row"><span>Схема</span><strong>Base Prompt v5 + профиль бренда</strong></div>
-            <div class="info-row"><span>Режим</span><strong>2 / 3 / 4 изображения</strong></div>
-            <div class="info-row"><span>Состояние промпта</span><strong id="promptStatus" class="status-text">загружается</strong></div>
-          </div>
-        </details>
+
 
         <details class="panel-card disclosure danger-disclosure" id="maintenanceDisclosure">
           <summary>
             <span class="summary-copy">
-              <span class="eyebrow">ОБСЛУЖИВАНИЕ</span>
               <strong>Сброс и пересканирование</strong>
             </span>
           </summary>
@@ -381,7 +334,6 @@
         <details class="panel-card disclosure logs-section" id="logsDisclosure">
           <summary>
             <span class="summary-copy">
-              <span class="eyebrow">ЖУРНАЛ</span>
               <strong>Последние события</strong>
             </span>
             <span class="logs-hint">12 записей</span>
@@ -394,7 +346,7 @@
     <footer class="command-dock">
       <div class="dock-state">
         <span id="dockLabel" class="dock-label">Выберите часть очереди</span>
-        <span id="dockCopy" class="dock-copy">Проверка перед стартом выполняется автоматически</span>
+        <span id="dockCopy" class="dock-copy"></span>
       </div>
       <div class="dock-actions">
         <button id="start" class="primary"><span class="button-icon">▶</span><span>Запустить</span></button>
@@ -403,6 +355,37 @@
       </div>
     </footer>
   </main>
+<div hidden aria-hidden="true" id="legacyLaunchSelection"><section class="queue-picker">
+
+            <label class="field"><span>Список запуска</span>
+              <select id="runQueueMode">
+                <option value="">Выберите очередь</option>
+                <option value="regular">Обычная очередь</option>
+                <option value="regeneration">Перегенерация брака</option>
+              </select>
+            </label>
+            <div class="filter-grid launch-filters">
+              <label class="field"><span>Статус и качество</span>
+                <select id="runGroupFilter" aria-label="Статус и качество модели">
+                  <option value="">Выберите точную категорию</option>
+                  <option value="in_sale_good">В продаже · хорошее</option>
+                  <option value="in_sale_bad">В продаже · плохое</option>
+                  <option value="not_in_sale_good">Не в продаже · хорошее</option>
+                  <option value="not_in_sale_bad">Не в продаже · плохое</option>
+                </select>
+              </label>
+              <label class="field"><span>Бренд</span>
+                <select id="runBrandFilter" aria-label="Бренд для запуска">
+                  <option value="">Выберите один бренд</option>
+                </select>
+              </label>
+              <label class="field"><span>Часть очереди</span>
+                <select id="runPart" aria-label="Часть очереди">
+                  <option value="">Сначала задайте фильтры</option>
+                </select>
+              </label>
+            </div>
+          </section></div>
   <script type="module" src="sidepanel.js"></script>
 </body>
 </html>

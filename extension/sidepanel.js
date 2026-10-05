@@ -1,3 +1,4 @@
+import { buildPlaylistProgressTree, findPlaylistPart, playlistPath } from './playlist-ui-utils.js';
 import {
   QUEUE_GROUP_IDS,
   QUEUE_GROUPS,
@@ -5,7 +6,6 @@ import {
   applyGenerationHistory,
   applyGenerationMemory,
   brandIdFromModelName,
-  buildQueueProgressTree,
   classifyWatchPath,
   chooseSourceVariant,
   filterFromQueueGroup,
@@ -96,17 +96,17 @@ const MAX_RATE_LIMIT_PAUSE_MINUTES = 30;
 // UI workspace v2: keep the daily workflow compact by separating launch,
 // catalogue and maintenance into independent views. This state is local to
 // the side panel and never changes automation/runtime state.
-const UI_VIEW_STORAGE_KEY = 'watchAutomation.uiView.v4';
-const UI_VIEW_STORAGE_KEY_LEGACY = 'watchAutomation.uiView.v3';
+const UI_VIEW_STORAGE_KEY = 'watchAutomation.uiView.v5';
+const UI_VIEW_STORAGE_KEY_LEGACY = 'watchAutomation.uiView.v4';
 const UI_VIEW_STORAGE_KEY_OLDEST = 'watchAutomation.uiView.v2';
 const UI_DISCLOSURE_STORAGE_KEY = 'watchAutomation.disclosures.v3';
-const UI_VIEWS = new Set(['queues', 'run', 'settings']);
-let memoryTreeMode = 'regular';
+const UI_VIEWS = new Set(['models', 'run', 'service']);
+let playlistMode = 'regular';
 
 function canonicalWorkspaceView(value) {
   const view = String(value || '');
-  const migrated = view === 'models' ? 'queues' : view === 'service' ? 'settings' : view;
-  return UI_VIEWS.has(migrated) ? migrated : 'queues';
+  const migrated = view === 'queues' ? 'models' : view === 'settings' ? 'service' : view;
+  return UI_VIEWS.has(migrated) ? migrated : 'models';
 }
 
 function setWorkspaceView(view, { persist = true } = {}) {
@@ -114,7 +114,7 @@ function setWorkspaceView(view, { persist = true } = {}) {
   document.querySelectorAll('[data-workspace-view]').forEach((node) => {
     node.hidden = node.dataset.workspaceView !== next;
   });
-  document.querySelectorAll('.workspace-tab[data-workspace-tab]').forEach((button) => {
+  document.querySelectorAll('[data-workspace-tab]').forEach((button) => {
     const active = button.dataset.workspaceTab === next;
     button.classList.toggle('is-active', active);
     button.setAttribute('aria-selected', active ? 'true' : 'false');
@@ -122,7 +122,7 @@ function setWorkspaceView(view, { persist = true } = {}) {
   if (persist) {
     try { localStorage.setItem(UI_VIEW_STORAGE_KEY, next); } catch (_) {}
   }
-  if (next === 'queues') {
+  if (next === 'models') {
     lastMemoryRenderKey = '';
     renderGenerationMemory();
   }
@@ -138,19 +138,10 @@ function disclosureState() {
 }
 
 function initWorkspaceUi() {
-  let initialView = 'queues';
+  let initialView = 'models';
   try {
-    const savedView = localStorage.getItem(UI_VIEW_STORAGE_KEY);
-    const previousView = savedView ? ''
-      : localStorage.getItem(UI_VIEW_STORAGE_KEY_LEGACY) || localStorage.getItem(UI_VIEW_STORAGE_KEY_OLDEST);
-    initialView = canonicalWorkspaceView(savedView || previousView || 'queues');
-    if (!savedView) {
-      // The previous default opened the run dashboard, while the new workspace
-      // starts on the queue overview. Migrate that view once; keep an explicit
-      // Settings choice and all future v4 selections intact.
-      if (previousView && canonicalWorkspaceView(previousView) === 'run') initialView = 'queues';
-      localStorage.setItem(UI_VIEW_STORAGE_KEY, initialView);
-    }
+    initialView = canonicalWorkspaceView(localStorage.getItem(UI_VIEW_STORAGE_KEY)
+      || localStorage.getItem(UI_VIEW_STORAGE_KEY_LEGACY) || 'models');
   } catch (_) {}
   setWorkspaceView(initialView, { persist: false });
 
@@ -249,6 +240,81 @@ function requestInlineConfirmation(message, actionLabel, callback) {
   });
 }
 
+function sentenceCase(value) {
+  const text = String(value || '');
+  return text ? text.charAt(0).toUpperCase() + text.slice(1).toLowerCase().replace(/ocr/g, 'OCR') : '';
+}
+
+function playlistSelectionLocked() {
+  return actionBusy || ['RUNNING', 'STARTING', 'DRAINING', 'RECONCILING'].includes(runtime.state)
+    || (runtime.state === 'PAUSED' && Boolean(runtime.run));
+}
+
+function selectedLaunchPlaylist() {
+  const signature = String($('runPart')?.dataset.partitionSignature || '');
+  return findPlaylistPart(currentMemoryProgressTree().tree, (part) => part.mode === launchQueueMode()
+    && part.groupId === $('runGroupFilter').value && part.brandId === $('runBrandFilter').value
+    && part.partNumber === Number($('runPart').value) && part.signature === signature);
+}
+
+function restorePlaylistSelection() {
+  if (selectedMemoryPartId) return;
+  const part = selectedLaunchPlaylist();
+  if (part) {
+    selectedMemoryPartId = part.id;
+    playlistMode = part.mode;
+  }
+}
+
+function selectPlaylistForLaunch(part) {
+  if (!part || playlistSelectionLocked()) return false;
+  const fresh = findMemoryPart(currentMemoryProgressTree().tree, part.id);
+  if (!fresh || fresh.signature !== part.signature) return false;
+  $('runQueueMode').value = fresh.mode;
+  $('runGroupFilter').value = fresh.groupId;
+  $('runBrandFilter').value = fresh.brandId;
+  resetRunPartSelection();
+  updateLaunchQueueSummary();
+  if (currentLaunchPartPlan?.signature !== fresh.signature) return false;
+  $('runPart').value = String(fresh.partNumber);
+  desiredRunPart = String(fresh.partNumber);
+  desiredRunPartSignature = fresh.signature;
+  lastPreflight = null;
+  renderPreflight(null);
+  updateLaunchQueueSummary();
+  updateActionButtons();
+  return true;
+}
+
+function renderPlaylistLaunchSummary(plan) {
+  const partNumber = Number($('runPart')?.value || 0);
+  const part = plan?.parts.find((item) => item.partNumber === partNumber);
+  const active = runtime.run && !['IDLE', 'DONE', 'STOPPED'].includes(runtime.state);
+  const label = active
+    ? `Часть ${runtime.runPart || '—'} · текущий прогон`
+    : part ? `Часть ${partNumber} · ${part.count} моделей` : 'Выберите часть очереди';
+  const path = active ? runtime.filterLabel || filterLabel(runtime.filter) : part ? playlistPath({ mode: launchQueueMode(), brandId: $('runBrandFilter').value, groupId: $('runGroupFilter').value }) : '';
+  if ($('launchTitle')) $('launchTitle').textContent = label;
+  if ($('launchSelectionPath')) $('launchSelectionPath').textContent = path;
+  if ($('dockLabel')) $('dockLabel').textContent = label;
+  if ($('dockCopy')) $('dockCopy').textContent = active ? path : part ? `${WATCH_BRAND_FILTERS.find((item) => item.id === $('runBrandFilter').value)?.label || ''} · до ${$('runLimit').value} фото · ${$('workerCount').value} вкладки` : '';
+}
+
+function renderSelectedPlaylist(part) {
+  $('selectedPartTitle').textContent = part ? `Часть ${part.partNumber}` : 'Выберите часть';
+  $('selectedPartPath').textContent = playlistPath(part);
+  $('selectedPartProgress').hidden = !part;
+  const selectedLaunch = selectedLaunchPlaylist();
+  $('useSelectedPart').hidden = !part || selectedLaunch?.id === part.id;
+  $('useSelectedPart').disabled = playlistSelectionLocked();
+  if (!part) return;
+  $('partProgressCount').textContent = part.mode === REGENERATION_QUEUE_ID ? `${part.queued} в очереди на повтор` : `${part.done} из ${part.total} готово`;
+  $('partProgressPercent').textContent = part.mode === REGENERATION_QUEUE_ID ? '' : `${part.percent}%`;
+  $('partProgressTrack').hidden = part.mode === REGENERATION_QUEUE_ID;
+  $('partProgressTrack').setAttribute('aria-valuenow', String(part.percent));
+  $('partProgressBar').style.width = `${part.percent}%`;
+}
+
 function filterFromInputs() {
   const groupId = String($('runGroupFilter')?.value || 'all');
   const groupFilter = QUEUE_GROUP_IDS.includes(groupId)
@@ -345,38 +411,6 @@ function launchQueueEntries(plan = launchQueuePartPlan()) {
   return selectedEntries.filter((entry) => !repairs.has(String(entry.sourceId)) && !['done', 'running'].includes(entry.status));
 }
 
-function renderLaunchSelectionDisplay(plan = currentLaunchPartPlan) {
-  const activeRun = Boolean(runtime.run && !['IDLE', 'DONE', 'STOPPED'].includes(String(runtime.state || '').toUpperCase()));
-  const partNumber = Number($('runPart')?.value || 0);
-  const selectedPart = plan?.parts?.find((part) => part.partNumber === partNumber);
-  const modeLabel = launchQueueMode() === REGENERATION_QUEUE_ID ? 'Перегенерация брака' : 'Обычная очередь';
-  const label = activeRun
-    ? `Часть ${runtime.runPart || '—'} · текущий прогон`
-    : selectedPart
-      ? `Часть ${selectedPart.partNumber} из ${plan.partCount}`
-      : 'Выберите часть очереди';
-  const path = activeRun
-    ? String(runtime.filterLabel || filterLabel(runtime.filter || filterFromInputs()))
-    : selectedPart
-      ? `${modeLabel} · ${filterLabel()}`
-      : '';
-  const summary = activeRun
-    ? `${runtime.runCompleted || 0} из ${runtime.runTotal || '—'} в текущем запуске`
-    : selectedPart
-      ? `${launchQueueEntries(plan).length} моделей готовы к запуску · до ${$('runLimit')?.value || RUN_PART_SIZE} фото за запуск`
-      : 'Сначала выберите очередь, точную категорию, бренд и часть.';
-  if ($('launchTitle')) $('launchTitle').textContent = label;
-  if ($('launchSelectionPath')) $('launchSelectionPath').textContent = path;
-  if ($('launchQueueSummary')) $('launchQueueSummary').textContent = summary;
-  if ($('dockLabel')) $('dockLabel').textContent = activeRun ? label : selectedPart ? `${label} · ${selectedPart.count} моделей` : 'Выберите часть очереди';
-  if ($('dockCopy') && (activeRun || !lastPreflight)) {
-    $('dockCopy').textContent = activeRun
-      ? String(runtime.currentAction || 'Прогон выполняется')
-      : selectedPart
-        ? `${WATCH_BRAND_FILTERS.find((item) => item.id === $('runBrandFilter')?.value)?.label || ''} · ${$('workerCount')?.value || 4} вкладки`
-        : 'Запуск станет доступен после точного выбора части';
-  }
-}
 
 function resetRunPartSelection() {
   desiredRunPart = '';
@@ -389,10 +423,7 @@ function resetRunPartSelection() {
 
 function updateLaunchQueueSummary() {
   const node = $('launchQueueSummary');
-  if (!node) {
-    renderLaunchSelectionDisplay(null);
-    return;
-  }
+  if (!node) return;
   const select = $('runPart');
   const selectionExact = launchSelectionIsExact();
   const plan = selectionExact ? launchQueuePartPlan() : null;
@@ -423,24 +454,21 @@ function updateLaunchQueueSummary() {
       select.value = '';
     }
   }
-  const count = launchQueueEntries(plan).length;
+  renderPlaylistLaunchSummary(plan);
   if (!selectionExact) {
-    renderLaunchSelectionDisplay(plan);
+    node.textContent = 'Выберите часть в очередях';
     return;
   }
   if (!plan?.total) {
-    renderLaunchSelectionDisplay(plan);
+    node.textContent = launchQueueMode() === REGENERATION_QUEUE_ID
+      ? 'В очереди брака нет подходящих моделей'
+      : 'По этим фильтрам моделей нет';
     return;
   }
   const selectedNumber = Number(select?.value || 0);
   const selectedPart = plan.parts.find((part) => part.partNumber === selectedNumber);
-  const tail = selectedPart ? ` · часть ${selectedPart.partNumber}/${plan.partCount} · к запуску ${count}` : ` · ${plan.partCount} частей`;
-  if (!select?.value) {
-    node.textContent = `${plan.total} моделей · ${plan.partCount} частей · ${filterLabel()}`;
-  } else {
-    node.textContent = `${plan.total} моделей${tail} · ${filterLabel()}`;
-  }
-  renderLaunchSelectionDisplay(plan);
+  const tail = selectedPart ? ` · часть ${selectedPart.partNumber}/${plan.partCount}` : ` · ${plan.partCount} частей`;
+  node.textContent = `${selectedPart?.count || plan.total} моделей${tail}`;
 }
 
 function filterLabel(filterValue = filterFromInputs()) {
@@ -1326,23 +1354,24 @@ function renderAll() {
   $('folderStatus').textContent = referenceSummary;
   const historyTotal = Object.values(counts).reduce((sum, item) => sum + item.done, 0);
   $('historyStatus').textContent = `В истории: ${historyTotal}`;
-  const promptStatus = $('promptStatus');
-  if (promptStatus) promptStatus.textContent = promptText.trim() ? 'готов' : 'ошибка';
+  $('promptStatus').textContent = promptText.trim() ? 'готов' : 'ошибка';
   updateLaunchQueueSummary();
-  renderPreflight(lastPreflight);
+  restorePlaylistSelection();
   renderGenerationMemory();
   renderSlotGrid();
+  renderPreflight(lastPreflight);
   updateActionButtons();
 }
 
 function renderPreflight(result) {
   const node = $('preflightSummary');
   if (!node) return;
+  node.hidden = !result;
   if (!result) {
     node.className = 'preflight-summary';
     node.textContent = 'Перед стартом выполню проверку файлов, референсов и watcher.';
     const dock = $('dockCopy');
-    if (dock) dock.textContent = 'Проверка перед стартом выполняется автоматически';
+    renderPlaylistLaunchSummary(currentLaunchPartPlan);
     return;
   }
   const failed = (result.checks || []).filter((check) => check.blocking && !check.ok);
@@ -1502,7 +1531,7 @@ function renderRunStatus(pause = countdown(runtime.rateLimitPauseUntil)) {
   else if (runtime.status === 'RATE_LIMIT_PAUSE' && pause) badgeLabel = `ПАУЗА ЗАПУСКА · ${pause}`;
   else if (runtime.status === 'RUNNING_WITH_ERRORS') badgeLabel = 'РАБОТАЕТ · ЕСТЬ ОШИБКА';
   else if (runtime.status === 'DONE_WITH_FACTS_ERRORS') badgeLabel = 'ЗАВЕРШЕНО · ОШИБКИ OCR';
-  $('stateBadge').textContent = badgeLabel;
+  $('stateBadge').textContent = sentenceCase(badgeLabel);
   let actionText = runtime.currentAction || (state === 'IDLE' ? 'Ожидание запуска.' : 'Состояние обновляется.');
   if (stalledBatchStage === 'CLOSING') {
     actionText = runtime.currentAction || 'Закрываю зависшие рабочие вкладки; завершённые PNG и прогресс сохранены.';
@@ -1631,8 +1660,8 @@ function renderSlotGrid() {
     state.className = 'slot-state';
     const phase = String(slot?.phase || slot?.status || '').toUpperCase();
     state.textContent = slot
-      ? (slot.finalCheckPending ? 'НАБЛЮДЕНИЕ' : (SLOT_STATE_LABELS[phase] || SLOT_STATE_LABELS[slot.status] || slot.phase || slot.status || 'ОЖИДАНИЕ')).toUpperCase()
-      : 'ГОТОВА';
+      ? sentenceCase(slot.finalCheckPending ? 'наблюдение' : (SLOT_STATE_LABELS[phase] || SLOT_STATE_LABELS[slot.status] || slot.phase || slot.status || 'ожидание'))
+      : 'Свободна';
     head.append(identity, state);
 
     const file = document.createElement('div');
@@ -1715,16 +1744,7 @@ function visibleMemoryRecords(records = memoryRecords(), state = memoryFilterSta
   return records.filter((record) => memoryRecordMatches(record, state));
 }
 
-function updateMemorySummary(records, visible, selectedPart = null) {
-  if (selectedPart) {
-    const partFactsPending = Number(selectedPart.factsPending || 0);
-    const partSummary = selectedPart.mode === REGENERATION_QUEUE_ID
-      ? `${selectedPart.queued} моделей в очереди перегенерации`
-      : `Не готово ${Math.max(0, selectedPart.total - selectedPart.done)}${partFactsPending ? ` · ${partFactsPending} без спецификации` : ''}`;
-    if ($('memoryStats')) $('memoryStats').textContent = partSummary;
-    if ($('memoryVisibleCount')) $('memoryVisibleCount').textContent = `Показано ${visible.length}/${selectedPart.total}`;
-    return;
-  }
+function updateMemorySummary(records, visible) {
   const counts = {
     ready: records.filter((record) => record.status === 'ready').length,
     running: records.filter((record) => record.status === 'running').length,
@@ -1733,7 +1753,7 @@ function updateMemorySummary(records, visible, selectedPart = null) {
     not_ready: records.filter((record) => record.status === 'not_ready').length
   };
   const visibleCount = visible.filter((record) => record.sourcePresent !== false).length;
-  if ($('memoryStats')) $('memoryStats').textContent = `Всего ${records.length} · Готово ${counts.ready} · Фото сохранено ${counts.imageSaved} · OCR ${counts.factsPending} · В работе ${counts.running} · Не готово ${counts.not_ready} · видно ${visibleCount}`;
+  if ($('memoryStats')) $('memoryStats').textContent = records.length ? [counts.running ? `В работе ${counts.running}` : '', counts.imageSaved ? `Фото без спецификации ${counts.imageSaved}` : '', counts.factsPending ? `Получение спецификации ${counts.factsPending}` : '', counts.not_ready ? `Не готово ${counts.not_ready}` : ''].filter(Boolean).join(' · ') : '';
   if ($('memoryVisibleCount')) $('memoryVisibleCount').textContent = `Показано ${visible.length}/${records.length}`;
 }
 
@@ -1758,32 +1778,7 @@ function openMemoryPartPath(nodes, partId, ancestors = []) {
   return false;
 }
 
-function memoryPartPath(nodes, partId, ancestors = []) {
-  for (const node of nodes || []) {
-    const path = [...ancestors, node.label].filter(Boolean);
-    if (node.type === 'part' && node.id === partId) return path;
-    const nested = memoryPartPath(node.children, partId, path);
-    if (nested) return nested;
-  }
-  return null;
-}
 
-function filterMemoryTreeNodes(nodes, search) {
-  const query = String(search || '').trim().toLocaleLowerCase('ru');
-  if (!query) return nodes || [];
-  const result = [];
-  for (const node of nodes || []) {
-    const directText = [node.label, node.id, ...(node.entries || []).flatMap((entry) => [entry.modelName, entry.fileName])]
-      .filter(Boolean).join(' ').toLocaleLowerCase('ru');
-    if (directText.includes(query)) {
-      result.push(node);
-      continue;
-    }
-    const children = filterMemoryTreeNodes(node.children, query);
-    if (children.length) result.push({ ...node, children, searchExpanded: true });
-  }
-  return result;
-}
 
 function memoryTreeSignature(nodes) {
   return (nodes || []).map((node) => [
@@ -1793,6 +1788,8 @@ function memoryTreeSignature(nodes) {
     node.running,
     node.percent,
     node.queued,
+    node.imageSaved,
+    node.factsPending,
     (node.entries || []).map((entry) => entry.sourceId).join(','),
     memoryTreeSignature(node.children)
   ].join(':')).join('|');
@@ -1806,15 +1803,15 @@ function currentMemoryProgressTree() {
     cachedMemoryTreeGroups = queue.groups;
     cachedMemoryTreeRepairQueue = queue.repairQueue;
     cachedMemoryTreeGenerationMemory = generationMemory;
-    cachedMemoryProgressTree = buildQueueProgressTree(queue.groups, queue.repairQueue, RUN_PART_SIZE);
+    cachedMemoryProgressTree = buildPlaylistProgressTree(queue.groups, queue.repairQueue, generationMemory);
     cachedMemoryProgressTreeSignature = memoryTreeSignature(cachedMemoryProgressTree);
   }
   return { tree: cachedMemoryProgressTree, signature: cachedMemoryProgressTreeSignature };
 }
 
 function memoryProgressLabel(node) {
-  if (node.mode === REGENERATION_QUEUE_ID) return `${node.queued} в очереди`;
-  return `${node.done}/${node.total} готово · ${node.percent}%${node.running ? ` · ${node.running} в работе` : ''}${node.factsPending ? ` · ${node.factsPending} без спецификации` : ''}`;
+  if (node.mode === REGENERATION_QUEUE_ID) return `${node.queued} в очереди${node.running ? ` · ${node.running} в работе` : ''}`;
+  return `${node.done}/${node.total} готово · ${node.percent}%${node.running ? ` · ${node.running} в работе` : ''}${node.imageSaved + node.factsPending ? ` · ${node.imageSaved + node.factsPending} без спецификации` : ''}`;
 }
 
 function memoryTreeFolder(node, depth = 0) {
@@ -1823,19 +1820,25 @@ function memoryTreeFolder(node, depth = 0) {
   details.className = 'memory-tree-folder';
   details.dataset.treeId = node.id;
   details.style.setProperty('--tree-depth', String(depth));
-  details.open = memoryTreeOpenIds.has(node.id) || Boolean(node.searchExpanded);
+  details.open = memoryTreeOpenIds.has(node.id);
 
   const summary = document.createElement('summary');
   summary.className = 'memory-tree-summary';
   const icon = document.createElement('span');
   icon.className = 'memory-tree-icon';
   icon.setAttribute('aria-hidden', 'true');
-  icon.textContent = '▰';
+  icon.textContent = '›';
   const copy = document.createElement('span');
   copy.className = 'memory-tree-copy';
   const name = document.createElement('span');
   name.className = 'memory-tree-name';
   name.textContent = node.label;
+  if (node.type === 'brand') {
+    const context = document.createElement('span');
+    context.className = 'playlist-category';
+    context.textContent = QUEUE_GROUPS[node.groupId]?.label || node.groupId;
+    name.append(context);
+  }
   const metric = document.createElement('span');
   metric.className = 'memory-tree-metric';
   metric.textContent = memoryProgressLabel(node);
@@ -1877,7 +1880,7 @@ function memoryTreePart(node, depth = 0) {
   const icon = document.createElement('span');
   icon.className = 'memory-tree-icon';
   icon.setAttribute('aria-hidden', 'true');
-  icon.textContent = '▧';
+  icon.textContent = '≡';
   const copy = document.createElement('span');
   copy.className = 'memory-tree-copy';
   const name = document.createElement('span');
@@ -1904,87 +1907,34 @@ function memoryTreePart(node, depth = 0) {
 function renderMemoryTree(nodes, selectedPart = null) {
   const tree = $('memoryTree');
   if (!tree) return;
+  const scrollTop = tree.scrollTop;
+  const focusedPart = tree.contains(document.activeElement) ? document.activeElement?.dataset.partId : '';
   tree.replaceChildren();
-  const roots = Array.isArray(nodes) ? nodes : [];
-  const regular = roots.find((node) => node.mode === 'regular');
-  const repair = roots.find((node) => node.mode === REGENERATION_QUEUE_ID);
-  const regularButton = document.querySelector('[data-playlist-mode="regular"]');
-  const repairButton = document.querySelector(`[data-playlist-mode="${REGENERATION_QUEUE_ID}"]`);
-  if (regularButton) {
-    regularButton.setAttribute('aria-pressed', String(memoryTreeMode === 'regular'));
-    $('regularQueueCount').textContent = regular ? `${regular.done}/${regular.total}` : '0';
+  const search = String($('playlistSearch')?.value || '').trim().toLowerCase();
+  const root = nodes.find((node) => node.mode === playlistMode);
+  $('regularQueueCount').textContent = String(nodes.find((node) => node.mode === 'regular')?.total || 0);
+  $('repairQueueCount').textContent = String(nodes.find((node) => node.mode === REGENERATION_QUEUE_ID)?.total || 0);
+  document.querySelectorAll('[data-playlist-mode]').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.playlistMode === playlistMode));
+  });
+  const brands = (root?.children || []).flatMap((sale) => sale.children.flatMap((quality) => quality.children));
+  const visible = brands.filter((brand) => !search || `${brand.label} ${QUEUE_GROUPS[brand.groupId]?.label} ${brand.entries.map((entry) => entry.modelName || entry.fileName).join(' ')}`.toLowerCase().includes(search));
+  for (const brand of visible) tree.append(memoryTreeFolder(brand));
+  if (!visible.length) {
+    const empty = document.createElement('p');
+    empty.className = 'memory-empty';
+    empty.textContent = search ? 'Очереди не найдены' : playlistMode === REGENERATION_QUEUE_ID ? 'Нет карточек для перегенерации' : 'Нет исходных моделей. Выберите папку в настройках.';
+    tree.append(empty);
   }
-  if (repairButton) {
-    repairButton.setAttribute('aria-pressed', String(memoryTreeMode === REGENERATION_QUEUE_ID));
-    $('repairQueueCount').textContent = repair ? String(repair.queued) : '0';
-  }
-  const root = roots.find((node) => node.mode === memoryTreeMode);
-  const search = String($('playlistSearch')?.value || '');
-  const visibleNodes = filterMemoryTreeNodes(root ? [root] : [], search);
-  const fragment = document.createDocumentFragment();
-  for (const queueNode of visibleNodes) {
-    const queueFolder = document.createElement('section');
-    queueFolder.className = `memory-tree-queue${queueNode.mode === REGENERATION_QUEUE_ID ? ' is-repair-queue' : ''}`;
-    queueFolder.append(memoryTreeFolder(queueNode));
-    fragment.append(queueFolder);
-  }
-  if (!visibleNodes.length) {
-    const empty = document.createElement('div');
-    empty.className = 'memory-empty tree-empty';
-    empty.textContent = search.trim()
-      ? 'В этой очереди совпадений нет.'
-      : memoryTreeMode === REGENERATION_QUEUE_ID
-        ? 'В очереди брака пока нет частей.'
-        : 'Очередь пуста. Проверьте источник моделей в настройках.';
-    fragment.append(empty);
-  }
-  tree.append(fragment);
-  if ($('memoryTreeSummary')) $('memoryTreeSummary').textContent = root ? memoryProgressLabel(root) : `Части по ${RUN_PART_SIZE} моделей`;
+  if ($('memoryTreeSummary')) $('memoryTreeSummary').textContent = root ? memoryProgressLabel(root) : '';
+  tree.scrollTop = scrollTop;
+  if (focusedPart) [...tree.querySelectorAll('[data-part-id]')].find((node) => node.dataset.partId === focusedPart)?.focus({ preventScroll: true });
 }
 
-function renderSelectedMemoryPart(part, nodes) {
-  const title = $('selectedPartTitle');
-  const pathNode = $('selectedPartPath');
-  const progress = $('selectedPartProgress');
-  const useButton = $('useSelectedPart');
-  if (!part) {
-    if (title) title.textContent = 'Выберите часть';
-    if (pathNode) pathNode.textContent = '';
-    if (progress) progress.hidden = true;
-    if (useButton) useButton.hidden = true;
-    return;
-  }
-  if (title) title.textContent = `Часть ${part.partNumber}`;
-  if (pathNode) pathNode.textContent = memoryPartPath(nodes, part.id)?.slice(0, -1).join(' · ') || '';
-  if (progress) progress.hidden = false;
-  if ($('partProgressCount')) {
-    $('partProgressCount').textContent = part.mode === REGENERATION_QUEUE_ID
-      ? `${part.queued} моделей ожидают перегенерации`
-      : `${part.done} из ${part.total} полностью готовы`;
-  }
-  if ($('partProgressPercent')) $('partProgressPercent').textContent = part.mode === REGENERATION_QUEUE_ID ? 'очередь брака' : `${part.percent}%`;
-  if ($('partProgressTrack')) {
-    $('partProgressTrack').hidden = part.mode === REGENERATION_QUEUE_ID;
-    $('partProgressTrack').setAttribute('aria-valuenow', String(part.percent));
-  }
-  if ($('partProgressBar')) $('partProgressBar').style.width = `${part.percent}%`;
-  if (useButton) {
-    const selectedLaunchPart = currentLaunchPartPlan?.parts?.find((item) => item.partNumber === Number($('runPart')?.value || 0));
-    const alreadySelected = launchQueueMode() === part.mode
-      && String($('runGroupFilter')?.value || '') === part.groupId
-      && String($('runBrandFilter')?.value || '') === part.brandId
-      && Number($('runPart')?.value || 0) === part.partNumber
-      && String($('runPart')?.dataset.partitionSignature || '') === part.signature
-      && String(currentLaunchPartPlan?.signature || '') === part.signature
-      && Boolean(selectedLaunchPart);
-    useButton.hidden = alreadySelected;
-    useButton.disabled = launchSelectionLocked();
-  }
-}
 
 function renderGenerationMemory() {
   const list = $('memoryList');
-  if (!list || document.querySelector('[data-workspace-view="queues"]')?.hidden) return;
+  if (!list || document.querySelector('[data-workspace-view="models"]')?.hidden) return;
   const records = memoryRecords();
   const memoryFilters = memoryFilterState();
   const repairs = repairQueueSourceIds();
@@ -1993,7 +1943,7 @@ function renderGenerationMemory() {
   if (!selectedPart && selectedMemoryPartId) selectedMemoryPartId = '';
   selectedPart = findMemoryPart(progressTree, selectedMemoryPartId);
   if (selectedPart) openMemoryPartPath(progressTree, selectedPart.id);
-  const renderKey = `${memoryTreeMode}|${$('playlistSearch')?.value || ''}|${JSON.stringify(memoryFilters)}|${selectedMemoryPartId}|${progressTreeSignature}|${records.map((record) => `${record.sourceId}:${record.status}:${record.sourcePresent}:${repairs.has(String(record.sourceId))}:${record.updatedAt || ''}:${record.lastError || ''}:${record.errorClass || ''}:${record.outputWidth || ''}x${record.outputHeight || ''}`).join(';')}`;
+  const renderKey = `${playlistMode}|${$('playlistSearch')?.value || ''}|${JSON.stringify(memoryFilters)}|${selectedMemoryPartId}|${progressTreeSignature}|${records.map((record) => `${record.sourceId}:${record.status}:${record.sourcePresent}:${repairs.has(String(record.sourceId))}:${record.updatedAt || ''}:${record.lastError || ''}:${record.errorClass || ''}:${record.outputWidth || ''}x${record.outputHeight || ''}`).join(';')}`;
   if (renderKey === lastMemoryRenderKey) return;
   lastMemoryRenderKey = renderKey;
   const partSourceIds = selectedPart ? new Set(selectedPart.sourceIds.map(String)) : null;
@@ -2001,10 +1951,11 @@ function renderGenerationMemory() {
   const visible = selectedPart
     ? visibleMemoryRecords(records, listFilters).filter((record) => partSourceIds.has(String(record.sourceId)))
     : [];
-  updateMemorySummary(records, visible, selectedPart);
-  renderSelectedMemoryPart(selectedPart, progressTree);
+  const partRecords = selectedPart ? records.filter((record) => partSourceIds.has(String(record.sourceId))) : [];
+  updateMemorySummary(partRecords, visible);
+  renderSelectedPlaylist(selectedPart);
   renderMemoryTree(progressTree, selectedPart);
-  if (!selectedPart && $('memoryVisibleCount')) $('memoryVisibleCount').textContent = 'Выберите часть';
+  if (!selectedPart && $('memoryVisibleCount')) $('memoryVisibleCount').textContent = '';
   const scrollTop = list.scrollTop;
   list.replaceChildren();
   if (!visible.length) {
@@ -2013,7 +1964,7 @@ function renderGenerationMemory() {
     empty.textContent = !records.length
       ? 'Выбери папку input-watches-images — все модели появятся здесь автоматически.'
       : !selectedPart
-        ? 'Раскрой папки очереди и выбери часть — здесь появятся входящие в неё модели.'
+        ? 'Выберите часть очереди слева или выше.'
         : 'Текущие фильтры не нашли моделей в выбранной части.';
     list.append(empty);
     return;
@@ -2061,50 +2012,8 @@ function renderGenerationMemory() {
   list.scrollTop = scrollTop;
 }
 
-function launchSelectionLocked() {
-  return actionBusy
-    || ['RUNNING', 'STARTING', 'DRAINING', 'RECONCILING'].includes(String(runtime.state || '').toUpperCase())
-    || (runtime.state === 'PAUSED' && Boolean(runtime.run));
-}
 
-function uiSentenceCase(value) {
-  const text = String(value || '');
-  return text ? text.charAt(0).toLocaleUpperCase('ru') + text.slice(1).toLocaleLowerCase('ru').replace(/ocr/g, 'OCR') : '';
-}
 
-async function applySelectedMemoryPartForLaunch() {
-  if (launchSelectionLocked()) {
-    showFeedback('Текущий прогон сохраняет свою очередь. Выбор следующего задания доступен после его завершения.', { type: 'error' });
-    return;
-  }
-  const part = findMemoryPart(currentMemoryProgressTree().tree, selectedMemoryPartId);
-  if (!part) throw new Error('Выбери актуальную часть очереди в дереве.');
-  const freshPart = findMemoryPart(currentMemoryProgressTree().tree, part.id);
-  if (!freshPart || freshPart.signature !== part.signature) {
-    throw new Error('Состав части изменился. Обнови список и выбери часть заново.');
-  }
-
-  $('runQueueMode').value = freshPart.mode;
-  $('runGroupFilter').value = freshPart.groupId;
-  $('runBrandFilter').value = freshPart.brandId;
-  resetRunPartSelection();
-  updateLaunchQueueSummary();
-  if (currentLaunchPartPlan?.signature !== freshPart.signature) {
-    resetRunPartSelection();
-    updateLaunchQueueSummary();
-    throw new Error('Выбранная часть изменилась при проверке. Повтори выбор из обновлённого дерева.');
-  }
-
-  $('runPart').value = String(freshPart.partNumber);
-  desiredRunPart = String(freshPart.partNumber);
-  desiredRunPartSignature = freshPart.signature;
-  lastPreflight = null;
-  renderPreflight(null);
-  updateLaunchQueueSummary();
-  updateActionButtons();
-  await saveDraft();
-  showFeedback(`Для запуска выбрана часть ${freshPart.partNumber}: ${freshPart.total} моделей.`, { type: 'success', autoHide: true });
-}
 
 function updateActionButtons() {
   const canContinue = runtime.state === 'PAUSED' && runtime.run;
@@ -2134,7 +2043,7 @@ function updateActionButtons() {
   else if (conversationRecoveryStage === 'WAITING') startLabel = `ВОССТАНОВЛЕНИЕ ${recoveryCountdown ? `· ${recoveryCountdown}` : ''}`.trim();
   else if (conversationRecoveryStage === 'REOPENING') startLabel = 'ОТКРЫВАЮ ЧАТЫ…';
   else if (waitingImageLimit) startLabel = 'ОЖИДАНИЕ ЛИМИТА';
-  $('start').querySelector('span:last-child').textContent = uiSentenceCase(startLabel);
+  $('start').querySelector('span:last-child').textContent = startLabel === 'СТАРТ' ? 'Запустить' : sentenceCase(startLabel);
   $('start').disabled = isRunning || isReconciling || actionBusy || waitingImageLimit || conversationRecoveryBusy || stalledBatchBusy
     || ['applying', 'restarting', 'syncing-references'].includes(extensionUpdateStatus.phase)
     || (!canContinue && !launchSelectionReady);
@@ -2175,7 +2084,7 @@ function updateActionButtons() {
     if ($(id)) $(id).disabled = controlsLocked;
   });
   if ($('useSelectedPart')) $('useSelectedPart').disabled = controlsLocked;
-  renderLaunchSelectionDisplay(currentLaunchPartPlan);
+  renderPlaylistLaunchSummary(currentLaunchPartPlan);
 }
 
 let actionBusy = false;
@@ -2189,16 +2098,13 @@ function renderHealth(pause = countdown(runtime.rateLimitPauseUntil)) {
     || runtime.state === 'ERROR'
     || Boolean(runtime.error);
   const rateLimited = Boolean(pause) || runtime.status === 'RATE_LIMIT_PAUSE';
-  // The compact layout reports health in the run card instead of the header.
-  // Keep these optional updates for compatibility with any older markup.
   const statusSignal = $('statusSignal');
   const pauseSignal = $('pauseSignal');
-  if (statusSignal) statusSignal.className = `health-signal ${warning ? 'is-warn' : (active ? 'is-live' : 'is-ready')}`;
-  if (pauseSignal) pauseSignal.className = `health-signal ${rateLimited ? 'is-paused' : 'is-ready'}`;
-  const status = $('status');
-  const pauseStatus = $('pauseStatus');
-  if (status) status.textContent = warning ? 'WARN' : 'OK';
-  if (pauseStatus) pauseStatus.textContent = pause || (rateLimited ? 'WAIT' : 'OK');
+  statusSignal.className = `health-signal ${warning ? 'is-warn' : (active ? 'is-live' : 'is-ready')}`;
+  pauseSignal.className = `health-signal ${rateLimited ? 'is-paused' : 'is-ready'}`;
+  $('status').textContent = extensionUpdateStatus.launchBlocked ? 'Обновление' : warning ? 'Есть ошибка' : runtime.state === 'PAUSED' ? 'Пауза' : active ? 'В работе' : 'Готов';
+  $('pauseStatus').textContent = pause || (rateLimited ? 'Лимит' : 'Без паузы');
+  $('pauseStatus').closest('.health-item').hidden = !rateLimited;
 }
 
 async function refreshRuntime() {
@@ -2813,7 +2719,7 @@ $('workerCount').addEventListener('change', () => {
   lastPreflight = null;
   renderPreflight(null);
   renderSlotGrid();
-  renderLaunchSelectionDisplay(currentLaunchPartPlan);
+  renderPlaylistLaunchSummary(currentLaunchPartPlan);
   saveDraft().catch(showError);
 });
 $('runLimit').addEventListener('change', () => {
@@ -2852,7 +2758,7 @@ $('start').addEventListener('click', () => {
 $('stop').addEventListener('click', () => stopOrResetRun().catch(showError));
 $('pauseRun').addEventListener('click', () => pauseRun().catch(showError));
 $('resetRunRescan')?.addEventListener('click', () => {
-  setWorkspaceView('settings');
+  setWorkspaceView('service');
   resetRunAndRescanFromUi().catch(showError);
 });
 $('clearHistory').addEventListener('click', (event) => clearHistory(event).catch(showError));
@@ -2860,6 +2766,9 @@ $('chooseOutputFolder')?.addEventListener('click', () => chooseOutputDirectory()
 $('grantOutputFolder')?.addEventListener('click', () => grantOutputDirectory().catch(showError));
 $('useDownloadsOutput')?.addEventListener('click', () => useDownloadsOutput().catch(showError));
 
+$('openResultsTransfer')?.addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('gallery.html#transfer') }).catch(showError);
+});
 $('openGallery')?.addEventListener('click', () => {
   chrome.tabs.create({ url: chrome.runtime.getURL('gallery.html'), active: true })
     .catch(showError);
@@ -2882,22 +2791,21 @@ $('memorySearch')?.addEventListener('input', () => {
   renderAll();
   saveDraft().catch(showError);
 });
-$('playlistSearch')?.addEventListener('input', () => {
-  lastMemoryRenderKey = '';
-  renderGenerationMemory();
-});
 document.querySelectorAll('[data-playlist-mode]').forEach((button) => {
   button.addEventListener('click', () => {
-    const nextMode = button.dataset.playlistMode;
-    if (!['regular', REGENERATION_QUEUE_ID].includes(nextMode) || nextMode === memoryTreeMode) return;
-    memoryTreeMode = nextMode;
-    const selectedPart = findMemoryPart(currentMemoryProgressTree().tree, selectedMemoryPartId);
-    if (selectedPart && selectedPart.mode !== nextMode) selectedMemoryPartId = '';
+    playlistMode = button.dataset.playlistMode;
     lastMemoryRenderKey = '';
     renderGenerationMemory();
   });
 });
-$('useSelectedPart')?.addEventListener('click', () => applySelectedMemoryPartForLaunch().catch(showError));
+$('playlistSearch')?.addEventListener('input', () => renderGenerationMemory());
+$('useSelectedPart')?.addEventListener('click', () => {
+  const part = findMemoryPart(currentMemoryProgressTree().tree, selectedMemoryPartId);
+  if (selectPlaylistForLaunch(part)) {
+    renderSelectedPlaylist(part);
+    saveDraft().catch(showError);
+  }
+});
 $('memoryTree')?.addEventListener('click', (event) => {
   const button = event.target.closest('button[data-part-id]');
   if (!button) return;
@@ -2908,8 +2816,9 @@ $('memoryTree')?.addEventListener('click', (event) => {
   if (!part) return;
   selectedMemoryPartId = part.id;
   lastMemoryRenderKey = '';
+  if (!playlistSelectionLocked()) selectPlaylistForLaunch(part);
   renderGenerationMemory();
-  if (!launchSelectionLocked()) applySelectedMemoryPartForLaunch().catch(showError);
+  saveDraft().catch(showError);
 });
 $('memoryStatusFilter')?.addEventListener('change', () => {
   renderAll();

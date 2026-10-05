@@ -31,6 +31,7 @@ test('run status render retains active elapsed and average after GET_RUNTIME_FAS
     runtime: null,
     RUN_STATE_LABELS: { RUNNING: 'РАБОТАЕТ', PAUSED: 'ПАУЗА' },
     elapsedRunClock,
+    sentenceCase: (value) => value.charAt(0).toUpperCase() + value.slice(1).toLowerCase(),
     countdown: () => '',
     $: (id) => {
       if (!elements.has(id)) elements.set(id, element());

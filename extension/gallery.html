@@ -3,23 +3,27 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Галерея генераций</title>
+  <title>Результаты — Watch Automation</title>
   <link rel="stylesheet" href="gallery.css">
 </head>
 <body>
   <main class="gallery-app">
     <header class="topbar">
       <div class="topbar-title">
-        <div class="logo">A</div>
+        <a class="logo" href="sidepanel.html" aria-label="Перейти к очередям" title="Очереди">W</a>
         <div>
-          <h1>Галерея генераций</h1>
-          <p>Фактические PNG из папки результатов и Downloads · быстрый возврат брака в очередь</p>
+          <h1>Результаты</h1>
         </div>
       </div>
       <div class="topbar-actions">
         <button id="resultsTransferOpen" class="button secondary" type="button">Передача результатов</button>
-        <button id="exportFactsCsv" class="button secondary" type="button">Экспорт CSV</button>
-        <button id="exportFactsJson" class="button secondary" type="button">Экспорт JSON</button>
+        <details class="export-menu">
+          <summary class="button secondary">Экспорт спецификаций <span aria-hidden="true">⌄</span></summary>
+          <div class="export-options">
+            <button id="exportFactsCsv" class="button secondary" type="button">Скачать CSV</button>
+            <button id="exportFactsJson" class="button secondary" type="button">Скачать JSON</button>
+          </div>
+        </details>
         <button id="refreshGallery" class="button" type="button">Обновить файлы</button>
       </div>
     </header>
@@ -33,6 +37,23 @@
         <span>Бренд</span>
         <select id="brandFilter"><option value="all">Все бренды</option></select>
       </label>
+      <label>
+        <span>Сортировка</span>
+        <select id="sortOrder">
+          <option value="date_desc">Дата: новые сначала</option>
+          <option value="date_asc">Дата: старые сначала</option>
+          <option value="name_asc">Название: А → Я</option>
+          <option value="name_desc">Название: Я → А</option>
+          <option value="brand_asc">Бренд: А → Я</option>
+          <option value="brand_desc">Бренд: Я → А</option>
+          <option value="facts_issues">Текст: проблемы сначала</option>
+        </select>
+      </label>
+    </section>
+
+    <details class="filter-disclosure">
+      <summary>Фильтры <span id="activeFilterCount" class="filter-count" hidden>0</span><span class="disclosure-arrow" aria-hidden="true">⌄</span></summary>
+      <div class="advanced-filters">
       <label>
         <span>Продажа</span>
         <select id="saleFilter">
@@ -62,33 +83,22 @@
           <option value="missing_size">Нет размера</option>
         </select>
       </label>
-      <label>
-        <span>Сортировка</span>
-        <select id="sortOrder">
-          <option value="date_desc">Дата: новые сначала</option>
-          <option value="date_asc">Дата: старые сначала</option>
-          <option value="name_asc">Название: А → Я</option>
-          <option value="name_desc">Название: Я → А</option>
-          <option value="brand_asc">Бренд: А → Я</option>
-          <option value="brand_desc">Бренд: Я → А</option>
-          <option value="facts_issues">Текст: проблемы сначала</option>
-        </select>
-      </label>
       <label class="fast-reject-toggle" title="Если включено, кнопка «Брак» отправляет изображение в архив без дополнительного подтверждения">
         <input id="fastReject" type="checkbox">
         <span>Брак без подтверждения</span>
       </label>
-    </section>
+      </div>
+    </details>
+
 
     <section class="statusbar">
       <div>
         <strong id="visibleCount">0</strong>
-        <span>по фильтрам</span>
-        <span class="dot">·</span>
+        <span>показано из</span>
         <strong id="totalCount">0</strong>
-        <span>PNG на диске, включая архив</span>
+        <span>актуальных карточек</span>
       </div>
-      <div id="folderStatus" class="folder-status">Сканирую файлы…</div>
+      <details class="file-status"><summary>Файлы и синхронизация</summary><div class="disk-count">PNG на диске, включая архив: <strong id="diskCount">—</strong></div><div id="folderStatus" class="folder-status" role="status">Сканирую файлы…</div></details>
     </section>
 
     <section id="emptyState" class="empty-state" hidden>
@@ -100,7 +110,7 @@
     <div class="load-more-wrap"><button id="loadMore" class="button secondary" type="button" hidden>Показать ещё</button></div>
   </main>
 
-  <dialog id="viewer" class="viewer">
+  <dialog id="viewer" class="viewer" aria-labelledby="viewerTitle">
     <div class="viewer-shell">
       <header class="viewer-header">
         <div class="viewer-title-wrap">
@@ -109,8 +119,8 @@
         </div>
         <div class="viewer-head-actions">
           <button id="viewerOpenChat" class="icon-button viewer-chat-button" type="button" title="Открыть чат, где была создана эта карточка" hidden>Чат ↗</button>
-          <button id="viewerOpenFile" class="icon-button" type="button" title="Открыть оригинальный PNG">↗</button>
-          <button id="viewerClose" class="icon-button" type="button" title="Закрыть">×</button>
+          <button id="viewerOpenFile" class="icon-button" type="button" title="Открыть оригинальный PNG" aria-label="Открыть оригинальный PNG">↗</button>
+          <button id="viewerClose" class="icon-button" type="button" title="Закрыть" aria-label="Закрыть просмотр">×</button>
         </div>
       </header>
 
@@ -120,20 +130,20 @@
           <div id="viewerPlaceholder" class="viewer-placeholder">Загрузка изображения…</div>
           <img id="viewerImage" alt="" draggable="false">
         </div>
-        <aside id="viewerFacts" class="viewer-facts" aria-label="Распознанный текст"></aside>
+        <aside id="viewerFacts" class="viewer-facts" aria-label="Спецификация карточки"></aside>
         <button id="viewerNext" class="nav-button next" type="button" aria-label="Следующая">›</button>
       </div>
 
       <footer class="viewer-footer">
         <div class="zoom-controls">
-          <button id="zoomOut" class="small-button" type="button">−</button>
+          <button id="zoomOut" class="small-button" type="button" aria-label="Уменьшить">−</button>
           <span id="zoomValue">100%</span>
-          <button id="zoomIn" class="small-button" type="button">+</button>
+          <button id="zoomIn" class="small-button" type="button" aria-label="Увеличить">+</button>
           <button id="zoomReset" class="small-button text" type="button">Вписать</button>
         </div>
         <div class="viewer-counter" id="viewerCounter">0 / 0</div>
         <div class="review-actions">
-          <button id="viewerReject" class="button reject" type="button">✕ Брак · перегенерировать</button>
+          <button id="viewerReject" class="button reject" type="button">В брак и перегенерацию</button>
         </div>
       </footer>
     </div>
@@ -158,7 +168,7 @@
     <p id="resultsTransferStatus" role="status" aria-live="polite"></p>
     <button id="resultsTransferClose" class="button secondary" type="button">Закрыть</button>
   </dialog>
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" hidden></div>
   <script type="module" src="gallery.js"></script>
 </body>
 </html>
