@@ -9,6 +9,8 @@ import {
   filterFromQueueGroup,
   filteredWatchEntries,
   factsMetadataProjections,
+  generationMemoryMatchesQueueEntry,
+  generationMemoryMatchesQueueAsset,
   generationMemoryRecordFromEntry,
   generationMemoryStatusForQueueStatus,
   ensureGenerationOutputFileName,
@@ -17,6 +19,7 @@ import {
   GENERATION_MEMORY_STATUSES,
   normalizeCoverageMode,
   normalizeGenerationMemoryStatus,
+  normalizeQueueStatus,
   normalizeRunLimit,
   normalizeWatchFilter,
   normalizeWorkerCount,
@@ -25,6 +28,7 @@ import {
   pendingEntryIdsForFilter,
   parseFilterSelectionId,
   queueGroupsFromCatalog,
+  resetUnfinishedQueueGenerationState,
   modelCatalogRecordsFromGroups,
   queueStatusForGenerationMemoryStatus,
   referenceDescriptorForPath,
@@ -154,7 +158,7 @@ const RUN_CLOCK_PAUSE_EVENTS = new Set([
   'conversation_load_recovery_started', 'run_stop_accepted', 'run_completed'
 ]);
 const OUTPUT_VERIFY_TIMEOUT_MS = 2000;
-const EXTENSION_BUILD_ID = '2026-10-05.3';
+const EXTENSION_BUILD_ID = '2026-10-05.4';
 const PROMPT_PIPELINE_VERSION = '6';
 const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
@@ -2604,69 +2608,103 @@ function generationMemoryEntries(memory) {
   return Object.values(memory?.items || {});
 }
 
+function queueEntryForGenerationMemory(queue, rows, record, sourceId, defaultEntry = null) {
+  for (const row of rows) {
+    if (generationMemoryMatchesQueueAsset(record, row)) return row;
+    const variant = (row.variants || []).find((item) => generationMemoryMatchesQueueAsset(record, item));
+    if (variant) return {
+      ...row,
+      ...variant,
+      sourceId,
+      skuKey: row.skuKey || sourceId,
+      variants: row.variants || []
+    };
+  }
+  return record ? null : (defaultEntry || rows[0] || null);
+}
+
 function syncGenerationMemory(queue, rawMemory, rawHistory = null, rawRun = null) {
   const memory = normalizeGenerationMemory(rawMemory);
   const history = normalizeHistory(rawHistory);
   let changed = false;
-  const seen = new Set();
+  const entriesBySource = new Map();
+  for (const groupId of QUEUE_GROUP_IDS) {
+    for (const entry of groupEntries(queue, groupId)) {
+      if (!entry?.sourceId) continue;
+      const rows = entriesBySource.get(String(entry.sourceId)) || [];
+      rows.push(entry);
+      entriesBySource.set(String(entry.sourceId), rows);
+    }
+  }
+  const seen = new Set(entriesBySource.keys());
+  const defaultEntryBySource = new Map(filteredWatchEntries(queue?.groups || {}, {})
+    .map((entry) => [String(entry.sourceId), entry]));
   const activeRun = rawRun && ['RUNNING', 'STARTING', 'DRAINING', 'PAUSED'].includes(rawRun.state)
     ? rawRun
     : null;
   const now = new Date().toISOString();
 
-  for (const groupId of QUEUE_GROUP_IDS) {
-    for (const entry of groupEntries(queue, groupId)) {
-      if (!entry?.sourceId) continue;
-      const sourceId = entry.sourceId;
-      seen.add(sourceId);
-      const previous = memory.items[sourceId] || null;
-      const legacy = history.items[sourceId] || null;
-      const fingerprintChanged = Boolean(
-        previous?.fingerprint && entry.fingerprint && previous.fingerprint !== entry.fingerprint
-      );
-      const recipeChanged = Boolean(
-        previous?.recipeHash && entry.recipeHash && previous.recipeHash !== entry.recipeHash
-      );
-      let status = previous
-        ? normalizeGenerationMemoryStatus(previous.status)
-        : (legacy ? GENERATION_MEMORY_STATUSES.READY : generationMemoryStatusForQueueStatus(entry.status));
-      if (fingerprintChanged || recipeChanged) status = GENERATION_MEMORY_STATUSES.NOT_READY;
-      if (status === GENERATION_MEMORY_STATUSES.RUNNING && !activeRun && previous?.statusSource !== 'manual') {
-        status = GENERATION_MEMORY_STATUSES.NOT_READY;
-      }
-      const nextCandidate = generationMemoryRecordFromEntry(entry, {
-        ...(previous || {}),
-        status,
-        sourcePresent: true,
-        statusSource: previous?.statusSource || (legacy ? 'automatic' : 'automatic'),
-        generatedAt: fingerprintChanged || recipeChanged ? null : (previous?.generatedAt || legacy?.generatedAt || entry.generatedAt || null),
-        outputPath: fingerprintChanged || recipeChanged ? null : (previous?.outputPath || legacy?.outputPath || entry.outputPath || null),
-        generationStartedAt: fingerprintChanged || recipeChanged ? null : (previous?.generationStartedAt || null),
-        lastError: fingerprintChanged || recipeChanged ? null : (previous?.lastError || entry.lastError || null),
-        outputHash: fingerprintChanged || recipeChanged ? null : (previous?.outputHash || entry.outputHash || null),
-        outputWidth: fingerprintChanged || recipeChanged ? null : (previous?.outputWidth || entry.outputWidth || null),
-        outputHeight: fingerprintChanged || recipeChanged ? null : (previous?.outputHeight || entry.outputHeight || null),
-        verificationMode: fingerprintChanged || recipeChanged ? null : (previous?.verificationMode || entry.verificationMode || null),
-        recipeHash: entry.recipeHash || previous?.recipeHash || null,
-        profileId: previous?.profileId || entry.profileId || null,
-        profileVersion: previous?.profileVersion || entry.profileVersion || null,
-        attempt: Number(previous?.attempt ?? entry.attempt ?? 0),
-        updatedAt: now,
-        createdAt: previous?.createdAt || now
-      });
-      const comparable = (value) => {
-        if (!value) return null;
-        const copy = { ...value };
-        delete copy.updatedAt;
-        return copy;
-      };
-      const same = JSON.stringify(comparable(previous)) === JSON.stringify(comparable(nextCandidate));
-      const next = same
-        ? { ...nextCandidate, updatedAt: previous?.updatedAt || now }
-        : nextCandidate;
-      memory.items[sourceId] = next;
-      if (!same) changed = true;
+  for (const [sourceId, rows] of entriesBySource) {
+    const previous = memory.items[sourceId] || null;
+    const entry = queueEntryForGenerationMemory(queue, rows, previous, sourceId,
+      defaultEntryBySource.get(sourceId));
+    // A memory row belongs to one input asset. Keep it intact when the SKU is
+    // present only with a different quality/path/hash, so its completion or
+    // error cannot leak onto that other variant.
+    if (!entry) continue;
+    const legacy = history.items[sourceId] || null;
+    const fingerprintChanged = Boolean(
+      previous?.fingerprint && entry.fingerprint && previous.fingerprint !== entry.fingerprint
+    );
+    const sourceHashChanged = Boolean(
+      previous?.sourceHash && entry.sourceHash
+      && String(previous.sourceHash).toLowerCase() !== String(entry.sourceHash).toLowerCase()
+    );
+    const recipeChanged = Boolean(
+      previous?.recipeHash && entry.recipeHash && previous.recipeHash !== entry.recipeHash
+    );
+    let status = previous
+      ? normalizeGenerationMemoryStatus(previous.status)
+      : (legacy ? GENERATION_MEMORY_STATUSES.READY : generationMemoryStatusForQueueStatus(entry.status));
+    if (fingerprintChanged || sourceHashChanged || recipeChanged) status = GENERATION_MEMORY_STATUSES.NOT_READY;
+    if (status === GENERATION_MEMORY_STATUSES.RUNNING && !activeRun && previous?.statusSource !== 'manual') {
+      status = GENERATION_MEMORY_STATUSES.NOT_READY;
     }
+    const changedInput = fingerprintChanged || sourceHashChanged || recipeChanged;
+    const nextCandidate = generationMemoryRecordFromEntry(entry, {
+      ...(previous || {}),
+      status,
+      sourceVariantId: entry.inputSourceId || entry.sourceVariantId || null,
+      sourceHash: entry.sourceHash || null,
+      sourcePresent: true,
+      statusSource: previous?.statusSource || 'automatic',
+      generatedAt: changedInput ? null : (previous?.generatedAt || legacy?.generatedAt || entry.generatedAt || null),
+      outputPath: changedInput ? null : (previous?.outputPath || legacy?.outputPath || entry.outputPath || null),
+      generationStartedAt: changedInput ? null : (previous?.generationStartedAt || null),
+      lastError: changedInput ? null : (previous?.lastError || entry.lastError || null),
+      outputHash: changedInput ? null : (previous?.outputHash || entry.outputHash || null),
+      outputWidth: changedInput ? null : (previous?.outputWidth || entry.outputWidth || null),
+      outputHeight: changedInput ? null : (previous?.outputHeight || entry.outputHeight || null),
+      verificationMode: changedInput ? null : (previous?.verificationMode || entry.verificationMode || null),
+      recipeHash: entry.recipeHash || previous?.recipeHash || null,
+      profileId: previous?.profileId || entry.profileId || null,
+      profileVersion: previous?.profileVersion || entry.profileVersion || null,
+      attempt: Number(previous?.attempt ?? entry.attempt ?? 0),
+      updatedAt: now,
+      createdAt: previous?.createdAt || now
+    });
+    const comparable = (value) => {
+      if (!value) return null;
+      const copy = { ...value };
+      delete copy.updatedAt;
+      return copy;
+    };
+    const same = JSON.stringify(comparable(previous)) === JSON.stringify(comparable(nextCandidate));
+    const next = same
+      ? { ...nextCandidate, updatedAt: previous?.updatedAt || now }
+      : nextCandidate;
+    memory.items[sourceId] = next;
+    if (!same) changed = true;
   }
   // Keep records for models removed from the selected folder. They remain
   // visible in the memory panel and can be forgotten explicitly by the user.
@@ -2901,23 +2939,27 @@ function setGenerationMemoryRecordStatus(memory, record, status, overrides = {})
   const clearResult = normalized !== GENERATION_MEMORY_STATUSES.READY;
   const clearRetryState = normalized === GENERATION_MEMORY_STATUSES.READY
     || normalized === GENERATION_MEMORY_STATUSES.RUNNING;
+  const overridden = (key, fallback) => Object.hasOwn(overrides, key) ? overrides[key] : fallback;
   memory.items[record.sourceId] = {
     ...previous,
     status: normalized,
+    generationId: overridden('generationId', previous.generationId || null),
+    previousGenerationId: overridden('previousGenerationId', previous.previousGenerationId || null),
     sourcePresent: overrides.sourcePresent ?? previous.sourcePresent ?? true,
     statusSource: overrides.statusSource || 'automatic',
-    generationStartedAt: overrides.generationStartedAt ?? previous.generationStartedAt ?? null,
+    generationStartedAt: overridden('generationStartedAt', previous.generationStartedAt || null),
     generatedAt: overrides.generatedAt ?? (clearResult ? null : (previous.generatedAt || null)),
     outputPath: overrides.outputPath ?? (clearResult ? null : (previous.outputPath || null)),
     outputHash: overrides.outputHash ?? (clearResult ? null : (previous.outputHash || null)),
     outputWidth: overrides.outputWidth ?? (clearResult ? null : (previous.outputWidth || null)),
     outputHeight: overrides.outputHeight ?? (clearResult ? null : (previous.outputHeight || null)),
     verificationMode: overrides.verificationMode ?? (clearResult ? null : (previous.verificationMode || null)),
-    errorClass: overrides.errorClass ?? (clearRetryState ? null : (clearResult ? (previous.errorClass || null) : null)),
-    nextRetryAt: overrides.nextRetryAt ?? (clearRetryState ? null : (clearResult ? (previous.nextRetryAt || null) : null)),
+    errorClass: overridden('errorClass', clearRetryState ? null : (clearResult ? (previous.errorClass || null) : null)),
+    nextRetryAt: overridden('nextRetryAt', clearRetryState ? null : (clearResult ? (previous.nextRetryAt || null) : null)),
     retryCount: overrides.retryCount ?? Number(previous.retryCount || 0),
-    lastError: overrides.lastError ?? (normalized === GENERATION_MEMORY_STATUSES.READY ? null : (previous.lastError || null)),
-    lastRunId: overrides.lastRunId ?? previous.lastRunId ?? null,
+    attempt: overrides.attempt ?? Number(previous.attempt || 0),
+    lastError: overridden('lastError', normalized === GENERATION_MEMORY_STATUSES.READY ? null : (previous.lastError || null)),
+    lastRunId: overridden('lastRunId', previous.lastRunId || null),
     createdAt: previous.createdAt || now,
     updatedAt: now
   };
@@ -2933,7 +2975,11 @@ function setGenerationMemoryStatus(memory, entry, status, overrides = {}) {
     }),
     ...previous,
     sourceId: entry.sourceId,
+    generationId: entry.generationId || null,
+    previousGenerationId: entry.previousGenerationId || previous.previousGenerationId || null,
     groupId: entry.groupId,
+    sourceVariantId: entry.inputSourceId || entry.sourceVariantId || null,
+    sourceHash: entry.sourceHash || null,
     relativePath: entry.relativePath,
     fileName: entry.fileName,
     modelName: entry.modelName,
@@ -3226,6 +3272,13 @@ async function recoverInterruptedRun(reason) {
   }
   const hasOrphanedRunningMemory = Object.values(initialMemory.items || {})
     .some((record) => normalizeGenerationMemoryStatus(record.status) === GENERATION_MEMORY_STATUSES.RUNNING);
+  if (!initialRun && String(initial.runtime?.state || '').toUpperCase() === 'STOPPED') {
+    // A prior stop may have cleared the run while leaving a stale variant
+    // projection behind. Repair persisted queue metadata only; no tab probing,
+    // download reconciliation, or session reset is needed without a run.
+    await ensureGenerationMemoryState();
+    return;
+  }
   if (!initialRun && hasOrphanedRunningMemory) {
     await resetRunAndRescan({
       reason: 'Найдены записи «В работе» без существующей сессии',
@@ -8188,6 +8241,110 @@ function findQueueEntry(queue, sourceId) {
   return allQueueEntries(queue).find((entry) => entry.sourceId === sourceId) || null;
 }
 
+function queueRowsForSource(queue, sourceId) {
+  return allQueueEntries(queue).filter((entry) => String(entry.sourceId || '') === String(sourceId || ''));
+}
+
+function indexQueueRowsBySource(queue) {
+  const rowsBySource = new Map();
+  for (const entry of allQueueEntries(queue)) {
+    const sourceId = String(entry.sourceId || '');
+    if (!sourceId) continue;
+    const rows = rowsBySource.get(sourceId) || [];
+    rows.push(entry);
+    rowsBySource.set(sourceId, rows);
+  }
+  return rowsBySource;
+}
+
+function selectedQueueVariant(queue, sourceId, filterValue = {}) {
+  return filteredWatchEntries(queue?.groups || {}, filterValue)
+    .find((entry) => String(entry.sourceId) === String(sourceId)) || null;
+}
+
+function resetQueueSourceForIdentity(queue, sourceId, identity, targetGroupId = '', sourceRows = null) {
+  let changed = false;
+  for (const entry of sourceRows || queueRowsForSource(queue, sourceId)) {
+    const variants = resetUnfinishedQueueGenerationState(entry, {
+      identity,
+      resetEntry: false
+    });
+    changed ||= variants.variantsReset > 0;
+    const resetParent = targetGroupId && String(entry.groupId || '') === String(targetGroupId)
+      || generationMemoryMatchesQueueEntry(identity, entry);
+    if (resetParent) {
+      const parent = resetUnfinishedQueueGenerationState(entry, {
+        resetEntry: true,
+        resetVariants: false
+      });
+      changed ||= parent.entryReset;
+    }
+  }
+  return changed;
+}
+
+function generationMemoryHasVerifiedResult(record) {
+  return [GENERATION_MEMORY_STATUSES.READY, GENERATION_MEMORY_STATUSES.IMAGE_SAVED,
+    GENERATION_MEMORY_STATUSES.FACTS_PENDING].includes(normalizeGenerationMemoryStatus(record?.status))
+    || Boolean(record?.outputPath && /^[a-f0-9]{64}$/i.test(String(record.outputHash || '')));
+}
+
+function clearUnfinishedGenerationMemoryRecord(generationMemory, record, entry) {
+  if (!record || !entry) return false;
+  const hadResettableState = Boolean(record.generationId || record.generationStartedAt || record.generatedAt
+    || record.outputPath || record.outputHash || record.outputWidth || record.outputHeight
+    || record.verificationMode || record.lastError || record.errorClass || record.nextRetryAt
+    || Number(record.retryCount || 0) || Number(record.attempt || 0) || record.lastRunId
+    || normalizeGenerationMemoryStatus(record.status) !== GENERATION_MEMORY_STATUSES.NOT_READY);
+  if (!hadResettableState) return false;
+  setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.NOT_READY, {
+    statusSource: 'automatic',
+    generationId: null,
+    generationStartedAt: null,
+    generatedAt: null,
+    outputPath: null,
+    outputHash: null,
+    outputWidth: null,
+    outputHeight: null,
+    verificationMode: null,
+    lastError: null,
+    lastRunId: null,
+    retryCount: 0,
+    attempt: 0,
+    errorClass: null,
+    nextRetryAt: null
+  });
+  return hadResettableState;
+}
+
+function repairStoppedQueueStatuses(queue, generationMemory) {
+  let changed = false;
+  const rowsBySource = indexQueueRowsBySource(queue);
+  for (const record of Object.values(generationMemory?.items || {})) {
+    if (normalizeGenerationMemoryStatus(record?.status) !== GENERATION_MEMORY_STATUSES.NOT_READY
+      || generationMemoryHasVerifiedResult(record)) continue;
+    const rows = rowsBySource.get(String(record.sourceId || '')) || [];
+    if (!rows.length) continue;
+    const identity = record;
+    const matchingEntry = rows.find((row) => generationMemoryMatchesQueueEntry(identity, row))
+      || rows.flatMap((row) => row.variants || []).find((variant) => generationMemoryMatchesQueueEntry(identity, variant));
+    if (!matchingEntry) continue;
+    const targetGroupId = record.groupId || matchingEntry.groupId || '';
+    changed = resetQueueSourceForIdentity(queue, record.sourceId, identity, targetGroupId, rows) || changed;
+    changed = clearUnfinishedGenerationMemoryRecord(generationMemory, record, {
+      ...matchingEntry,
+      sourceId: record.sourceId,
+      groupId: targetGroupId,
+      inputSourceId: record.sourceVariantId || matchingEntry.sourceVariantId || matchingEntry.variantId,
+      sourceVariantId: record.sourceVariantId || matchingEntry.sourceVariantId || matchingEntry.variantId,
+      sourceHash: record.sourceHash || matchingEntry.sourceHash || null,
+      relativePath: record.relativePath || matchingEntry.relativePath || null,
+      fingerprint: record.fingerprint || matchingEntry.fingerprint || null
+    }) || changed;
+  }
+  return changed;
+}
+
 function applyGenerationMemoryStatusChange(queue, history, generationMemory, sourceId, status, overrides = {}) {
   const entry = findQueueEntry(queue, sourceId);
   const existing = generationMemory.items[sourceId] || null;
@@ -8436,9 +8593,13 @@ async function ensureGenerationMemoryState() {
     }
     const beforeQueue = JSON.stringify(allQueueEntries(stored.queue || { groups: {} }).map((entry) => [entry.sourceId, entry.status, entry.generatedAt, entry.outputPath, entry.lastError]));
     const synced = syncQueueWithHistory(queue, history, memory, stored.run);
+    const stoppedRepairChanged = !stored.run
+      && String(stored.runtime?.state || '').toUpperCase() === 'STOPPED'
+      ? repairStoppedQueueStatuses(synced.queue, synced.memory)
+      : false;
     const afterQueue = JSON.stringify(allQueueEntries(synced.queue).map((entry) => [entry.sourceId, entry.status, entry.generatedAt, entry.outputPath, entry.lastError]));
     const queueChanged = beforeQueue !== afterQueue || JSON.stringify(stored.queue?.groups || {}) !== JSON.stringify(synced.queue.groups || {});
-    if (queueChanged || synced.historyChanged || synced.memoryChanged || !stored.generationMemory) {
+    if (queueChanged || synced.historyChanged || synced.memoryChanged || stoppedRepairChanged || !stored.generationMemory) {
       await chrome.storage.local.set({
         queue: synced.queue,
         history: synced.history,
@@ -8648,49 +8809,60 @@ async function performResetRunAndRescan(options = {}) {
       ...Object.values(run?.slots || {}).map((slot) => slot.entryId).filter(Boolean)
     ]);
 
-    for (const entry of allQueueEntries(queue)) {
-      const memoryRecord = generationMemory.items[entry.sourceId] || null;
-      const belongsToResetRun = runEntryIds.has(entry.sourceId)
-        || (targetRunId && memoryRecord?.lastRunId === targetRunId)
-        || entry.status === 'running';
-      if (!belongsToResetRun || entry.status === 'done') continue;
-      entry.status = 'pending';
-      entry.retryCount = 0;
-      entry.lastError = null;
-      entry.errorClass = null;
-      entry.nextRetryAt = null;
-      entry.generationStartedAt = null;
-      entry.generatedAt = null;
-      entry.outputPath = null;
-      entry.outputHash = null;
-      entry.outputWidth = null;
-      entry.outputHeight = null;
-      entry.verificationMode = null;
-      setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.NOT_READY, {
-        statusSource: 'automatic',
-        generationStartedAt: null,
-        generatedAt: null,
-        outputPath: null,
-        outputHash: null,
-        outputWidth: null,
-        outputHeight: null,
-        verificationMode: null,
-        lastError: null,
-        lastRunId: null,
-        retryCount: 0,
-        errorClass: null,
-        nextRetryAt: null
-      });
-      delete history.items[entry.sourceId];
-      delete history.ignored[entry.sourceId];
-      resetRecords += 1;
+    const rowsBySource = indexQueueRowsBySource(queue);
+    const stopFilter = run
+      ? normalizeWatchFilter(run.filter || parseFilterSelectionId(run.groupId) || filterFromQueueGroup(run.groupId))
+      : {};
+    const resetTargets = new Map(filteredWatchEntries(queue.groups || {}, stopFilter)
+      .map((entry) => [String(entry.sourceId), entry]));
+    const resetSourceIds = new Set(runEntryIds);
+    for (const [sourceId, rows] of rowsBySource) {
+      const memoryRecord = generationMemory.items[sourceId] || null;
+      if ((targetRunId && memoryRecord?.lastRunId === targetRunId)
+        || rows.some((entry) => normalizeQueueStatus(entry.status) === 'running')
+        || rows.some((entry) => (entry.variants || []).some((variant) => normalizeQueueStatus(variant.status) === 'running'))) {
+        resetSourceIds.add(sourceId);
+      }
+    }
+    for (const record of Object.values(generationMemory.items || {})) {
+      if (normalizeGenerationMemoryStatus(record.status) === GENERATION_MEMORY_STATUSES.RUNNING && record.sourceId) {
+        resetSourceIds.add(String(record.sourceId));
+      }
+    }
+
+    for (const sourceId of resetSourceIds) {
+      const rows = rowsBySource.get(String(sourceId)) || [];
+      if (!rows.length) continue;
+      const memoryRecord = generationMemory.items[sourceId] || null;
+      const runningVariant = rows.flatMap((entry) => entry.variants || [])
+        .find((variant) => normalizeQueueStatus(variant.status) === 'running');
+      const identity = run
+        ? (resetTargets.get(String(sourceId)) || memoryRecord || runningVariant || rows[0])
+        : (memoryRecord || runningVariant || resetTargets.get(String(sourceId)) || rows[0]);
+      const targetGroupId = String(identity?.groupId || rows[0]?.groupId || '');
+      const queueChanged = resetQueueSourceForIdentity(queue, sourceId, identity, targetGroupId, rows);
+      const memoryIsSaved = generationMemoryHasVerifiedResult(memoryRecord);
+      const memoryChanged = memoryRecord && !memoryIsSaved
+        ? clearUnfinishedGenerationMemoryRecord(generationMemory, memoryRecord, {
+          ...identity,
+          sourceId,
+          inputSourceId: identity?.inputSourceId || identity?.sourceVariantId || identity?.variantId || null,
+          sourceVariantId: identity?.sourceVariantId || identity?.variantId || null
+        })
+        : false;
+      if (queueChanged || memoryChanged) resetRecords += 1;
     }
 
     // Older builds could leave memory rows marked RUNNING even after the run
     // object was lost. A session reset must never keep those phantom jobs.
     for (const record of Object.values(generationMemory.items || {})) {
       if (normalizeGenerationMemoryStatus(record.status) !== GENERATION_MEMORY_STATUSES.RUNNING) continue;
-      const queueEntry = record.sourceId ? findQueueEntry(queue, record.sourceId) : null;
+      const rows = record.sourceId ? (rowsBySource.get(String(record.sourceId)) || []) : [];
+      const matchingEntry = rows.find((entry) => generationMemoryMatchesQueueEntry(record, entry))
+        || rows.flatMap((entry) => entry.variants || []).find((variant) => generationMemoryMatchesQueueEntry(record, variant));
+      const queueEntry = matchingEntry && rows[0]
+        ? { ...rows[0], ...matchingEntry, sourceId: record.sourceId }
+        : null;
       if (queueEntry?.status === 'done') {
         const completedStatus = queueEntry.factsStatus === 'ok'
           ? GENERATION_MEMORY_STATUSES.READY
@@ -8715,6 +8887,7 @@ async function performResetRunAndRescan(options = {}) {
       }
       setGenerationMemoryRecordStatus(generationMemory, record, GENERATION_MEMORY_STATUSES.NOT_READY, {
         statusSource: 'automatic',
+        generationId: null,
         generationStartedAt: null,
         generatedAt: null,
         outputPath: null,
@@ -8728,11 +8901,11 @@ async function performResetRunAndRescan(options = {}) {
         errorClass: null,
         nextRetryAt: null
       });
-      if (record.sourceId) {
-        delete history.items[record.sourceId];
-        delete history.ignored[record.sourceId];
-      }
+      if (record.sourceId && queueEntry) resetQueueSourceForIdentity(queue, record.sourceId, record,
+        record.groupId || queueEntry.groupId || '', rows);
     }
+
+    applyGenerationMemory(queue.groups || {}, generationMemory);
 
     if (run?.operationId) {
       const planned = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);

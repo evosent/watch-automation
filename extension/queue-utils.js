@@ -229,6 +229,123 @@ export function normalizeQueueStatus(value, fallback = 'pending') {
     : queueStatusForGenerationMemoryStatus(status || fallback);
 }
 
+function queueEntryIdentity(entry = {}) {
+  const relativePath = normalizeRelativePath(entry.relativePath || '');
+  return {
+    sourceVariantId: String(entry.inputSourceId || entry.sourceVariantId || entry.variantId
+      || (relativePath && entry.groupId ? sourceVariantIdFor(entry.groupId, relativePath) : '')),
+    relativePath,
+    fingerprint: String(entry.fingerprint || ''),
+    sourceHash: String(entry.sourceHash || '').toLowerCase()
+  };
+}
+
+export function generationMemoryMatchesQueueEntry(record, entry) {
+  if (!record || !entry) return false;
+  const memoryIdentity = queueEntryIdentity(record);
+  const entryIdentity = queueEntryIdentity(entry);
+  if (memoryIdentity.sourceVariantId && entryIdentity.sourceVariantId
+    && memoryIdentity.sourceVariantId !== entryIdentity.sourceVariantId) return false;
+  if (memoryIdentity.relativePath && entryIdentity.relativePath
+    && memoryIdentity.relativePath !== entryIdentity.relativePath) return false;
+  if (memoryIdentity.fingerprint && entryIdentity.fingerprint
+    && memoryIdentity.fingerprint !== entryIdentity.fingerprint) return false;
+  if (memoryIdentity.sourceHash && entryIdentity.sourceHash
+    && memoryIdentity.sourceHash !== entryIdentity.sourceHash) return false;
+  return true;
+}
+
+// Identify the source asset independently from its bytes. This lets memory
+// detect a changed file at the same path and invalidate the old result.
+export function generationMemoryMatchesQueueAsset(record, entry) {
+  if (!record || !entry) return false;
+  const memoryIdentity = queueEntryIdentity(record);
+  const entryIdentity = queueEntryIdentity(entry);
+  if (memoryIdentity.sourceVariantId && entryIdentity.sourceVariantId
+    && memoryIdentity.sourceVariantId !== entryIdentity.sourceVariantId) return false;
+  if (memoryIdentity.relativePath && entryIdentity.relativePath
+    && memoryIdentity.relativePath !== entryIdentity.relativePath) return false;
+  const memoryGroup = String(record.groupId || '');
+  const entryGroup = String(entry.groupId || '');
+  if (memoryGroup && entryGroup && memoryGroup !== entryGroup) return false;
+  const memoryFile = String(record.fileName || '').toLowerCase();
+  const entryFile = String(entry.fileName || '').toLowerCase();
+  if (!memoryIdentity.relativePath && memoryFile && entryFile && memoryFile !== entryFile) return false;
+  return true;
+}
+
+function generationMemoryFields(record = {}) {
+  const status = normalizeGenerationMemoryStatus(record.status);
+  return {
+    status: queueStatusForGenerationMemoryStatus(status),
+    generationId: record.generationId || null,
+    previousGenerationId: record.previousGenerationId || null,
+    generatedAt: record.generatedAt || null,
+    outputPath: record.outputPath || null,
+    outputHash: record.outputHash || null,
+    outputWidth: record.outputWidth || null,
+    outputHeight: record.outputHeight || null,
+    verificationMode: record.verificationMode || null,
+    recipeHash: record.recipeHash || null,
+    profileId: record.profileId || null,
+    profileVersion: record.profileVersion || null,
+    attempt: Number(record.attempt || 0),
+    errorClass: record.errorClass || null,
+    nextRetryAt: record.nextRetryAt || null,
+    retryCount: Number(record.retryCount || 0),
+    lastError: status === GENERATION_MEMORY_STATUSES.READY ? null : (record.lastError || null),
+    lastRunId: record.lastRunId || null
+  };
+}
+
+function isQueueEntryCompleted(entry) {
+  return normalizeQueueStatus(entry?.status) === 'done';
+}
+
+function clearUnfinishedQueueEntry(entry) {
+  if (!entry || isQueueEntryCompleted(entry)) return false;
+  const resetState = {
+    status: 'pending',
+    generationId: null,
+    generationStartedAt: null,
+    generatedAt: null,
+    outputPath: null,
+    outputHash: null,
+    outputWidth: null,
+    outputHeight: null,
+    verificationMode: null,
+    chatUrl: null,
+    attempt: 0,
+    retryCount: 0,
+    lastError: null,
+    errorClass: null,
+    nextRetryAt: null,
+    lastRunId: null
+  };
+  const changed = Object.entries(resetState).some(([key, value]) => entry[key] !== value);
+  if (changed) Object.assign(entry, resetState);
+  return changed;
+}
+
+// Reset only the requested source variant. The parent queue row may represent
+// another quality variant, so callers control whether that row is in scope.
+export function resetUnfinishedQueueGenerationState(entry, {
+  identity = null,
+  resetEntry = true,
+  resetVariants = true
+} = {}) {
+  if (!entry || typeof entry !== 'object') return { entryReset: false, variantsReset: 0 };
+  const entryReset = resetEntry && (!identity || generationMemoryMatchesQueueEntry(identity, entry))
+    ? clearUnfinishedQueueEntry(entry)
+    : false;
+  let variantsReset = 0;
+  for (const variant of resetVariants && Array.isArray(entry.variants) ? entry.variants : []) {
+    if (identity && !generationMemoryMatchesQueueEntry(identity, variant)) continue;
+    if (clearUnfinishedQueueEntry(variant)) variantsReset += 1;
+  }
+  return { entryReset, variantsReset };
+}
+
 export function factsMetadataProjections(patch = {}) {
   const factsStatus = String(patch.factsStatus || '').toLowerCase();
   const memoryStatus = factsStatus === 'ok'
@@ -567,30 +684,11 @@ export function applyGenerationMemory(groups = {}, memory = {}) {
     for (const entry of groups[groupId] || []) {
       const record = items[entry.sourceId];
       if (!record) continue;
-      const activeVariantId = String(entry.inputSourceId || entry.sourceVariantId || '');
-      if (record.sourceVariantId && activeVariantId && String(record.sourceVariantId) !== activeVariantId) continue;
-      if (record.relativePath && entry.relativePath && normalizeRelativePath(record.relativePath) !== normalizeRelativePath(entry.relativePath)) continue;
-      if (record.fingerprint && entry.fingerprint && String(record.fingerprint) !== String(entry.fingerprint)) continue;
-      if (record.sourceHash && entry.sourceHash && String(record.sourceHash).toLowerCase() !== String(entry.sourceHash).toLowerCase()) continue;
-      const status = normalizeGenerationMemoryStatus(record.status);
-      entry.status = queueStatusForGenerationMemoryStatus(status);
-      entry.generationId = record.generationId || null;
-      entry.previousGenerationId = record.previousGenerationId || null;
-      entry.generatedAt = record.generatedAt || null;
-      entry.outputPath = record.outputPath || null;
-      entry.outputHash = record.outputHash || null;
-      entry.outputWidth = record.outputWidth || null;
-      entry.outputHeight = record.outputHeight || null;
-      entry.verificationMode = record.verificationMode || null;
-      entry.recipeHash = record.recipeHash || null;
-      entry.profileId = record.profileId || null;
-      entry.profileVersion = record.profileVersion || null;
-      entry.attempt = Number(record.attempt || entry.attempt || 0);
-      entry.errorClass = record.errorClass || null;
-      entry.nextRetryAt = record.nextRetryAt || null;
-      entry.retryCount = Number(record.retryCount || entry.retryCount || 0);
-      entry.lastError = record.lastError || null;
-      if (status === GENERATION_MEMORY_STATUSES.READY) entry.lastError = null;
+      const fields = generationMemoryFields(record);
+      if (generationMemoryMatchesQueueEntry(record, entry)) Object.assign(entry, fields);
+      for (const variant of Array.isArray(entry.variants) ? entry.variants : []) {
+        if (generationMemoryMatchesQueueEntry(record, variant)) Object.assign(variant, fields);
+      }
     }
   }
   return groups;
@@ -1036,23 +1134,27 @@ export function applyGenerationHistory(groups = {}, history = {}) {
     for (const entry of groups[groupId] || []) {
       const record = items[entry.sourceId];
       if (!record) continue;
-      const activeVariantId = String(entry.inputSourceId || entry.sourceVariantId || '');
-      if (record.sourceVariantId && activeVariantId && String(record.sourceVariantId) !== activeVariantId) continue;
-      if (record.relativePath && entry.relativePath && normalizeRelativePath(record.relativePath) !== normalizeRelativePath(entry.relativePath)) continue;
-      if (record.fingerprint && entry.fingerprint && String(record.fingerprint) !== String(entry.fingerprint)) continue;
-      entry.status = 'done';
-      entry.generatedAt = record.generatedAt || entry.generatedAt || null;
-      entry.generationId = record.generationId || entry.generationId || null;
-      entry.previousGenerationId = record.previousGenerationId || entry.previousGenerationId || null;
-      entry.outputPath = record.outputPath || entry.outputPath || null;
-      entry.outputHash = record.outputHash || entry.outputHash || null;
-      entry.outputWidth = record.outputWidth || entry.outputWidth || null;
-      entry.outputHeight = record.outputHeight || entry.outputHeight || null;
-      entry.verificationMode = record.verificationMode || entry.verificationMode || null;
-      entry.recipeHash = record.recipeHash || entry.recipeHash || null;
-      entry.profileId = record.profileId || entry.profileId || null;
-      entry.profileVersion = record.profileVersion || entry.profileVersion || null;
-      entry.lastError = null;
+      const fields = {
+        status: 'done',
+        generatedAt: record.generatedAt || null,
+        generationId: record.generationId || null,
+        previousGenerationId: record.previousGenerationId || null,
+        outputPath: record.outputPath || null,
+        outputHash: record.outputHash || null,
+        outputWidth: record.outputWidth || null,
+        outputHeight: record.outputHeight || null,
+        verificationMode: record.verificationMode || null,
+        recipeHash: record.recipeHash || null,
+        profileId: record.profileId || null,
+        profileVersion: record.profileVersion || null,
+        lastError: null,
+        errorClass: null,
+        nextRetryAt: null
+      };
+      if (generationMemoryMatchesQueueEntry(record, entry)) Object.assign(entry, fields);
+      for (const variant of Array.isArray(entry.variants) ? entry.variants : []) {
+        if (generationMemoryMatchesQueueEntry(record, variant)) Object.assign(variant, fields);
+      }
     }
   }
   return groups;

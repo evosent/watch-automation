@@ -31,12 +31,18 @@ import {
 } from '../extension/idb.js';
 import {
   QUEUE_GROUP_IDS,
+  applyGenerationMemory,
   factsMetadataProjections,
   filteredWatchEntries,
+  generationMemoryMatchesQueueAsset,
+  generationMemoryMatchesQueueEntry,
   mergeScannedGroups,
   modelCatalogRecordsFromGroups,
+  pendingEntryIdsForFilter,
   pendingEntryIds,
+  queuePartPlan,
   queueGroupsFromCatalog,
+  resetUnfinishedQueueGenerationState,
   chooseSourceVariant
 } from '../extension/queue-utils.js';
 import { galleryRecordsFromCatalog, currentRevisionsForCatalog } from '../extension/gallery-revision-utils.js';
@@ -182,6 +188,109 @@ test('facts updates preserve queue and memory status domains', () => {
     assert.equal(projected.memory.status, memoryStatus);
     assert.equal(projected.queue.chatUrl, projected.memory.chatUrl);
   }
+});
+
+test('stopped unfinished memory resets its matching variant and leaves other quality assets isolated', () => {
+  const sourceId = 'casio:ae-1200whd-1a';
+  const goodVariantId = 'input-watches-images/in_sale/AE-1200WHD-1A.png';
+  const badVariantId = 'input-watches-images/in_sale/bad_resolution/AE-1200WHD-1A.png';
+  const goodIdentity = {
+    sourceId,
+    sourceVariantId: goodVariantId,
+    groupId: 'in_sale_good',
+    relativePath: goodVariantId,
+    fileName: 'AE-1200WHD-1A.png',
+    fingerprint: '128:1000:AE-1200WHD-1A.png',
+    sourceHash: digest('good-source')
+  };
+  const entry = {
+    ...goodIdentity,
+    skuKey: sourceId,
+    inputSourceId: goodVariantId,
+    modelName: 'Casio AE-1200WHD-1A',
+    status: 'pending',
+    variants: [
+      { ...goodIdentity, variantId: goodVariantId, status: 'running', generationId: 'stale-good', lastError: 'old timeout', errorClass: 'timeout' },
+      {
+        sourceVariantId: badVariantId,
+        variantId: badVariantId,
+        groupId: 'in_sale_bad',
+        relativePath: badVariantId,
+        fileName: 'AE-1200WHD-1A.png',
+        fingerprint: '64:1000:AE-1200WHD-1A.png',
+        sourceHash: digest('bad-source'),
+        status: 'running',
+        generationId: 'other-quality-run',
+        lastError: 'different asset'
+      }
+    ]
+  };
+  const groups = { in_sale_good: [entry], in_sale_bad: [], not_in_sale_good: [], not_in_sale_bad: [] };
+  const memoryRecord = {
+    ...goodIdentity,
+    status: 'not_ready',
+    generationId: null,
+    lastError: null,
+    errorClass: null,
+    nextRetryAt: null
+  };
+  const memory = { items: { [sourceId]: memoryRecord } };
+
+  applyGenerationMemory(groups, memory);
+  assert.equal(entry.variants[0].status, 'pending', 'memory status replaces stale running variant state');
+  assert.equal(entry.variants[0].generationId, null);
+  assert.equal(entry.variants[1].status, 'running', 'a different quality variant keeps its own state');
+  assert.equal(generationMemoryMatchesQueueAsset(memoryRecord, {
+    ...goodIdentity,
+    fingerprint: 'changed-fingerprint',
+    sourceHash: digest('changed-source')
+  }), true, 'the same path remains associated so changed bytes can invalidate old progress');
+  assert.equal(generationMemoryMatchesQueueEntry(memoryRecord, {
+    ...goodIdentity,
+    fingerprint: 'changed-fingerprint',
+    sourceHash: digest('changed-source')
+  }), false, 'changed bytes cannot inherit the old generation result');
+
+  entry.lastError = 'stale queue error';
+  entry.variants[0].status = 'running';
+  entry.variants[0].generationId = 'stale-good';
+  entry.variants[0].lastError = 'stale variant error';
+  const reset = resetUnfinishedQueueGenerationState(entry, { identity: memoryRecord, resetEntry: true });
+  assert.deepEqual(reset, { entryReset: true, variantsReset: 1 });
+  const again = resetUnfinishedQueueGenerationState(entry, { identity: memoryRecord, resetEntry: true });
+  assert.deepEqual(again, { entryReset: false, variantsReset: 0 }, 'repeated stop normalization is idempotent');
+  const completed = {
+    ...goodIdentity,
+    status: 'done',
+    generationId: 'confirmed-generation',
+    outputPath: 'C:/results/confirmed.png',
+    outputHash: digest('confirmed-png')
+  };
+  assert.deepEqual(resetUnfinishedQueueGenerationState(completed), { entryReset: false, variantsReset: 0 });
+  assert.equal(completed.generationId, 'confirmed-generation');
+  assert.equal(completed.outputPath, 'C:/results/confirmed.png');
+  applyGenerationMemory(groups, memory);
+
+  const selected = filteredWatchEntries(groups, { saleStatus: 'in_sale', quality: 'good', brand: 'casio' });
+  assert.equal(selected[0].status, 'pending');
+  assert.deepEqual(pendingEntryIdsForFilter(selected, 100, 'queue'), [sourceId]);
+  assert.deepEqual(queuePartPlan(selected, 100, 'regular|in_sale|good|casio').parts[0].sourceIds, [sourceId]);
+  assert.equal(entry.variants[1].status, 'running', 'repair remains scoped to the matching source variant');
+});
+
+test('legacy sparse generation memory still restores a completed queue row', () => {
+  const sourceId = 'casio:legacy-model';
+  const entry = {
+    sourceId,
+    skuKey: sourceId,
+    groupId: 'in_sale_good',
+    fileName: 'Legacy.png',
+    status: 'pending'
+  };
+  const memory = { items: { [sourceId]: { sourceId, fileName: 'Legacy.png', status: 'ready', generationId: 'legacy-ready' } } };
+  applyGenerationMemory({ in_sale_good: [entry] }, memory);
+  assert.equal(entry.status, 'done');
+  assert.equal(entry.generationId, 'legacy-ready');
 });
 
 function idbDelete(name = DB_NAME) {

@@ -41,6 +41,8 @@ import {
   shouldRefreshUnresponsiveGeneration
 } from '../extension/reliability-utils.js';
 import {
+  GENERATION_MEMORY_STATUSES,
+  QUEUE_GROUP_IDS,
   referenceDescriptorForPath,
   generatedFileName,
   generationOutputFileName,
@@ -48,8 +50,14 @@ import {
   brandIdFromModelName,
   buildQueueProgressTree,
   filteredWatchEntries,
+  generationMemoryMatchesQueueAsset,
+  generationMemoryMatchesQueueEntry,
+  generationMemoryRecordFromEntry,
+  generationMemoryStatusForQueueStatus,
+  normalizeGenerationMemoryStatus,
   queuePartPlan,
   queueEntriesForPart,
+  resetUnfinishedQueueGenerationState,
   RUN_PART_SIZE,
   WATCH_BRAND_FILTERS
 } from '../extension/queue-utils.js';
@@ -1817,7 +1825,7 @@ test('0.3.18 completed generations persist recipe identity and missing legacy ha
   assert.match(worker, /if \(!entry\.recipeHash\) \{[\s\S]*entry\.recipeHash = expectedRecipeHash/);
   assert.match(worker, /return Boolean\(expected && entry\.recipeHash && entry\.recipeHash !== expected\)/);
   assert.match(queueUtils, /recipeHash: overrides\.recipeHash \?\? entry\?\.recipeHash \?\? null/);
-  assert.match(queueUtils, /entry\.recipeHash = record\.recipeHash \|\| entry\.recipeHash \|\| null/);
+  assert.match(queueUtils, /recipeHash: record\.recipeHash \|\| null/);
 });
 
 test('background facts recovery reloads frozen tabs and resumes DOM inspection without foreground activation', async () => {
@@ -2079,8 +2087,8 @@ test('reload and restart keep successful SKUs completed through persisted genera
   assert.match(worker, /chrome\.runtime\.onInstalled\.addListener/);
   assert.match(worker, /ensureGenerationMemoryState/);
   assert.match(queueUtils, /generationId: overrides\.generationId \?\? entry\?\.generationId \?\? null/);
-  assert.match(queueUtils, /entry\.status = queueStatusForGenerationMemoryStatus\(status\)/);
-  assert.match(queueUtils, /entry\.generationId = record\.generationId \|\| null/);
+  assert.match(queueUtils, /status: queueStatusForGenerationMemoryStatus\(status\)/);
+  assert.match(queueUtils, /generationId: record\.generationId \|\| null/);
 });
 
 test('development auto-reload defers while paused generation tabs still own work', async () => {
@@ -2106,6 +2114,28 @@ test('manual Stop consumes a deferred development reload at the first idle check
   assert.match(poll, /if \(marker\.userStopPending\)/);
   assert.match(poll, /suppressedAfterUserStop: true/);
   assert.match(poll, /pendingRevision: null,[\s\S]*?userStopPending: false/);
+});
+
+test('stop reset clears only unfinished variant state and passively repairs stopped storage', async () => {
+  const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
+  const resetStart = worker.indexOf('async function performResetRunAndRescan(options = {})');
+  const resetEnd = worker.indexOf('async function clearGenerationHistory', resetStart);
+  const reset = worker.slice(resetStart, resetEnd);
+  const ensureStart = worker.indexOf('async function ensureGenerationMemoryState()');
+  const ensureEnd = worker.indexOf('async function quickProbeReadyResultsBeforeReset', ensureStart);
+  const ensure = worker.slice(ensureStart, ensureEnd);
+  const recoveryStart = worker.indexOf('async function recoverInterruptedRun(reason)');
+  const recoveryEnd = worker.indexOf('function hasObservationWork', recoveryStart);
+  const recovery = worker.slice(recoveryStart, recoveryEnd);
+
+  assert.match(reset, /resetQueueSourceForIdentity\(/);
+  assert.match(reset, /generationMemoryHasVerifiedResult\(memoryRecord\)/);
+  assert.match(reset, /applyGenerationMemory\(queue\.groups \|\| \{\}, generationMemory\)/);
+  assert.doesNotMatch(reset, /delete history\.items/);
+  assert.doesNotMatch(reset, /queue\.repairQueue\s*=/);
+  assert.match(ensure, /!stored\.run[\s\S]*?stored\.runtime\?\.state[\s\S]*?'STOPPED'[\s\S]*?repairStoppedQueueStatuses/);
+  assert.match(recovery, /if \(!initialRun && String\(initial\.runtime\?\.state \|\| ''\)\.toUpperCase\(\) === 'STOPPED'\)[\s\S]*?ensureGenerationMemoryState\(\)/);
+  assert.match(recovery, /no tab probing,[\s\S]*?session reset is needed without a run/);
 });
 
 test('post-cooldown limit warnings are dismissed and coalesced for the configured ignore window', async () => {
