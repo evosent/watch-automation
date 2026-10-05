@@ -832,6 +832,7 @@
         factsJobId: meta.factsJobId || null
       });
       await A().waitForComposerReadyForInput({ timeout: FACTS_COMPOSER_TIMEOUT_MS, signal });
+      A().assertChatMode();
 
       stage('FILLING_PROMPT');
       const filled = await A().setComposerText(text, { signal });

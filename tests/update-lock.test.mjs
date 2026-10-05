@@ -18,9 +18,11 @@ function jsonResponse(payload, { ok = true, status = 200 } = {}) {
   return { ok, status, json: async () => structuredClone(payload) };
 }
 
-function workerHarness({ version = '0.3.40', lock = null, run = null, fetcher = async () => jsonResponse({ status: { phase: 'applying' } }) } = {}) {
+function workerHarness({ version = '0.3.40', lock = null, run = null, importJournal = null,
+  fetcher = async () => jsonResponse({ status: { phase: 'applying' } }) } = {}) {
   const data = { run, devAutoReload: { revision: 'previous' } };
   if (lock) data.manualExtensionUpdateLock = structuredClone(lock);
+  if (importJournal) data.resultsImportJournal = structuredClone(importJournal);
   const requests = [];
   const context = vm.createContext({
     Date,
@@ -59,15 +61,22 @@ function workerHarness({ version = '0.3.40', lock = null, run = null, fetcher = 
   });
   vm.runInContext(`let stateChain = Promise.resolve();
     let manualUpdateApplyInFlight = null;
+    let manualUpdateRestartInFlight = null;
+    let manualExtensionUpdateStatusCache = null;
+    let manualExtensionUpdateStatusInFlight = null;
+    const MANUAL_EXTENSION_UPDATE_STATUS_CACHE_MS = 5000;
     let devReloadPollInFlight = false;
     ${[
       'withStateLock',
       'requestLocalExtensionUpdate',
+      'readManualExtensionUpdateStatus',
+      'invalidateManualExtensionUpdateStatus',
       'clearManualExtensionUpdateLock',
       'reconcileManualExtensionUpdateLock',
       'assertManualExtensionUpdateNotApplying',
       'startManualExtensionUpdate',
       'applyManualExtensionUpdate',
+      'retryManualExtensionRestart',
       'getManualExtensionUpdateStatus',
       'pollDevReload',
       'startRun',
@@ -143,4 +152,71 @@ test('development auto-reload defers while a manual update owns the lock', async
   const result = await h.context.pollDevReload();
   assert.equal(result.reason, 'manual_update');
   assert.equal(h.requests.length, 0);
+});
+
+test('the pre-launch update guard deduplicates status reads and has a fresh no-pending fast path', async () => {
+  const h = workerHarness();
+  await h.context.assertManualExtensionUpdateNotApplying();
+  await h.context.assertManualExtensionUpdateNotApplying();
+  assert.equal(h.requests.length, 1, 'a second Start/Resume guard reuses the recent successful status read');
+  h.context.invalidateManualExtensionUpdateStatus();
+  await h.context.assertManualExtensionUpdateNotApplying();
+  assert.equal(h.requests.length, 2, 'an explicit invalidation forces a fresh authoritative read');
+});
+
+function pendingRestartPayload({ retryAvailable = true, requestedAt = new Date(Date.now() - 3 * 60_000).toISOString() } = {}) {
+  return {
+    status: { phase: 'restarting', restartRetryAvailable: retryAvailable },
+    installed: { packageId: 'package-1', extensionVersion: '0.3.40', restart: { phase: 'pending', requestedAt } }
+  };
+}
+
+test('restart retry preserves the lock when an accepted request loses its acknowledgement', async () => {
+  const h = workerHarness({ version: '0.3.39', fetcher: async (url) => {
+    if (url.includes('/update/status')) return jsonResponse(pendingRestartPayload());
+    throw new Error('Failed to fetch after POST was accepted');
+  } });
+  await assert.rejects(h.context.retryManualExtensionRestart(), /Failed to fetch/);
+  assert.equal(h.requests.length, 2);
+  assert.match(h.requests[1].url, /\/update\/restart\?/);
+  assert.equal(h.data.manualExtensionUpdateLock?.active, true);
+  assert.equal(h.data.manualExtensionUpdateLock?.targetVersion, '0.3.40');
+  assert.equal(h.data.devAutoReload.suppressNextTabRefresh, true);
+});
+
+test('restart retry coalesces repeated clicks while the endpoint is in flight', async () => {
+  let accept;
+  const endpoint = new Promise((resolve) => { accept = resolve; });
+  const h = workerHarness({ version: '0.3.39', fetcher: async (url) => {
+    if (url.includes('/update/status')) return jsonResponse(pendingRestartPayload());
+    return endpoint;
+  } });
+  const first = h.context.retryManualExtensionRestart();
+  const second = h.context.retryManualExtensionRestart();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.requests.length, 2, 'one status read plus one restart POST');
+  accept(jsonResponse({ status: { phase: 'restarting' }, installed: pendingRestartPayload().installed }));
+  const [left, right] = await Promise.all([first, second]);
+  assert.equal(left.launchBlocked, true);
+  assert.equal(right.launchBlocked, true);
+  assert.equal(h.requests.filter((request) => request.url.includes('/update/restart?')).length, 1);
+});
+
+test('restart retry refuses active runs and import transactions before contacting the watcher', async () => {
+  const running = workerHarness({ run: { state: 'RUNNING' } });
+  await assert.rejects(running.context.retryManualExtensionRestart(), /Перед перезапуском/);
+  assert.equal(running.requests.length, 0);
+  const importing = workerHarness({ importJournal: { id: 'import-1' } });
+  await assert.rejects(importing.context.retryManualExtensionRestart(), /импорта результатов/);
+  assert.equal(importing.requests.length, 0);
+});
+
+test('legacy status responses infer retry availability from the durable pending timestamp', async () => {
+  const payload = pendingRestartPayload();
+  delete payload.status.restartRetryAvailable;
+  const h = workerHarness({ version: '0.3.39', fetcher: async () => jsonResponse(payload) });
+  const status = await h.context.getManualExtensionUpdateStatus();
+  assert.equal(status.canRetryRestart, true);
+  assert.equal(status.launchBlocked, true);
+  assert.equal(h.data.manualExtensionUpdateLock?.targetVersion, '0.3.40');
 });

@@ -5,7 +5,7 @@ import { createReadStream, promises as fs, watch as watchFiles } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
-import { createUpdateManager, UPDATE_STATE_FILE } from './update-utils.mjs';
+import { createUpdateManager, installedUpdateStatus, scheduleApplicationRestart, UPDATE_STATE_FILE } from './update-utils.mjs';
 import { createResultsTransferManager } from '../extension/local-service/results-transfer.mjs';
 import {
   controlCommandMatchesClient,
@@ -74,9 +74,24 @@ let nextControlId = Date.now() * 1000 + 1;
 
 const updateManager = createUpdateManager(PROJECT_ROOT, {
   onApplyStart: async () => { updateApplying = true; },
-  onApplyEnd: async () => {
-    updateApplying = false;
-    await rescan('manual-update');
+  onApplyEnd: async ({ applied }) => {
+    // Keep the installed revision hidden while the helper swaps the watcher
+    // and managed browser. Failed installs still restore the current watcher.
+    if (!applied) {
+      updateApplying = false;
+      await rescan('manual-update-failed');
+    }
+  },
+  onRestart: async ({ installed }) => {
+    updateApplying = true;
+    try {
+      await scheduleApplicationRestart(PROJECT_ROOT, installed, { hostName: HOST, port: PORT });
+      setTimeout(close, 700);
+    } catch (error) {
+      updateApplying = false;
+      await rescan('restart-failed');
+      throw error;
+    }
   }
 });
 const resultsTransfers = createResultsTransferManager({ outputRoot: defaultOutputRoot });
@@ -952,7 +967,7 @@ function startHttpServer() {
           .catch(() => null)
           .then((installed) => jsonResponse(response, 200, {
             ok: true,
-            status: updateManager.getStatus(),
+            status: installedUpdateStatus(updateManager.getStatus(), installed),
             installed
           }));
         return;
@@ -967,11 +982,20 @@ function startHttpServer() {
       if (request.method === 'POST' && requestUrl.pathname === '/update/apply') {
         const started = updateManager.startApply();
         const status = updateManager.getStatus();
-        if (!started && !['applying', 'complete', 'current'].includes(String(status.phase || ''))) {
+        if (!started && !['applying', 'restarting', 'complete', 'current'].includes(String(status.phase || ''))) {
           jsonResponse(response, 409, { ok: false, error: 'Нет подготовленного обновления для установки', status });
           return;
         }
         jsonResponse(response, 202, { ok: true, started, status });
+        return;
+      }
+      if (request.method === 'POST' && requestUrl.pathname === '/update/restart') {
+        updateManager.startRestart().then((result) => {
+          jsonResponse(response, result.started ? 202 : result.reason === 'restart_failed' ? 500 : 409, {
+            ok: result.started, started: result.started, reason: result.reason,
+            error: result.started ? undefined : result.message, status: result.status, installed: result.installed
+          });
+        }).catch((error) => jsonResponse(response, 500, { ok: false, error: error?.message || String(error) }));
         return;
       }
       jsonResponse(response, 404, { ok: false, error: 'Неизвестный маршрут обновления' });

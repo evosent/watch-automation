@@ -305,6 +305,32 @@ test('model queue tree mirrors launch parts and reports progress at every regula
   assert.equal(regen.children[0].children[0].children[0].children[0].queued, 1);
 });
 
+test('completed repair entries are excluded from regeneration parts like the launch queue', () => {
+  const groups = { in_sale_good: [], in_sale_bad: [], not_in_sale_good: [], not_in_sale_bad: [] };
+  groups.in_sale_good = Array.from({ length: 102 }, (_, index) => ({
+    sourceId: `casio:${String(index).padStart(4, '0')}`,
+    skuKey: `casio:${String(index).padStart(4, '0')}`,
+    modelName: `Casio Model ${String(index).padStart(4, '0')}`,
+    groupId: 'in_sale_good',
+    status: 'pending'
+  }));
+  const repairQueue = [
+    ...groups.in_sale_good.slice(0, 101).map((entry) => ({ sourceId: entry.sourceId, status: 'pending' })),
+    { sourceId: groups.in_sale_good[101].sourceId, status: 'completed' }
+  ];
+  const tree = buildQueueProgressTree(groups, repairQueue);
+  const regeneration = tree.find((node) => node.mode === 'regeneration');
+  const part = regeneration.children[0].children[0].children[0].children[0];
+  const launchPlan = queuePartPlan(groups.in_sale_good.slice(0, 101), RUN_PART_SIZE,
+    'regeneration|in_sale|good|casio');
+
+  assert.equal(regeneration.total, 101);
+  assert.equal(regeneration.queued, 101);
+  assert.equal(part.total, 100);
+  assert.equal(part.signature, launchPlan.signature);
+  assert.deepEqual(part.sourceIds, launchPlan.parts[0].sourceIds);
+});
+
 test('generic brand is an exact filter instead of aliasing all brands', () => {
   assert.ok(WATCH_BRAND_FILTERS.some((item) => item.id === 'generic'));
   const groups = {
@@ -1770,7 +1796,14 @@ test('package integrity: static DOM id references exist in gallery and side pane
     ]);
     const htmlIds = new Set([...html.matchAll(/id=["']([^"']+)["']/g)].map((match) => match[1]));
     const referencedIds = new Set([...js.matchAll(/\$\(["']([^"']+)["']\)/g)].map((match) => match[1]));
-    const missing = [...referencedIds].filter((id) => !htmlIds.has(id)).sort();
+    // The compact side panel removed the visible header health cluster. Those
+    // legacy IDs are intentionally absent and renderHealth updates them only
+    // when older markup provides them; its null-safe contract is covered by
+    // sidepanel-workspace.test.mjs.
+    const optionalLegacySidepanelIds = base === 'sidepanel'
+      ? new Set(['statusSignal', 'pauseSignal', 'status', 'pauseStatus'])
+      : new Set();
+    const missing = [...referencedIds].filter((id) => !htmlIds.has(id) && !optionalLegacySidepanelIds.has(id)).sort();
     assert.deepEqual(missing, [], `${base}.js references missing DOM ids`);
   }
 });

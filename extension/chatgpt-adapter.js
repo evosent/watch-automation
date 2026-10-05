@@ -191,10 +191,13 @@
     });
   }
 
-  async function safeClick(element, label, debugOverlay = true) {
+  async function safeClick(element, label, debugOverlay = true, beforeClick = null) {
     if (!R().visible(element)) throw new Error(`Target not visible: ${label}`);
     if (element.disabled || element.getAttribute('aria-disabled') === 'true') throw new Error(`Target disabled: ${label}`);
     if (debugOverlay) await O().highlightTarget(element, { label });
+    // Callers may provide a safety check that must be evaluated after any
+    // asynchronous highlighting and immediately before the physical click.
+    if (beforeClick?.() === false) return { clicked: false };
     recordAdapterAction({
       type: 'click',
       name: label,
@@ -203,15 +206,105 @@
     element.click();
   }
 
+  function chatModeState() {
+    const selector = 'button, [role="tab"], [role="radio"], [role="button"], a';
+    const label = (node) => String(node.textContent || node.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
+    const controls = [...document.querySelectorAll(selector)].filter((node) => R().visible(node));
+    const chats = controls.filter((node) => /^(Чат|Chat)$/i.test(label(node)));
+    const works = controls.filter((node) => /^(Работа|Work)$/i.test(label(node)));
+    const pairs = [];
+    for (const chat of chats) {
+      let parent = chat.parentElement;
+      for (let depth = 0; parent && parent !== document.body && depth < 3; depth++, parent = parent.parentElement) {
+        const siblings = [...parent.querySelectorAll(selector)].filter((node) => R().visible(node));
+        const work = works.find((node) => siblings.includes(node));
+        // Restrict matching to the two-option switch, never arbitrary sidebar
+        // links or words inside messages and project lists.
+        if (work && siblings.length === 2) { pairs.push({ chat, work }); break; }
+      }
+    }
+    // Older ChatGPT layouts have no mode switch. If a Work control exists
+    // without an unambiguous Chat/Work pair, fail closed.
+    if (!pairs.length) return { mode: works.length ? 'unknown' : 'classic' };
+    if (pairs.length !== 1) return { mode: 'unknown' };
+    const { chat, work } = pairs[0];
+    const active = (node) => {
+      for (const attribute of ['aria-selected', 'aria-pressed', 'aria-checked', 'data-selected', 'data-active']) {
+        const value = node.getAttribute(attribute);
+        if (value === 'true' || value === 'false') return value === 'true';
+      }
+      const state = node.getAttribute('data-state');
+      if (['active', 'checked', 'on'].includes(state)) return true;
+      if (['inactive', 'unchecked', 'off'].includes(state)) return false;
+      const current = node.getAttribute('aria-current');
+      if (current && current !== 'false') return true;
+      return null;
+    };
+    let chatActive = active(chat), workActive = active(work);
+    if (chatActive === null && workActive === null) {
+      // Some builds use an opaque selected pill and a transparent other tab.
+      const transparent = (node) => /^(transparent|rgba\([^)]*,\s*0\)|rgb\([^)]*\/\s*0\))$/.test(getComputedStyle(node).backgroundColor);
+      const chatClear = transparent(chat), workClear = transparent(work);
+      if (chatClear !== workClear) { chatActive = !chatClear; workActive = !workClear; }
+    }
+    const mode = chatActive === true && workActive !== true ? 'chat'
+      : workActive === true && chatActive !== true ? 'work' : 'unknown';
+    return { mode, chat, work };
+  }
+
+  function assertChatMode() {
+    const state = chatModeState();
+    if (state.mode === 'chat' || state.mode === 'classic') return state;
+    const error = new Error('Генерация работает только в режиме «Чат». Выберите «Чат» вместо «Работа» и повторите запуск.');
+    error.code = 'CHAT_MODE_REQUIRED';
+    throw error;
+  }
+
+  let chatModePreparation = null;
+  function ensureChatMode({ debugOverlay = false, signal } = {}) {
+    if (chatModePreparation) return chatModePreparation;
+    chatModePreparation = (async () => {
+      await waitForDomCondition({ name: 'ChatGPT composer', timeout: 60000, signal, predicate: () => R().resolve('composer').element });
+      const state = chatModeState();
+      if (state.mode === 'chat' || state.mode === 'classic') return state;
+      // Changing modes can discard a saved conversation or prepared inputs.
+      const composer = R().resolve('composer').element;
+      if (!state.chat || /^\/c\//.test(location.pathname) || document.querySelector('[data-turn]')
+        || String(composer?.textContent || composer?.value || '').trim()
+        || R().attachmentTiles?.().length) return assertChatMode();
+      await safeClick(state.chat, 'Выбрать режим Чат', debugOverlay, () => {
+        const current = chatModeState();
+        if (current.mode === 'chat') return false;
+        const currentComposer = R().resolve('composer').element;
+        const pageStillEmpty = current.chat && !/^\/c\//.test(location.pathname)
+          && !document.querySelector('[data-turn]')
+          && !String(currentComposer?.textContent || currentComposer?.value || '').trim()
+          && !R().attachmentTiles?.().length;
+        if (!pageStillEmpty) return assertChatMode();
+        return true;
+      });
+      await waitForDomCondition({ name: 'режим Чат', timeout: 10000, signal, predicate: () => chatModeState().mode === 'chat' });
+      return assertChatMode();
+    })().finally(() => { chatModePreparation = null; });
+    return chatModePreparation;
+  }
+
   async function ensureNewChat({ debugOverlay = true, signal } = {}) {
     await waitForDomCondition({ name: 'ChatGPT composer', timeout: 60000, signal, predicate: () => R().resolve('composer').element });
     const hasTurns = document.querySelector('[data-turn]');
     const inConversationPath = /^\/c\//.test(location.pathname);
-    if (!hasTurns && !inConversationPath) return { alreadyNew: true };
+    if (!hasTurns && !inConversationPath) {
+      await ensureChatMode({ debugOverlay, signal });
+      return { alreadyNew: true };
+    }
+    // Do not navigate away from a prepared conversation while Work is active
+    // or the mode control cannot be identified with confidence.
+    assertChatMode();
     const found = R().resolve('newChat');
     if (!found.element) throw new Error('New Chat button not found');
-    await safeClick(found.element, 'Click: New Chat', debugOverlay);
+    await safeClick(found.element, 'Click: New Chat', debugOverlay, assertChatMode);
     await waitForDomCondition({ name: 'empty new chat', timeout: 30000, signal, predicate: () => R().resolve('composer').element && !document.querySelector('[data-turn]') });
+    await ensureChatMode({ debugOverlay, signal });
     return { alreadyNew: false, selector: found.selector };
   }
 
@@ -527,7 +620,7 @@
     // composer, immediately before the real Send click.
     const baselineAssistantCount = R().assistantTurns().length;
     const baselineUserCount = R().userTurns().length;
-    await safeClick(send, 'Click: Send', debugOverlay);
+    await safeClick(send, 'Click: Send', debugOverlay, assertChatMode);
     const sendClickedAtMs = Date.now();
     recordAdapterAction({ type: 'send-click', state: 'CLICKED', details: { baselineAssistantCount, baselineUserCount, sendClickedAtMs } });
     return { baselineAssistantCount, baselineUserCount, sendClickedAtMs };
@@ -1013,11 +1106,16 @@
   }
 
   window.WatchChatGPTAdapter = {
-    waitForDomCondition, safeClick, ensureNewChat, uploadFile, uploadFiles, setComposerText, composerHasText,
+    waitForDomCondition, safeClick, ensureNewChat, ensureChatMode, assertChatMode, chatModeState, uploadFile, uploadFiles, setComposerText, composerHasText,
     waitForComposerReadyForInput, waitForComposerReadyForSend, clickSendPrompt, waitForPromptAcceptance, sendPrompt, waitForSettledAssistantText, inspectFactsResponse,
     inspectGeneratedImage, waitForGeneratedImage, classifyAssistantOutcome, noteRateLimit,
     latestAssistantTurn: () => R().latestAssistantTurn(),
     latestUserTurn: () => R().latestUserTurn?.() || R().userTurns().at(-1) || null,
     dryRunReport, visualizeDryRun
   };
+  // Only the managed empty landing page may switch modes automatically.
+  // Saved conversations and any prepared inputs are verified without edits.
+  if (typeof location !== 'undefined' && location.pathname === '/' && new URL(location.href).searchParams.get('watch_automation') === '1') {
+    ensureChatMode().catch((error) => recordAdapterAction({ type: 'chat-mode', state: 'ERROR', details: { error: error.message } }));
+  }
 })();

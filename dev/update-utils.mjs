@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { inflateRawSync } from 'node:zlib';
@@ -285,6 +286,154 @@ async function readInstalledVersion(projectRoot) {
   return String(manifest?.version || 'неизвестна');
 }
 
+export async function writeUpdateRestartState(projectRoot, packageId, restart) {
+  const markerPath = path.join(path.resolve(projectRoot), UPDATE_STATE_FILE);
+  const installed = await readJson(markerPath);
+  if (!installed || installed.packageId !== packageId) throw new Error('Установленный пакет изменился до перезапуска');
+  const next = { ...installed, restart };
+  const temporary = `${markerPath}.restart-${process.pid}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  await fs.rename(temporary, markerPath);
+  return next;
+}
+
+export function installedUpdateStatus(status, installed) {
+  const restartAge = Date.now() - Date.parse(installed?.restart?.requestedAt);
+  const pending = installed?.restart?.phase === 'pending';
+  const retryable = installed?.restart?.phase === 'error' || (pending && Number.isFinite(restartAge) && restartAge >= 120000);
+  status = { ...status,
+    restartRetryAvailable: Boolean(installed?.packageId && retryable && !['checking', 'downloading', 'validating', 'ready', 'applying'].includes(status.phase)),
+    restartRetryAvailableAt: pending && Number.isFinite(restartAge) ? new Date(Date.parse(installed.restart.requestedAt) + 120000).toISOString() : null
+  };
+  if (!['idle', 'restarting'].includes(status.phase) || !installed?.restart) return status;
+  const restart = installed.restart;
+  const phase = restart.phase === 'complete' ? 'complete' : restart.phase === 'error' ? 'error' : 'restarting';
+  return { ...status, phase, currentVersion: installed.extensionVersion, latestVersion: installed.extensionVersion,
+    packageId: installed.packageId, restartRequired: phase === 'restarting',
+    error: phase === 'error' ? restart.error : null,
+    message: phase === 'complete' ? `Обновление ${installed.extensionVersion} установлено. Приложение перезапущено.`
+      : phase === 'error' ? `Файлы обновлены, но перезапуск не завершён: ${restart.error}`
+        : 'Обновление установлено. Перезапускаю приложение и локальный сервис…' };
+}
+
+// A detached helper outlives the watcher that currently serves the update
+// request. It starts the updated watcher, closes only the managed browser
+// profile, and then relaunches that profile with the newly installed files.
+export function applicationRestartScript(config) {
+  const encoded = Buffer.from(JSON.stringify(config), 'utf8').toString('base64');
+  return String.raw`
+$ErrorActionPreference = 'Stop'
+$config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')) | ConvertFrom-Json
+function Save-RestartState([string]$phase, [string]$failure = '') {
+  $markerPath = Join-Path $config.projectRoot '.watch-automation-update-state.json'
+  $marker = Get-Content -LiteralPath $markerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($marker.packageId -ne $config.packageId) { throw 'Installed package changed during restart' }
+  $restart = @{ phase=$phase; requestedAt=$config.requestedAt; previousPid=$config.previousPid; completedAt=[DateTime]::UtcNow.ToString('o'); error=$failure }
+  $marker | Add-Member -NotePropertyName restart -NotePropertyValue $restart -Force
+  $temporary = $markerPath + '.restart-helper.tmp'
+  [IO.File]::WriteAllText($temporary, ($marker | ConvertTo-Json -Depth 10), (New-Object Text.UTF8Encoding($false)))
+  Move-Item -LiteralPath $temporary -Destination $markerPath -Force
+}
+function Get-ManagedBrowsers {
+  $profileArg = '(?:^|\s)--user-data-dir=(?:"' + [regex]::Escape($config.profilePath) + '"|' + [regex]::Escape($config.profilePath) + ')(?:\s|$)'
+  @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
+    $_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath) -eq $config.chromePath -and $_.CommandLine -match $profileArg
+  })
+}
+try {
+  if ($config.acknowledgementPath) { [IO.File]::WriteAllText($config.acknowledgementPath, [string]$PID) }
+  Wait-Process -Id $config.previousPid -Timeout 30 -ErrorAction SilentlyContinue
+  if (Get-Process -Id $config.previousPid -ErrorAction SilentlyContinue) { throw 'Previous local service did not stop' }
+  $env:WATCH_AUTOMATION_HOST = $config.hostName
+  $env:WATCH_AUTOMATION_PORT = [string]$config.port
+  $nextWatcher = Start-Process -FilePath $config.nodeExecutable -ArgumentList ('"' + $config.watcherPath + '"') -WorkingDirectory $config.projectRoot -WindowStyle Hidden -PassThru
+  $healthy = $false
+  for ($attempt=0; $attempt -lt 60; $attempt++) {
+    try {
+      $health = Invoke-RestMethod -Uri $config.healthUrl -TimeoutSec 1 -UseBasicParsing
+      if ($health.ok -and $health.pid -eq $nextWatcher.Id -and $health.projectRoot -eq $config.projectRoot) { $healthy=$true; break }
+    } catch {}
+    Start-Sleep -Milliseconds 500
+  }
+  if (-not $healthy) { throw 'Updated local service did not become ready' }
+  $browsers = @(Get-ManagedBrowsers)
+  foreach ($browser in $browsers) { $process = Get-Process -Id $browser.ProcessId -ErrorAction SilentlyContinue; if ($process) { $process.CloseMainWindow() | Out-Null } }
+  if ($browsers.Count) {
+    Wait-Process -Id @($browsers | Select-Object -ExpandProperty ProcessId) -Timeout 8 -ErrorAction SilentlyContinue
+    $remaining = @(Get-ManagedBrowsers)
+    foreach ($browser in $remaining) { Stop-Process -Id $browser.ProcessId -Force -ErrorAction Stop }
+    if ($remaining.Count) { Wait-Process -Id @($remaining | Select-Object -ExpandProperty ProcessId) -Timeout 10 -ErrorAction SilentlyContinue }
+    if (@(Get-ManagedBrowsers).Count) { throw 'Previous automation browser did not stop' }
+  }
+  $arguments = @(('--user-data-dir="' + $config.profilePath + '"'), '--no-first-run', '--no-default-browser-check', '--disable-sync',
+    '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
+    '--disable-features=IntensiveWakeUpThrottling,FreezingOnBatterySaver,InfiniteTabsFreezing,InfiniteTabsFreezingOnMemoryPressure,CalculateNativeWinOcclusion',
+    ('--load-extension="' + $config.extensionPath + '"'), 'https://chatgpt.com/?watch_automation=1')
+  Start-Process -FilePath $config.chromePath -ArgumentList $arguments -WorkingDirectory $config.projectRoot | Out-Null
+  $browserReady = $false
+  for ($attempt=0; $attempt -lt 30; $attempt++) { if (@(Get-ManagedBrowsers).Count) { $browserReady=$true; break }; Start-Sleep -Milliseconds 500 }
+  if (-not $browserReady) { throw 'Chrome for Testing did not start with the automation profile' }
+  Save-RestartState 'complete'
+} catch {
+  try { Save-RestartState 'error' $_.Exception.Message } catch {}
+  exit 1
+}
+`;
+}
+
+export async function scheduleApplicationRestart(projectRoot, installed, {
+  hostName = '127.0.0.1', port = 17321, nodeExecutable = process.execPath,
+  localAppData = process.env.LOCALAPPDATA, spawnImpl = spawn, platform = process.platform
+} = {}) {
+  if (platform !== 'win32' || !localAppData) throw new Error('Автоматический перезапуск приложения поддерживается в Windows');
+  const root = path.resolve(projectRoot);
+  const browserRoot = path.join(localAppData, 'WatchAutomation', 'ChromeForTesting');
+  let chromePath = null;
+  for (const candidate of [path.join(browserRoot, 'chrome-win64', 'chrome.exe'), path.join(browserRoot, 'chrome.exe')]) {
+    if (await fs.stat(candidate).then((info) => info.isFile()).catch(() => false)) { chromePath = candidate; break; }
+  }
+  if (!chromePath) throw new Error('Chrome for Testing не найден. Запусти INSTALL_WatchAutomation.cmd');
+  const helperRoot = await fs.mkdtemp(path.join(root, '.watch-automation-restart-'));
+  const acknowledgementPath = path.join(helperRoot, 'started.txt');
+  const scriptPath = path.join(helperRoot, 'restart.ps1');
+  const logPath = path.join(helperRoot, 'restart.log');
+  const config = { projectRoot: root, nodeExecutable, chromePath,
+    watcherPath: path.join(root, 'dev', 'watch-extension.mjs'), extensionPath: path.join(root, 'extension'),
+    profilePath: path.join(localAppData, 'WatchAutomation', 'ChromeProfile'),
+    hostName, port, healthUrl: `http://${hostName}:${port}/health`,
+    packageId: installed.packageId, previousPid: process.pid, requestedAt: installed.restart.requestedAt,
+    acknowledgementPath };
+  await fs.writeFile(scriptPath, applicationRestartScript(config), 'utf8');
+  const bootstrapConfig = Buffer.from(JSON.stringify({ scriptPath, logPath, outputPath: path.join(helperRoot, 'stdout.log') }), 'utf8').toString('base64');
+  const bootstrap = `$ErrorActionPreference='Stop'; $launch=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${bootstrapConfig}')) | ConvertFrom-Json; Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"'+$launch.scriptPath+'"')) -WindowStyle Hidden -RedirectStandardOutput $launch.outputPath -RedirectStandardError $launch.logPath | Out-Null`;
+  const encodedBootstrap = Buffer.from(bootstrap, 'utf16le').toString('base64');
+  const log = await fs.open(path.join(helperRoot, 'bootstrap.log'), 'a');
+  let child; let exited = false; let exitCode = null;
+  try {
+    child = spawnImpl('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encodedBootstrap], {
+      cwd: root, detached: false, windowsHide: true, stdio: ['ignore', log.fd, log.fd]
+    });
+    child.once('exit', (code) => { exited = true; exitCode = code; });
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      if (exited && exitCode !== 0) throw new Error(`Помощник перезапуска завершился до подтверждения (код ${exitCode}). Журналы: ${helperRoot}`);
+      const acknowledgement = await fs.readFile(acknowledgementPath, 'utf8').catch(() => '');
+      if (Number.isSafeInteger(Number(acknowledgement)) && Number(acknowledgement) > 0) {
+        child.unref();
+        return { pid: Number(acknowledgement), logPath };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`Помощник перезапуска не подтвердил запуск. Журналы: ${helperRoot}`);
+  } catch (error) {
+    if (child && !exited) child.kill?.();
+    throw error;
+  } finally {
+    await log.close();
+  }
+}
+
 async function replaceTargets(projectRoot, stageRoot, packageManifest, releaseIdentity) {
   const backupRoot = await fs.mkdtemp(path.join(projectRoot, '.watch-automation-update-backup-'));
   const targets = [
@@ -348,7 +497,7 @@ async function replaceTargets(projectRoot, stageRoot, packageManifest, releaseId
   }
 }
 
-export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyEnd = null } = {}) {
+export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyEnd = null, onRestart = null } = {}) {
   const root = path.resolve(projectRoot);
   let status = {
     phase: 'idle',
@@ -361,12 +510,29 @@ export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyE
   };
   let preparePromise = null;
   let applyPromise = null;
+  let restartPromise = null;
   let stageRoot = null;
   let releaseIdentity = null;
 
   const setStatus = (phase, message, extra = {}) => {
     status = { ...status, ...extra, phase, message, updatedAt: new Date().toISOString() };
   };
+
+  async function restartInstalledUpdate(packageManifest, installed) {
+    const restart = { phase: 'pending', requestedAt: new Date().toISOString(), previousPid: process.pid };
+    installed = await writeUpdateRestartState(root, installed.packageId, restart);
+    setStatus('restarting', 'Обновление установлено. Перезапускаю приложение и локальный сервис…', {
+      currentVersion: installed.extensionVersion, latestVersion: installed.extensionVersion,
+      packageId: installed.packageId, restartRequired: true, error: null
+    });
+    try {
+      await onRestart({ packageManifest, installed });
+      return installed;
+    } catch (error) {
+      await writeUpdateRestartState(root, installed.packageId, { ...restart, phase: 'error', error: error?.message || String(error) }).catch(() => {});
+      throw error;
+    }
+  }
 
   async function prepareLatestUpdate(fetchImpl = globalThis.fetch) {
     const currentVersion = await readInstalledVersion(root);
@@ -390,6 +556,12 @@ export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyE
     }
     const installedState = await readJson(path.join(root, UPDATE_STATE_FILE));
     if (installedState?.releaseIdentity === releaseIdentity) {
+      if (onRestart && ['pending', 'error'].includes(installedState.restart?.phase)) {
+        // Checking for updates is observational. Only the explicit retry
+        // endpoint may launch a second restart helper.
+        status = installedUpdateStatus({ ...status, phase: 'idle' }, installedState);
+        return { available: false, restarting: installedState.restart.phase === 'pending' };
+      }
       setStatus('current', `Установлена актуальная версия ${latestVersion}.`, { latestVersion });
       return { available: false, version: latestVersion };
     }
@@ -429,7 +601,7 @@ export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyE
   }
 
   function startPrepare(fetchImpl = globalThis.fetch) {
-    if (preparePromise || applyPromise || status.phase === 'ready') return false;
+    if (preparePromise || applyPromise || restartPromise || status.phase === 'ready') return false;
     preparePromise = prepareLatestUpdate(fetchImpl)
       .catch((error) => {
         setStatus('error', error?.message || String(error), { error: error?.message || String(error) });
@@ -444,32 +616,49 @@ export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyE
   }
 
   function startApply() {
-    if (!stageRoot || status.phase !== 'ready' || applyPromise) return false;
+    if (!stageRoot || status.phase !== 'ready' || applyPromise || restartPromise) return false;
     applyPromise = (async () => {
       const stagedRoot = stageRoot;
-      const packageManifest = await readJson(path.join(stagedRoot, UPDATE_PACKAGE_MANIFEST));
-      setStatus('applying', `Устанавливаю ${packageManifest.extensionVersion} и синхронизирую референсы…`);
-      await onApplyStart?.();
+      let installed = null;
+      let packageManifest = null;
       try {
-        await replaceTargets(root, stagedRoot, packageManifest, releaseIdentity);
-        stageRoot = null;
-        setStatus('complete', `Обновление ${packageManifest.extensionVersion} установлено. Входные фотографии сохранены.`, {
-          currentVersion: packageManifest.extensionVersion,
-          latestVersion: packageManifest.extensionVersion,
-          packageId: packageManifest.packageId,
-          error: null
-        });
+        packageManifest = await readJson(path.join(stagedRoot, UPDATE_PACKAGE_MANIFEST));
+        if (!packageManifest) throw new Error('Подготовленный пакет обновления не найден. Повтори проверку.');
+        setStatus('applying', `Устанавливаю ${packageManifest.extensionVersion} и синхронизирую референсы…`);
+        await onApplyStart?.();
+        try {
+          installed = await replaceTargets(root, stagedRoot, packageManifest, releaseIdentity);
+          stageRoot = null;
+        } finally {
+          await onApplyEnd?.({ applied: Boolean(installed) });
+        }
         await fs.rm(stagedRoot, { recursive: true, force: true }).catch(() => {});
+        if (onRestart) {
+          await restartInstalledUpdate(packageManifest, installed);
+          return;
+        }
+        setStatus('complete', `Обновление ${packageManifest.extensionVersion} установлено. Входные фотографии сохранены.`, {
+          currentVersion: packageManifest.extensionVersion, latestVersion: packageManifest.extensionVersion,
+          packageId: packageManifest.packageId, error: null
+        });
       } catch (error) {
-        setStatus('error', `Обновление отменено, исходные файлы восстановлены: ${error?.message || error}`, {
+        if (installed && onRestart) {
+          await writeUpdateRestartState(root, installed.packageId, {
+            phase: 'error', requestedAt: new Date().toISOString(), previousPid: process.pid, error: error?.message || String(error)
+          }).catch(() => {});
+        }
+        setStatus('error', installed
+          ? `Файлы обновлены, но перезапуск приложения не завершён: ${error?.message || error}`
+          : `Обновление отменено, исходные файлы восстановлены: ${error?.message || error}`, {
           error: error?.message || String(error)
         });
-        throw error;
       } finally {
-        await onApplyEnd?.();
-        applyPromise = null;
+        if (stageRoot === stagedRoot) {
+          await fs.rm(stagedRoot, { recursive: true, force: true }).catch(() => {});
+          stageRoot = null;
+        }
       }
-    })();
+    })().finally(() => { applyPromise = null; });
     void applyPromise.catch(() => {});
     return true;
   }
@@ -479,8 +668,40 @@ export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyE
     return { ...status };
   }
 
+  function startRestart() {
+    const rejected = (reason, message, installed = null, retryAvailable = false) => ({
+      started: false, reason, message, installed,
+      status: { ...installedUpdateStatus({ ...status }, installed), restartRetryAvailable: retryAvailable }
+    });
+    if (restartPromise) return restartPromise;
+    if (preparePromise || applyPromise || stageRoot) {
+      return Promise.resolve(rejected('busy', 'Другая операция обновления ещё выполняется.'));
+    }
+    if (!onRestart) return Promise.resolve(rejected('unsupported', 'Перезапуск приложения недоступен в этом сервисе.'));
+    restartPromise = (async () => {
+      const installed = await readJson(path.join(root, UPDATE_STATE_FILE));
+      if (!installed?.packageId || !['pending', 'error'].includes(installed.restart?.phase)) {
+        return rejected('not_pending', 'Нет незавершённого перезапуска установленного обновления.', installed);
+      }
+      if (installed.restart.phase === 'pending') {
+        const requestedAt = Date.parse(installed.restart.requestedAt);
+        if (!Number.isFinite(requestedAt) || Date.now() - requestedAt < 120000) {
+          return rejected('busy', 'Перезапуск ещё выполняется. Повтор доступен через две минуты после его начала.', installed);
+        }
+      }
+      const restarted = await restartInstalledUpdate(installed, installed);
+      return { started: true, installed: restarted, status: installedUpdateStatus({ ...status }, restarted) };
+    })().catch(async (error) => {
+      const message = `Файлы обновлены, но перезапуск приложения не завершён: ${error?.message || error}`;
+      setStatus('error', message, { error: error?.message || String(error) });
+      const installed = await readJson(path.join(root, UPDATE_STATE_FILE));
+      return rejected('restart_failed', message, installed, true);
+    }).finally(() => { restartPromise = null; });
+    return restartPromise;
+  }
+
   async function cancelPreparedUpdate() {
-    if (status.phase === 'applying') return false;
+    if (applyPromise || restartPromise || ['applying', 'restarting'].includes(status.phase)) return false;
     if (stageRoot) await fs.rm(stageRoot, { recursive: true, force: true }).catch(() => {});
     stageRoot = null;
     setStatus('idle', 'Подготовленное обновление отменено.');
@@ -493,6 +714,7 @@ export function createUpdateManager(projectRoot, { onApplyStart = null, onApplyE
     waitForPrepare,
     startApply,
     waitForApply,
+    startRestart,
     cancelPreparedUpdate
   };
 }

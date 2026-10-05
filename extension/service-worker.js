@@ -207,6 +207,10 @@ const postprocessCapacityReservations = new Map();
 let inputFilePromiseCache = new Map();
 let devReloadPollInFlight = false;
 let manualUpdateApplyInFlight = null;
+let manualUpdateRestartInFlight = null;
+let manualExtensionUpdateStatusCache = null;
+let manualExtensionUpdateStatusInFlight = null;
+const MANUAL_EXTENSION_UPDATE_STATUS_CACHE_MS = 5000;
 let devControlPollInFlight = false;
 let devControlClientIdentityCache = null;
 let devControlClientIdentityPromise = null;
@@ -3772,6 +3776,29 @@ async function requestLocalExtensionUpdate(url, method = 'GET') {
   }
 }
 
+async function readManualExtensionUpdateStatus({ force = false } = {}) {
+  const version = String(chrome.runtime.getManifest?.().version || '');
+  const now = Date.now();
+  if (!force && manualExtensionUpdateStatusCache
+    && manualExtensionUpdateStatusCache.version === version
+    && now - manualExtensionUpdateStatusCache.checkedAt < MANUAL_EXTENSION_UPDATE_STATUS_CACHE_MS) {
+    return manualExtensionUpdateStatusCache.response;
+  }
+  if (!force && manualExtensionUpdateStatusInFlight) return manualExtensionUpdateStatusInFlight;
+  const request = requestLocalExtensionUpdate(DEV_UPDATE_STATUS_URL).then((response) => {
+    manualExtensionUpdateStatusCache = { response, version, checkedAt: Date.now() };
+    return response;
+  }).finally(() => {
+    if (manualExtensionUpdateStatusInFlight === request) manualExtensionUpdateStatusInFlight = null;
+  });
+  if (!force) manualExtensionUpdateStatusInFlight = request;
+  return request;
+}
+
+function invalidateManualExtensionUpdateStatus() {
+  manualExtensionUpdateStatusCache = null;
+}
+
 async function clearManualExtensionUpdateLock({ clearRefreshSuppression = false } = {}) {
   await chrome.storage.local.remove('manualExtensionUpdateLock');
   if (clearRefreshSuppression) {
@@ -3784,16 +3811,28 @@ async function clearManualExtensionUpdateLock({ clearRefreshSuppression = false 
 }
 
 async function reconcileManualExtensionUpdateLock(status = null, installedState = null) {
-  const stored = await chrome.storage.local.get('manualExtensionUpdateLock');
-  const expectedLock = stored.manualExtensionUpdateLock;
-  if (!expectedLock?.active) return { ok: true, skipped: true };
   let installed = installedState;
   let updateStatus = status;
   if (!updateStatus) {
-    const response = await requestLocalExtensionUpdate(DEV_UPDATE_STATUS_URL);
+    const response = await readManualExtensionUpdateStatus();
     updateStatus = response?.status || null;
     installed = response?.installed || null;
   }
+  const stored = await chrome.storage.local.get('manualExtensionUpdateLock');
+  let expectedLock = stored.manualExtensionUpdateLock;
+  // Reconstruct the local launch lock if the MV3 worker/profile state was
+  // cleared while the updater's durable restart marker survived.
+  if (!expectedLock?.active && ['pending', 'error'].includes(installed?.restart?.phase)) {
+    expectedLock = await withStateLock(async () => {
+      const current = await chrome.storage.local.get('manualExtensionUpdateLock');
+      if (current.manualExtensionUpdateLock?.active) return current.manualExtensionUpdateLock;
+      const lock = { active: true, targetVersion: String(installed.extensionVersion || ''),
+        startedAt: installed.restart.requestedAt || new Date().toISOString() };
+      await chrome.storage.local.set({ manualExtensionUpdateLock: lock });
+      return lock;
+    });
+  }
+  if (!expectedLock?.active) return { ok: true, skipped: true };
   return withStateLock(async () => {
     const current = await chrome.storage.local.get('manualExtensionUpdateLock');
     const lock = current.manualExtensionUpdateLock;
@@ -3807,9 +3846,14 @@ async function reconcileManualExtensionUpdateLock(status = null, installedState 
     const targetLoaded = Boolean(targetVersion
       && String(installed?.extensionVersion || '') === targetVersion
       && runningVersion === targetVersion);
-    const finished = targetLoaded && ['complete', 'current', 'idle'].includes(phase);
-    if (phase === 'error' || finished) {
-      await clearManualExtensionUpdateLock({ clearRefreshSuppression: phase === 'error' });
+    const restartPhase = String(installed?.restart?.phase || '');
+    const finished = targetLoaded && ['complete', 'current', 'idle'].includes(phase)
+      && (!restartPhase || restartPhase === 'complete');
+    // An error recorded by the restart helper means files were installed but
+    // does not prove that the new watcher/browser started. Keep Start blocked.
+    const rejectedBeforeRestart = phase === 'error' && !['pending', 'error'].includes(restartPhase);
+    if (rejectedBeforeRestart || finished) {
+      await clearManualExtensionUpdateLock({ clearRefreshSuppression: rejectedBeforeRestart });
       return { ok: true, cleared: true, phase };
     }
     return { ok: true, pending: true, phase: phase || 'unknown' };
@@ -3819,10 +3863,8 @@ async function reconcileManualExtensionUpdateLock(status = null, installedState 
 async function assertManualExtensionUpdateNotApplying() {
   const importState = await chrome.storage.local.get('resultsImportJournal');
   if (importState.resultsImportJournal) throw new Error('Завершается импорт результатов. Дождись его завершения в галерее.');
-  const stored = await chrome.storage.local.get('manualExtensionUpdateLock');
-  if (!stored.manualExtensionUpdateLock?.active) return;
   try {
-    const response = await requestLocalExtensionUpdate(DEV_UPDATE_STATUS_URL);
+    const response = await readManualExtensionUpdateStatus();
     await reconcileManualExtensionUpdateLock(response?.status || null, response?.installed || null);
   } catch (_) {}
   const current = await chrome.storage.local.get('manualExtensionUpdateLock');
@@ -3834,8 +3876,62 @@ async function startManualExtensionUpdate() {
   await assertManualExtensionUpdateNotApplying();
   const { run } = await getStored();
   if (runHasActiveAutomationWork(run)) throw new Error('Перед обновлением дождись завершения прогона или останови его.');
-  const response = await requestLocalExtensionUpdate(DEV_UPDATE_START_URL, 'POST');
-  return response.status || {};
+  invalidateManualExtensionUpdateStatus();
+  try {
+    const response = await requestLocalExtensionUpdate(DEV_UPDATE_START_URL, 'POST');
+    return response.status || {};
+  } finally {
+    invalidateManualExtensionUpdateStatus();
+  }
+}
+
+function retryManualExtensionRestart() {
+  if (manualUpdateRestartInFlight) return manualUpdateRestartInFlight;
+  manualUpdateRestartInFlight = withStateLock(async () => {
+    const { run } = await getStored();
+    if (runHasActiveAutomationWork(run)) throw new Error('Перед перезапуском дождись завершения прогона или останови его.');
+    const stored = await chrome.storage.local.get(['resultsImportJournal', 'manualExtensionUpdateLock', 'devAutoReload']);
+    if (stored.resultsImportJournal) throw new Error('Дождись завершения импорта результатов перед перезапуском.');
+
+    invalidateManualExtensionUpdateStatus();
+    const response = await readManualExtensionUpdateStatus({ force: true });
+    const installed = response?.installed || null;
+    const restart = installed?.restart;
+    const age = Date.now() - Date.parse(restart?.requestedAt || '');
+    const eligible = response?.status?.restartRetryAvailable
+      ?? (restart?.phase === 'error' || (restart?.phase === 'pending' && Number.isFinite(age) && age >= 120000));
+    if (!installed?.packageId || !['pending', 'error'].includes(restart?.phase)
+      || !eligible || !['idle', 'restarting', 'error'].includes(String(response?.status?.phase || ''))) {
+      throw new Error('Перезапуск ещё выполняется или повторный запуск сейчас недоступен.');
+    }
+    const existing = stored.manualExtensionUpdateLock;
+    const targetVersion = String(installed.extensionVersion || '');
+    if (existing?.active && existing.targetVersion && targetVersion && existing.targetVersion !== targetVersion) {
+      throw new Error('Найдено незавершённое обновление другой версии; сначала проверь его состояние.');
+    }
+    const lock = existing?.active ? existing : {
+      active: true, targetVersion,
+      startedAt: restart.requestedAt || new Date().toISOString()
+    };
+    await chrome.storage.local.set({
+      manualExtensionUpdateLock: lock,
+      devAutoReload: { ...(stored.devAutoReload || {}), refreshTabsAfterReload: false, suppressNextTabRefresh: true }
+    });
+
+    // Preserve the lock on both explicit HTTP refusal and lost acknowledgement:
+    // the installed marker remains unresolved until the new app confirms boot.
+    let result;
+    try {
+      result = await requestLocalExtensionUpdate(`${DEV_UPDATE_START_URL}/restart`, 'POST');
+    } finally {
+      invalidateManualExtensionUpdateStatus();
+    }
+    return {
+      status: result.status || { phase: 'restarting' }, installed,
+      launchBlocked: true, canRetryRestart: false
+    };
+  }).finally(() => { manualUpdateRestartInFlight = null; });
+  return manualUpdateRestartInFlight;
 }
 
 function applyManualExtensionUpdate(targetVersion = '') {
@@ -3863,6 +3959,7 @@ function applyManualExtensionUpdate(targetVersion = '') {
     });
     if (claim.deferred) return claim;
     try {
+      invalidateManualExtensionUpdateStatus();
       const response = await requestLocalExtensionUpdate(DEV_UPDATE_APPLY_URL, 'POST');
       return { started: true, status: response.status || {} };
     } catch (error) {
@@ -3877,27 +3974,36 @@ function applyManualExtensionUpdate(targetVersion = '') {
         });
       }
       throw error;
+    } finally {
+      invalidateManualExtensionUpdateStatus();
     }
   })().finally(() => { manualUpdateApplyInFlight = null; });
   return manualUpdateApplyInFlight;
 }
 
 async function getManualExtensionUpdateStatus() {
-  const response = await requestLocalExtensionUpdate(DEV_UPDATE_STATUS_URL);
+  const response = await readManualExtensionUpdateStatus();
   const status = response?.status || {};
   if (status.phase === 'ready') {
     const applyResult = await applyManualExtensionUpdate(status.latestVersion || '');
-    if (applyResult.deferred) return { status, installed: response?.installed || null, deferred: true, reason: applyResult.reason };
-    return { status: applyResult.status || status, installed: response?.installed || null, applying: applyResult.started === true };
+    const stored = await chrome.storage.local.get('manualExtensionUpdateLock');
+    const launchBlocked = stored.manualExtensionUpdateLock?.active === true;
+    if (applyResult.deferred) return { status, installed: response?.installed || null, deferred: true, reason: applyResult.reason, launchBlocked };
+    return { status: applyResult.status || status, installed: response?.installed || null,
+      applying: applyResult.started === true, launchBlocked, canRetryRestart: false };
   }
-  const lockState = await reconcileManualExtensionUpdateLock(status, response?.installed || null).catch(() => null);
-  if (lockState?.pending && ['complete', 'current', 'idle'].includes(String(status.phase || ''))) {
-    return {
-      status: { ...status, phase: 'restarting', message: 'Ожидаю загрузки обновлённой версии расширения.' },
-      installed: response?.installed || null
-    };
+  await reconcileManualExtensionUpdateLock(status, response?.installed || null).catch(() => null);
+  const stored = await chrome.storage.local.get('manualExtensionUpdateLock');
+  const launchBlocked = stored.manualExtensionUpdateLock?.active === true;
+  const restart = response?.installed?.restart;
+  const restartAge = Date.now() - Date.parse(restart?.requestedAt || '');
+  const canRetryRestart = status.restartRetryAvailable ?? (['idle', 'restarting', 'error'].includes(status.phase)
+    && (restart?.phase === 'error' || (restart?.phase === 'pending' && Number.isFinite(restartAge) && restartAge >= 120000)));
+  if (launchBlocked && ['complete', 'current', 'idle'].includes(status.phase)) {
+    return { status: { ...status, phase: 'restarting', message: 'Перезапуск ещё не подтверждён.' },
+      installed: response?.installed || null, launchBlocked, canRetryRestart };
   }
-  return { status, installed: response?.installed || null };
+  return { status, installed: response?.installed || null, launchBlocked, canRetryRestart };
 }
 
 function runHasActiveAutomationWork(run) {
@@ -8045,7 +8151,6 @@ async function setUserStopReloadBoundary(pending) {
 }
 
 async function startOrResumeRun(options = {}) {
-  await assertManualExtensionUpdateNotApplying();
   await waitForStartupReconciliation();
   const intent = String(options.intent || '').toLowerCase();
   const { run } = await getStored();
@@ -11681,9 +11786,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
+  if (message?.type === 'RETRY_EXTENSION_RESTART') {
+    retryManualExtensionRestart()
+      .then((value) => sendResponse({ ok: true, ...value }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
   if (message?.type === 'GET_EXTENSION_UPDATE_STATUS') {
     getManualExtensionUpdateStatus()
-      .then((value) => sendResponse({ ok: true, ...value }))
+      .then((value) => sendResponse({ ok: true, ...value, updateProtocol: 2 }))
       .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }

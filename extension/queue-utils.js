@@ -884,6 +884,7 @@ export function queueEntriesForPart(plan, partNumber) {
 
 export function buildQueueProgressTree(groups = {}, repairQueue = [], partSize = RUN_PART_SIZE) {
   const repairs = new Set((Array.isArray(repairQueue) ? repairQueue : [])
+    .filter((item) => typeof item === 'string' || item?.status !== 'completed')
     .map((item) => typeof item === 'string' ? item : item?.sourceId)
     .filter(Boolean)
     .map(String));

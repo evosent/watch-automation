@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { createUpdateManager, inspectUpdateArchive, UPDATE_ASSET_NAME, UPDATE_PACKAGE_MANIFEST, validateExtractedPackage } from '../dev/update-utils.mjs';
+import { mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { createUpdateManager, installedUpdateStatus, inspectUpdateArchive, UPDATE_ASSET_NAME,
+  UPDATE_PACKAGE_MANIFEST, UPDATE_STATE_FILE, validateExtractedPackage } from '../dev/update-utils.mjs';
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -161,4 +162,71 @@ test('update manager reports an older GitHub release and never downloads it over
   assert.match(status.message, /более старая версия 0\.3\.35/i);
   assert.match(status.message, /откат версии отменён/i);
   assert.equal(requests.length, 1, 'the updater must stop before downloading the older ZIP');
+});
+
+test('durable restart state exposes a cooldown, then permits a safe retry', async (t) => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'watch-update-restart-state-'));
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const marker = { schemaVersion: 1, packageId: 'package-retry', extensionVersion: '0.3.40',
+    restart: { phase: 'pending', requestedAt: new Date(Date.now() - 60_000).toISOString() } };
+  await writeFile(path.join(projectRoot, UPDATE_STATE_FILE), JSON.stringify(marker));
+  let restartCount = 0;
+  const manager = createUpdateManager(projectRoot, { onRestart: async () => { restartCount += 1; } });
+
+  const coolingDown = await manager.startRestart();
+  assert.equal(coolingDown.started, false);
+  assert.equal(coolingDown.reason, 'busy');
+  assert.equal(coolingDown.status.restartRetryAvailable, false);
+  assert.equal(restartCount, 0);
+
+  marker.restart.requestedAt = new Date(Date.now() - 3 * 60_000).toISOString();
+  await writeFile(path.join(projectRoot, UPDATE_STATE_FILE), JSON.stringify(marker));
+  const available = installedUpdateStatus({ phase: 'idle' }, marker);
+  assert.equal(available.restartRetryAvailable, true);
+  const retried = await manager.startRestart();
+  assert.equal(retried.started, true);
+  assert.equal(restartCount, 1);
+  assert.equal(retried.installed.restart.phase, 'pending');
+  assert.equal(retried.status.phase, 'restarting');
+});
+
+test('restart retries coalesce clicks, preserve helper errors, and allow immediate retry after failure', async (t) => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'watch-update-restart-retry-'));
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+  await writeFile(path.join(projectRoot, UPDATE_STATE_FILE), JSON.stringify({ schemaVersion: 1,
+    packageId: 'package-retry', extensionVersion: '0.3.40',
+    restart: { phase: 'error', requestedAt: new Date(Date.now() - 5 * 60_000).toISOString(), error: 'lost launch ack' } }));
+  let restartCount = 0, release;
+  const manager = createUpdateManager(projectRoot, { onRestart: async () => {
+    restartCount += 1;
+    if (restartCount === 1) throw new Error('simulated acknowledgement loss');
+    await new Promise((resolve) => { release = resolve; });
+  } });
+
+  const failed = await manager.startRestart();
+  assert.equal(failed.started, false);
+  assert.equal(failed.reason, 'restart_failed');
+  assert.equal(failed.status.phase, 'error');
+  const failedMarker = JSON.parse(await readFile(path.join(projectRoot, UPDATE_STATE_FILE), 'utf8'));
+  assert.equal(failedMarker.restart.phase, 'error');
+  assert.equal(failedMarker.restart.error, 'simulated acknowledgement loss');
+  assert.equal(failedMarker.restartRetryAvailable, undefined);
+  assert.equal(installedUpdateStatus({ phase: 'idle' }, failedMarker).restartRetryAvailable, true);
+
+  const first = manager.startRestart();
+  const second = manager.startRestart();
+  for (let attempt = 0; attempt < 100 && !release; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(restartCount, 2, 'two clicks share one restart helper request');
+  release();
+  const [left, right] = await Promise.all([first, second]);
+  assert.equal(left.started, true);
+  assert.equal(right.started, true);
+  assert.equal(restartCount, 2);
+
+  const rapidRepeat = await manager.startRestart();
+  assert.equal(rapidRepeat.started, false);
+  assert.equal(rapidRepeat.reason, 'busy');
+  assert.equal(restartCount, 2, 'a rapid repeat respects the freshly written pending marker cooldown');
 });
