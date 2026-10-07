@@ -1,3 +1,5 @@
+import './quota-utils.js';
+
 // Pure helpers used by the service worker and the test suite.  Keeping the
 // retry and progress policy free from Chrome APIs makes the orchestration
 // rules deterministic and easy to exercise with a fake browser.
@@ -25,6 +27,7 @@ export const SLOT_PHASES = Object.freeze({
 export const AUTOMATION_ERROR_CLASSES = Object.freeze({
   RATE_LIMIT: 'RATE_LIMIT',
   CONVERSATION_LOAD_ERROR: 'CONVERSATION_LOAD_ERROR',
+  HISTORY_LOAD_ERROR: 'HISTORY_LOAD_ERROR',
   AUTH_REQUIRED: 'AUTH_REQUIRED',
   SECURITY_CHALLENGE: 'SECURITY_CHALLENGE',
   NETWORK: 'NETWORK',
@@ -35,6 +38,7 @@ export const AUTOMATION_ERROR_CLASSES = Object.freeze({
   MODEL_REFUSAL: 'MODEL_REFUSAL',
   TOOL_UNAVAILABLE: 'TOOL_UNAVAILABLE',
   UPLOAD_REJECTED: 'UPLOAD_REJECTED',
+  UPLOAD_LIMIT: 'UPLOAD_LIMIT',
   DOWNLOAD: 'DOWNLOAD',
   INVALID_OUTPUT: 'INVALID_OUTPUT',
   TIMEOUT: 'TIMEOUT',
@@ -140,6 +144,7 @@ export function findStalledBatchRecoveryCandidate(
     || (String(run?.state || '').toUpperCase() === 'PAUSED'
       && String(run?.pauseReason || '').toUpperCase() === 'ERROR');
   if (!activeRun || run?.clockStopped || run?.stopBlocked || run?.imageLimitDetected === true
+    || run?.uploadCooldownActive === true || run?.uploadLimitDetected === true || run?.uploadManualPause === true
     || String(run?.status || '').toUpperCase() === 'RATE_LIMIT_PAUSE'
     || Number(run?.rateLimitPauseUntil || 0) > Number(now)) return null;
 
@@ -223,6 +228,7 @@ export function resolveGenerationPause(savedGapMs, minutes, jitterSeconds, rando
 const RETRY_BASE_MS = Object.freeze({
   [AUTOMATION_ERROR_CLASSES.RATE_LIMIT]: 180000,
   [AUTOMATION_ERROR_CLASSES.NETWORK]: 15000,
+  [AUTOMATION_ERROR_CLASSES.HISTORY_LOAD_ERROR]: 15000,
   [AUTOMATION_ERROR_CLASSES.TAB_LOST]: 5000,
   [AUTOMATION_ERROR_CLASSES.DOM_CHANGED]: 10000,
   [AUTOMATION_ERROR_CLASSES.DOWNLOAD]: 8000,
@@ -245,23 +251,10 @@ export function coalescedPauseDeadline(previousUntil, now = Date.now(), pauseMs 
   return previous > current ? previous : current + Math.max(0, Number(pauseMs) || 0);
 }
 
-export function imageLimitResumeAt(message, now = Date.now()) {
-  const text = String(message || '').replace(/\s+/g, ' ').trim();
-  if (!/(?:лимит\s+(?:создания|генерации)\s+изображений|лимит\s+запросов\s+на\s+генерацию\s+изображений|image\s+generation\s+limit)/i.test(text)) return null;
-  const match = text.match(/(?:попробуйте\s+снова\s+в|try\s+again\s+at)\s*(\d{1,2}):(\d{2})\s*(am|pm)?/i);
-  if (!match) return null;
-  let hour = Number(match[1]);
-  const minute = Number(match[2]);
-  if (minute > 59 || hour > 23 || (match[3] && (hour < 1 || hour > 12))) return null;
-  if (match[3]) hour = (hour % 12) + (match[3].toLowerCase() === 'pm' ? 12 : 0);
-  const deadline = new Date(now);
-  deadline.setHours(hour, minute + 1, 0, 0);
-  // A stale banner seen just after its reset time warrants a short recheck,
-  // not a wait until the same clock time tomorrow.
-  if (deadline.getTime() <= now && now - deadline.getTime() < 5 * 60000) return now + 60000;
-  if (deadline.getTime() <= now) deadline.setDate(deadline.getDate() + 1);
-  return deadline.getTime();
-}
+export const {
+  isUploadLimitText, isStorageLimitText, isImageLimitText,
+  uploadLimitResumeAt, imageLimitResumeAt, imageLimitFallbackResumeAt
+} = globalThis.WatchQuotaUtils;
 
 function textOf(error) {
   if (!error) return '';
@@ -277,7 +270,10 @@ export function classifyAutomationError(error, context = {}) {
   if (Object.prototype.hasOwnProperty.call(AUTOMATION_ERROR_CLASSES, explicitCode)) {
     return AUTOMATION_ERROR_CLASSES[explicitCode];
   }
-  if (context.rateLimit || /rate\s*limit|too\s+many|слишком\s+много|слишком\s+часто|временно\s+ограничен|лимит\s+(?:создания|генерации)\s+изображений/.test(value)) {
+  if (context.uploadLimit || isUploadLimitText(value) || isStorageLimitText(value)) {
+    return AUTOMATION_ERROR_CLASSES.UPLOAD_LIMIT;
+  }
+  if (context.rateLimit || isImageLimitText(value) || /rate\s*limit|too\s+many|слишком\s+много|слишком\s+часто|временно\s+ограничен/.test(value)) {
     return AUTOMATION_ERROR_CLASSES.RATE_LIMIT;
   }
   if (context.authRequired || /sign\s*in|log\s*in|войти|авторизац|сессия|unauthoriz|401/.test(value)) {
@@ -285,6 +281,9 @@ export function classifyAutomationError(error, context = {}) {
   }
   if (context.securityChallenge || /captcha|проверка\s+безопасности|security\s+check|challenge/.test(value)) {
     return AUTOMATION_ERROR_CLASSES.SECURITY_CHALLENGE;
+  }
+  if (/(?:не\s+удалось|не\s+получилось|невозможно)\s+(?:загрузить|получить)\s+(?:историю|список\s+(?:чатов|разговоров))|(?:unable|failed|could\s+not)\s+to\s+load\s+(?:(?:chat|conversation)\s+)?history/.test(value)) {
+    return AUTOMATION_ERROR_CLASSES.HISTORY_LOAD_ERROR;
   }
   if (/не\s+удалось\s+загрузить\s+этот\s+разговор\s+chatgpt/.test(value)) {
     return AUTOMATION_ERROR_CLASSES.CONVERSATION_LOAD_ERROR;

@@ -67,9 +67,11 @@ export function freshSlotRevisionFields() {
     preparedForSubmit: false,
     preparedAt: null,
     pageRunAcceptedAt: null,
+    lastHandledFailure: null,
     lastSendClickedAt: null,
     physicalSendAtMs: null,
     physicalSendLeaseId: null,
+    rejectedSendAtMs: null,
     pageSubmissionLeaseId: null,
     pageGenerationSubmitted: null,
     pageProbeAssistantCount: null,
@@ -99,8 +101,11 @@ export function currentLeasePhysicalSend(slot) {
   const reportedAt = Number(slot.physicalSendAtMs || 0);
   const reportedForLease = Boolean(slot.leaseId)
     && String(slot.physicalSendLeaseId || '') === String(slot.leaseId);
-  return reportedForLease && Number.isFinite(reportedAt) && reportedAt > 0
-    || clickedAt > 0 && (preparedAt === 0 || clickedAt >= preparedAt);
+  // Keep the physical receipt, but a known before-assistant rate rejection
+  // cannot protect a nonexistent generation. A later click is independent.
+  const rejectedAt = Number(slot.rejectedSendAtMs || 0);
+  return reportedForLease && Number.isFinite(reportedAt) && reportedAt > Math.max(0, rejectedAt)
+    || clickedAt > Math.max(0, rejectedAt) && (preparedAt === 0 || clickedAt >= preparedAt);
 }
 
 export function pageProbeConfirmsUnsubmitted(slot, probe) {
@@ -113,7 +118,7 @@ export function pageProbeConfirmsUnsubmitted(slot, probe) {
     || String(probe.chatUrl || '').trim()
     || String(slot.chatUrl || '').trim()
     || Number(slot.assistantCount || 0) !== 0
-    || Number(probe.physicalSendAtMs || 0) > 0
+    || Number(probe.physicalSendAtMs || 0) > Math.max(0, Number(slot.rejectedSendAtMs || 0))
     || slot.generationSubmittedAt || slot.downloadId
     || currentLeasePhysicalSend(slot)) return false;
   return true;

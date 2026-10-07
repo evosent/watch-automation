@@ -325,6 +325,17 @@ async function startRevision({ skuKey, id, pathName, chat = `https://chatgpt.com
     factsJobId,
     outputPath: pathName,
     outputHash,
+    fileVerification: {
+      verified: true,
+      exists: true,
+      isFile: true,
+      generationId: id,
+      sourceId: skuKey,
+      outputPath: pathName,
+      outputHash,
+      sizeBytes: 2048,
+      verifiedAt: future
+    },
     outputFileName: path.basename(pathName),
     chatUrl: chat,
     factsStatus: 'pending',

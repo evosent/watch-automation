@@ -110,3 +110,17 @@ test('diagnostic completion counts match planned IDs across filtered queue group
   assert.equal(eventOnlyHeader.completedCount, 1);
   assert.equal(eventOnlyHeader.pendingCount, 2);
 });
+
+test('an archived manual storage pause remains distinguishable from a timed or inferred upload cooldown', () => {
+  const header = runDiagnosticHeader({ operationId: 'manual-storage', state: 'PAUSED',
+    pauseReason: 'UPLOAD_LIMIT', uploadCooldownActive: true, uploadLimitDetected: true,
+    uploadManualPause: true, uploadPauseSettled: true, uploadLimitAutoResume: false,
+    rateLimitPauseUntil: null, plannedIds: [] });
+  assert.equal(header.uploadManualPause, true);
+  assert.equal(header.uploadLimitDetected, true);
+  assert.equal(header.uploadPauseSettled, true);
+  assert.equal(header.uploadLimitAutoResume, false);
+  assert.equal(header.rateLimitPauseUntil, null);
+  assert.equal(runDiagnosticHeader({ operationId: 'inferred', uploadCooldownActive: true,
+    uploadLimitDetected: false, plannedIds: [] }).uploadLimitDetected, false);
+});

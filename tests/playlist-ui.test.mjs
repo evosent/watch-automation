@@ -116,13 +116,14 @@ test('part lookup selects the exact generic brand and exposes its readable queue
   assert.equal(playlistPath({ ...part, mode: 'regeneration' }), 'Перегенерация · Другие / не распознано · Не в продаже · плохое качество');
 });
 
-test('empty catalog and legacy queue records without explicit memory remain readable', () => {
+test('empty catalog remains readable and queue status alone never synthesizes readiness', () => {
   const empty = buildPlaylistProgressTree(groupsFor([]));
   assert.equal(empty.length, 2);
   assert.equal(empty.every((node) => node.total === 0 && node.percent === 0), true);
   const tree = buildPlaylistProgressTree(groupsFor([entry(1, { status: 'done' }), entry(2)]));
-  assert.equal(tree[0].done, 1);
-  assert.equal(tree[0].percent, 50);
+  assert.equal(tree[0].done, 0);
+  assert.equal(tree[0].needsVerification, 2);
+  assert.equal(tree[0].percent, 0);
 });
 
 const panelSource = await readFile(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
@@ -153,12 +154,14 @@ function panelHarness(entries, repairQueue = []) {
     ...queueUtils, ...reliability, ...inputPlan,
     buildPlaylistProgressTree, findPlaylistPart, playlistPath,
     queue: { groups: groupsFor(entries), repairQueue }, generationMemory: { items: {} },
+    accountingSnapshot: null,
     runtime: { state: 'IDLE', run: null }, actionBusy: false,
     selectedMemoryPartId: '', playlistMode: 'regular', lastPreflight: { ok: true },
     desiredRunPart: '', desiredRunPartSignature: '', currentLaunchPartPlan: null,
     currentLaunchSelectionExact: false, promptText: 'Base prompt',
     cachedMemoryTreeGroups: null, cachedMemoryTreeRepairQueue: null,
     cachedMemoryTreeGenerationMemory: null, cachedMemoryProgressTree: null,
+    cachedMemoryTreeAccountingSnapshot: null,
     cachedMemoryProgressTreeSignature: '',
     DEFAULT_RATE_LIMIT_PAUSE_MINUTES: 3, MIN_RATE_LIMIT_PAUSE_MINUTES: 1, MAX_RATE_LIMIT_PAUSE_MINUTES: 30,
     $: (id) => nodes[id],

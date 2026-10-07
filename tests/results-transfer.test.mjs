@@ -13,6 +13,7 @@ import { sha256, pngMetadata, writeResultsZip, inspectResultsZip, extractResults
 import { portableResult, validateResultsManifest, resultsImportPreview, planResultsMerge,
   RESULTS_PACKAGE_FORMAT, RESULTS_PACKAGE_VERSION } from '../extension/results-transfer-utils.js';
 import { sourceIdFor, pendingEntryIds, modelCatalogRecordsFromGroups } from '../extension/queue-utils.js';
+import { canonicalBrandIdentityId } from '../extension/sku-utils.js';
 import { DB_NAME, mergeResultsDatabase, getAllGenerationRevisions, getAllModelCatalog } from '../extension/idb.js';
 import { galleryRecordsFromCatalog } from '../extension/gallery-revision-utils.js';
 import { initResultsTransfer } from '../extension/results-transfer-ui.js';
@@ -70,6 +71,21 @@ async function resetDb() {
 function manifest(items) { return { format: RESULTS_PACKAGE_FORMAT, schemaVersion: RESULTS_PACKAGE_VERSION, exportedAt: new Date().toISOString(),
   items: items.map((item) => ({ ...portableResult(item), image: `images/${item.outputHash}.png` })) }; }
 async function upload(manager, file) { return manager.uploadImport(Readable.from(await readFile(file)), owner); }
+
+test('brand identity evidence accepts reviewed aliases while rejecting unrelated brands', () => {
+  assert.equal(canonicalBrandIdentityId('Pagani'), 'pagani_design');
+  assert.equal(canonicalBrandIdentityId('Pagani Design'), 'pagani_design');
+  assert.equal(canonicalBrandIdentityId('Q&Q'), 'q_and_q');
+  assert.equal(canonicalBrandIdentityId('Casio'), 'casio');
+  assert.notEqual(canonicalBrandIdentityId('Casio'), canonicalBrandIdentityId('Pagani'));
+
+  const item = revision(500);
+  item.modelName = 'Pagani Design PD-1759CBWWS Мужские механические наручные часы, Гарантия';
+  item.sourceId = sourceIdFor(item.groupId, item.relativePath, item.modelName);
+  item.facts = { ...item.facts, sourceId: item.sourceId, titleBrand: 'Pagani', titleModel: 'PD-1759CBWWS' };
+  assert.equal(portableResult(item).sourceId, item.sourceId);
+  assert.throws(() => portableResult({ ...item, facts: { ...item.facts, titleBrand: 'Casio' } }), /Бренд в названии/);
+});
 
 test('100 real PNGs export from Downloads and merge into a second installation without losing local results', async (t) => {
   const temp = await temporary(t);

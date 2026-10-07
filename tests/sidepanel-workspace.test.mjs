@@ -16,7 +16,7 @@ test('original playlist workspace retains unique controls and presentation route
   assert.match(html, /id="legacyLaunchSelection"/);
   assert.match(script, /view === 'queues' \? 'models' : view === 'settings' \? 'service'/);
   assert.match(script, /let initialView = 'models'/);
-  assert.match(script, /buildPlaylistProgressTree\(queue.groups, queue.repairQueue, generationMemory\)/);
+  assert.match(script, /buildPlaylistProgressTree\(queue.groups, queue.repairQueue, generationMemory, accountingSnapshot\)/);
   assert.match(script, /flatMap\(\(sale\) => sale.children.flatMap\(\(quality\) => quality.children\)\)/);
 });
 
@@ -35,6 +35,8 @@ test('all existing run, maintenance and transfer actions are reachable', () => {
   }
   assert.match(script, /retryButton.disabled = retryButton.hidden \|\| extensionRestartRetryBusy/);
   assert.match(script, /launchCandidateCount > 0/);
+  assert.match(script, /const plannedTasks = Math\.min\(runLimit, pendingTasks\)/);
+  assert.match(script, /К запуску \$\{plannedTasks\} задач/);
   assert.match(script, /elapsedRunClock\(clockRun, Date.now\(\)\)/);
 });
 

@@ -101,7 +101,22 @@
     return { kind: 'TEXT_ONLY', code: 'TEXT_ONLY', terminal: false, text };
   }
 
+  let lastUploadObservation = null;
+  let lastUploadInputObservation = null;
+  let uploadMenuOpenedByAdapter = null;
   function recordAdapterAction(action) {
+    if (/^upload-/.test(String(action?.type || ''))) {
+      const details = action.details || {};
+      const observation = ['upload-dispatch', 'upload-input-missing'].includes(action.type) ? {} : { ...(lastUploadObservation || {}) };
+      for (const key of ['stage', 'selector', 'inputConnected', 'multiple', 'expectedCount', 'baselineCount', 'actualCount', 'error', 'elapsedMs', 'menuOpened', 'reason', 'inputCandidates']) {
+        if (details[key] !== undefined) observation[key] = typeof details[key] === 'string'
+          ? details[key].slice(0, 1600) : details[key];
+      }
+      lastUploadObservation = {
+        ...observation, type: action.type, at: new Date().toISOString()
+      };
+      if (/^upload-input-/.test(action.type)) lastUploadInputObservation = { ...lastUploadObservation };
+    }
     try { window.WatchDomRecorder?.recordAction(action); } catch (_) {}
   }
 
@@ -169,8 +184,9 @@
     return error;
   }
 
-  async function waitForDomCondition({ predicate, timeout = 30000, name = 'condition', pollFallbackMs = 750, signal } = {}) {
+  async function waitForDomCondition({ predicate, timeout = 30000, name = 'condition', pollFallbackMs = 750, signal, preparationPage = false } = {}) {
     const start = Date.now();
+    let historyBlockedSince = null;
     let timer;
     let unsubscribe = () => {};
     return new Promise((resolve, reject) => {
@@ -180,7 +196,24 @@
       const fail = (err) => { if (finished) return; finished = true; cleanup(); reject(err); };
       const check = () => {
         if (Date.now() - start > timeout) return fail(new Error(`Timeout waiting for ${name} (${timeout}ms)`));
-        try { const value = predicate(); if (value) done(value); } catch (e) { fail(e); }
+        try {
+          // History warnings belong to preparation. A disabled composer after
+          // Send is normal and must not hide proof that the prompt was accepted.
+          if (preparationPage) {
+            try {
+              assertPreparationPageReady();
+              historyBlockedSince = null;
+            } catch (error) {
+              if (error?.code !== 'HISTORY_LOAD_ERROR') throw error;
+              // Allow a short composer remount before classifying the page as
+              // unavailable; explicit file/storage quotas still fail at once.
+              if (historyBlockedSince === null) historyBlockedSince = Date.now();
+              if (Date.now() - historyBlockedSince < 2000) return;
+              throw error;
+            }
+          }
+          const value = predicate(); if (value) done(value);
+        } catch (e) { fail(e); }
       };
       const onAbort = () => fail(new DOMException('Aborted', 'AbortError'));
       if (signal?.aborted) return onAbort();
@@ -264,7 +297,7 @@
   function ensureChatMode({ debugOverlay = false, signal } = {}) {
     if (chatModePreparation) return chatModePreparation;
     chatModePreparation = (async () => {
-      await waitForDomCondition({ name: 'ChatGPT composer', timeout: 60000, signal, predicate: () => R().resolve('composer').element });
+      await waitForDomCondition({ name: 'ChatGPT composer', timeout: 60000, signal, preparationPage: true, predicate: () => R().resolve('composer').element });
       const state = chatModeState();
       if (state.mode === 'chat' || state.mode === 'classic') return state;
       // Changing modes can discard a saved conversation or prepared inputs.
@@ -283,14 +316,14 @@
         if (!pageStillEmpty) return assertChatMode();
         return true;
       });
-      await waitForDomCondition({ name: 'режим Чат', timeout: 10000, signal, predicate: () => chatModeState().mode === 'chat' });
+      await waitForDomCondition({ name: 'режим Чат', timeout: 10000, signal, preparationPage: true, predicate: () => chatModeState().mode === 'chat' });
       return assertChatMode();
     })().finally(() => { chatModePreparation = null; });
     return chatModePreparation;
   }
 
   async function ensureNewChat({ debugOverlay = true, signal } = {}) {
-    await waitForDomCondition({ name: 'ChatGPT composer', timeout: 60000, signal, predicate: () => R().resolve('composer').element });
+    await waitForDomCondition({ name: 'ChatGPT composer', timeout: 60000, signal, preparationPage: true, predicate: () => R().resolve('composer').element });
     const hasTurns = document.querySelector('[data-turn]');
     const inConversationPath = /^\/c\//.test(location.pathname);
     if (!hasTurns && !inConversationPath) {
@@ -303,14 +336,173 @@
     const found = R().resolve('newChat');
     if (!found.element) throw new Error('New Chat button not found');
     await safeClick(found.element, 'Click: New Chat', debugOverlay, assertChatMode);
-    await waitForDomCondition({ name: 'empty new chat', timeout: 30000, signal, predicate: () => R().resolve('composer').element && !document.querySelector('[data-turn]') });
+    await waitForDomCondition({ name: 'empty new chat', timeout: 30000, signal, preparationPage: true, predicate: () => R().resolve('composer').element && !document.querySelector('[data-turn]') });
     await ensureChatMode({ debugOverlay, signal });
     return { alreadyNew: false, selector: found.selector };
   }
 
+  function assertPreparationPageReady() {
+    const historyError = R().visibleHistoryLoadError?.();
+    if (!historyError) return;
+    const uploadIssue = R().uploadError?.();
+    if (uploadIssue?.uploadLimit) throw uploadIssueError(uploadIssue);
+    const composer = R().resolve('composer').element;
+    if (composer && composer.isConnected !== false && composer.disabled !== true
+      && composer.getAttribute?.('aria-disabled') !== 'true') return;
+    const error = new Error(String(historyError.innerText || historyError.textContent || 'Не удалось загрузить историю').replace(/\s+/g, ' ').trim().slice(0, 1600));
+    error.code = 'HISTORY_LOAD_ERROR';
+    error.responseText = error.message;
+    throw error;
+  }
+
+  function uploadIssueError(issue) {
+    const error = new Error(issue.text);
+    error.responseText = issue.text;
+    if (issue.uploadLimit) {
+      error.code = 'UPLOAD_LIMIT';
+      error.autoResume = issue.storageLimit !== true;
+      error.resumeAtMs = issue.storageLimit ? null : globalThis.WatchQuotaUtils?.uploadLimitResumeAt(issue.text);
+      error.storageLimit = issue.storageLimit === true;
+    } else {
+      error.code = /network|connection|offline|сеть|соединен/i.test(issue.text) ? 'NETWORK' : 'UPLOAD_REJECTED';
+    }
+    return error;
+  }
+
+  function assertUploadAllowed({ checkPage = true } = {}) {
+    const issue = R().uploadError?.();
+    if (issue) throw uploadIssueError(issue);
+    if (checkPage) assertPreparationPageReady();
+  }
+
+  function uploadInputDiagnostics() {
+    try { return R().fileInputDiagnostics?.({ maxCandidates: 20 }) || null; }
+    catch (_) { return null; }
+  }
+
+  function uploadMenuExpanded(button) {
+    return button?.getAttribute?.('aria-expanded') === 'true'
+      || button?.getAttribute?.('data-state') === 'open';
+  }
+
+  // Modern composers may mount the hidden file input only after their Add
+  // menu opens. Wait for an ordinary remount first, then open that exact menu
+  // once. Never click a menu item that would launch the native file picker.
+  async function ensureUploadInput({ debugOverlay = true, signal } = {}) {
+    const startedAt = Date.now();
+    let menuOpened = false;
+    const current = () => {
+      const found = R().resolve('fileInput', { visibleOnly: false });
+      const input = found.element;
+      return input && input.isConnected !== false && input.disabled !== true
+        && input.getAttribute?.('aria-disabled') !== 'true' ? found : null;
+    };
+    const record = (type, details = {}) => recordAdapterAction({ type, details: {
+      stage: 'input-preparation', elapsedMs: Date.now() - startedAt, menuOpened,
+      inputCandidates: uploadInputDiagnostics(), ...details
+    } });
+    const wait = async (timeout, name) => {
+      try {
+        return await waitForDomCondition({ timeout, name, signal, preparationPage: true,
+          predicate: () => { assertUploadAllowed({ checkPage: false }); return current(); }
+        });
+      } catch (error) {
+        if (error.message === `Timeout waiting for ${name} (${timeout}ms)`) return null;
+        throw error;
+      }
+    };
+    try {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      assertUploadAllowed();
+      const ready = current();
+      if (ready) return ready;
+      record('upload-input-missing');
+      let found = await wait(2000, 'upload input remount');
+      if (!found) {
+        const plus = R().resolve('composerPlus').element;
+        if (plus && plus.isConnected !== false && R().visible(plus)
+          && !plus.disabled && plus.getAttribute?.('aria-disabled') !== 'true'
+          && !uploadMenuExpanded(plus)) {
+          let clicked = false;
+          await safeClick(plus, 'Открыть меню прикрепления', debugOverlay, () => {
+            if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+            assertUploadAllowed();
+            assertChatMode();
+            if (current() || uploadMenuExpanded(plus)
+              || R().resolve('composerPlus').element !== plus || plus.isConnected === false) return false;
+            clicked = true;
+            return true;
+          });
+          if (clicked) {
+            menuOpened = true;
+            uploadMenuOpenedByAdapter = plus;
+            record('upload-input-menu-opened');
+          }
+        }
+        found = await wait(10000, 'upload input after Add menu');
+      }
+      if (!found) {
+        const error = new Error('Не найдено поле прикрепления фотографий после ожидания и проверки меню. Страница ChatGPT изменилась или не готова к загрузке.');
+        error.code = 'DOM_CHANGED';
+        throw error;
+      }
+      record('upload-input-recovered', { selector: found.selector || null,
+        inputConnected: true, multiple: found.element.multiple === true });
+      return found;
+    } catch (error) {
+      record('upload-input-failed', { reason: error.name === 'AbortError' ? 'AbortError' : error.code || error.name,
+        error: error.message || String(error) });
+      throw error;
+    }
+  }
+
+  function closeOwnedUploadMenu() {
+    const plus = uploadMenuOpenedByAdapter;
+    uploadMenuOpenedByAdapter = null;
+    // File selection normally closes the menu itself. Close only the same
+    // still-open Add menu we opened, never another dialog or a native picker.
+    if (!plus || plus.isConnected === false || !uploadMenuExpanded(plus)
+      || R().resolve('composerPlus').element !== plus || !R().visible(plus)
+      || plus.disabled || plus.getAttribute?.('aria-disabled') === 'true') return;
+    try {
+      plus.click();
+      recordAdapterAction({ type: 'upload-input-menu-closed', details: { stage: 'after-dispatch', menuOpened: false } });
+    } catch (error) {
+      // Selection already happened: failure to tidy the menu cannot justify
+      // selecting the files a second time.
+      recordAdapterAction({ type: 'upload-input-menu-close-failed', details: {
+        stage: 'after-dispatch', error: error.message || String(error)
+      } });
+    }
+  }
+
+  function dispatchUploadFiles(input, files) {
+    if (input.isConnected === false || input.disabled === true
+      || R().resolve('fileInput', { visibleOnly: false }).element !== input) {
+      const error = new Error('Поле прикрепления фотографий изменилось перед загрузкой.');
+      error.code = 'DOM_CHANGED';
+      recordAdapterAction({ type: 'upload-input-failed', details: {
+        stage: 'before-dispatch', reason: error.code, error: error.message,
+        inputCandidates: uploadInputDiagnostics()
+      } });
+      throw error;
+    }
+    input.files = files;
+    // File selection is handled by change. An input listener may synchronously
+    // remount the composer, so sending input first could strand change on a
+    // detached node and leave the page with no attachments.
+    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    // Preserve input-only compatibility only while the same input still owns
+    // this upload. Never dispatch the files again to a replacement element.
+    if (input.isConnected !== false && R().resolve('fileInput', { visibleOnly: false }).element === input) {
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    }
+  }
+
   async function uploadFile({ dataUrl, name, type, expectedCount, debugOverlay = true, signal }) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!R().resolve('fileInput', { visibleOnly: false }).element) throw new Error('Image file input not found');
+    assertUploadAllowed();
+    await ensureUploadInput({ debugOverlay, signal });
     const plus = R().resolve('composerPlus').element;
     if (debugOverlay && plus) await O().highlightTarget(plus, { label: `Upload #${expectedCount}: ${name}` });
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -321,24 +513,27 @@
     dt.items.add(file);
     // ChatGPT may replace the composer while the overlay or blob is being
     // prepared. Dispatch only to the resolver's current, connected input.
-    const currentInputInfo = R().resolve('fileInput', { visibleOnly: false });
+    const currentInputInfo = await ensureUploadInput({ debugOverlay, signal });
     const input = currentInputInfo.element;
-    if (!input || input.isConnected === false) throw new Error('Current image file input was remounted during upload');
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    assertUploadAllowed();
     const dispatchDetails = {
       stage: 'dispatch', selector: currentInputInfo.selector || null,
       inputConnected: input.isConnected !== false, multiple: input.multiple === true,
       expectedCount, baselineCount: R().attachmentTiles().length
     };
     recordAdapterAction({ type: 'upload-dispatch', details: dispatchDetails });
-    input.files = dt.files;
-    input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    dispatchUploadFiles(input, dt.files);
+    closeOwnedUploadMenu();
     let tiles;
     try {
       tiles = await waitForDomCondition({
-        name: `attachment count ${expectedCount}`, timeout: 60000, signal,
-        predicate: () => { const xs = R().attachmentTiles(); return xs.length >= expectedCount ? xs : null; }
+        name: `attachment count ${expectedCount}`, timeout: 60000, signal, preparationPage: true,
+        predicate: () => {
+          assertUploadAllowed({ checkPage: false });
+          const xs = R().attachmentTiles();
+          return xs.length >= expectedCount ? xs : null;
+        }
       });
     } catch (error) {
       recordAdapterAction({ type: 'upload-dispatch-failed', details: {
@@ -359,8 +554,8 @@
     }
 
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const inputInfo = R().resolve('fileInput', { visibleOnly: false });
-    if (!inputInfo.element) throw new Error('Image file input not found');
+    assertUploadAllowed();
+    const inputInfo = await ensureUploadInput({ debugOverlay, signal });
 
     // ChatGPT's input accepts multiple files. One DataTransfer/change event
     // avoids waiting for four separate thumbnail-processing cycles. Older
@@ -398,9 +593,8 @@
         { type: fileData.type || blob.type || 'image/png', lastModified: Date.now() }
       ));
     }
-    const freshInputInfo = R().resolve('fileInput', { visibleOnly: false });
+    const freshInputInfo = await ensureUploadInput({ debugOverlay, signal });
     const input = freshInputInfo.element;
-    if (!input || input.isConnected === false) throw new Error('Current image file input was remounted during upload');
     if (input.multiple !== true) {
       const perFile = [];
       let count = baselineCount;
@@ -414,22 +608,24 @@
       return { count, selector: freshInputInfo.selector, mode: 'sequential', perFile };
     }
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    assertUploadAllowed();
     const dispatchDetails = {
       stage: 'dispatch', selector: freshInputInfo.selector || null,
       inputConnected: input.isConnected !== false, multiple: input.multiple === true,
       baselineCount, expectedCount: list.length
     };
     recordAdapterAction({ type: 'upload-dispatch', name: list.map((file) => file.name).join(', '), details: dispatchDetails });
-    input.files = dataTransfer.files;
-    input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    dispatchUploadFiles(input, dataTransfer.files);
+    closeOwnedUploadMenu();
     let tiles;
     try {
       tiles = await waitForDomCondition({
         name: `attachment batch ${list.length}`,
         timeout: 90000,
         signal,
+        preparationPage: true,
         predicate: () => {
+          assertUploadAllowed({ checkPage: false });
           const xs = R().attachmentTiles();
           return xs.length >= baselineCount + list.length ? xs : null;
         }
@@ -567,13 +763,14 @@
     return editable === null || editable === '' || editable === 'true';
   }
 
-  async function waitForComposerReadyForInput({ timeout = 180000, signal } = {}) {
+  async function waitForComposerReadyForInput({ timeout = 180000, signal, preparationPage = false } = {}) {
     let stableComposer = null;
     let stableSince = 0;
     return waitForDomCondition({
       name: 'composer ready for next input',
       timeout,
       signal,
+      preparationPage,
       pollFallbackMs: 250,
       predicate: () => {
         if (R().stopGeneratingButton()) {
@@ -1088,6 +1285,12 @@
     }
     report.attachmentCount = R().attachmentTiles().length;
     report.assistantTurns = R().assistantTurns().length;
+    report.lastUpload = lastUploadObservation ? { ...lastUploadObservation } : null;
+    report.uploadInputRecovery = lastUploadInputObservation ? { ...lastUploadInputObservation } : null;
+    report.fileInputDiagnostics = uploadInputDiagnostics();
+    const historyError = R().visibleHistoryLoadError?.();
+    report.historyWarning = historyError
+      ? String(historyError.innerText || historyError.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 1600) : null;
     return report;
   }
 
@@ -1106,7 +1309,7 @@
   }
 
   window.WatchChatGPTAdapter = {
-    waitForDomCondition, safeClick, ensureNewChat, ensureChatMode, assertChatMode, chatModeState, uploadFile, uploadFiles, setComposerText, composerHasText,
+    waitForDomCondition, safeClick, ensureNewChat, ensureChatMode, assertChatMode, chatModeState, assertPreparationPageReady, ensureUploadInput, uploadFile, uploadFiles, setComposerText, composerHasText,
     waitForComposerReadyForInput, waitForComposerReadyForSend, clickSendPrompt, waitForPromptAcceptance, sendPrompt, waitForSettledAssistantText, inspectFactsResponse,
     inspectGeneratedImage, waitForGeneratedImage, classifyAssistantOutcome, noteRateLimit,
     latestAssistantTurn: () => R().latestAssistantTurn(),

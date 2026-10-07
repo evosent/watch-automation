@@ -1,4 +1,7 @@
 import { buildPlaylistProgressTree, findPlaylistPart, playlistPath } from './playlist-ui-utils.js';
+import { createDiagnosticOutbox } from './diagnostic-outbox-utils.js';
+import { completeRunDiagnostic, listCompleteRunDiagnosticHeaders, latestDiagnosticOperationId } from './diagnostic-export-utils.js';
+import { runDiagnosticHeader } from './run-diagnostics-utils.js';
 import {
   QUEUE_GROUP_IDS,
   QUEUE_GROUPS,
@@ -7,11 +10,9 @@ import {
   applyGenerationMemory,
   brandIdFromModelName,
   classifyWatchPath,
-  chooseSourceVariant,
   filterFromQueueGroup,
   filteredWatchEntries,
   fingerprintForFile,
-  generationMemoryRecordFromEntry,
   groupIdForWatchFilter,
   isImageFileName,
   mergeScannedGroups,
@@ -29,17 +30,26 @@ import {
   parseFilterSelectionId,
   queueCounts,
   referenceDescriptorForPath,
-  sourceIdFor,
   sourceVariantIdFor,
   watchFilterLabel,
   WATCH_BRAND_FILTERS
 } from './queue-utils.js';
 import {
-  getAsset, getAssetKeys, replaceAssets, replaceAssetsFromLoader, replaceModelCatalog, getAllModelCatalog, adoptLegacyGenerationRevisions,
+  getAsset, getAssetKeys, replaceAssets, replaceAssetsFromLoader, replaceModelCatalog, getAllModelCatalog,
   getOutputDirectoryHandle, putOutputDirectoryHandle, listRunDiagnostics, getRunDiagnostic
 } from './idb.js';
 import { buildInputPlan, normalizeInputMode, DEFAULT_INPUT_MODE } from './input-plan.js';
 import { selectFactsProgressForSlot } from './facts-progress-utils.js';
+import { mergeRuntimeSnapshot } from './run-progress-utils.js';
+import {
+  ACCOUNTING_SNAPSHOT_STORAGE_KEY,
+  acceptAccountingSnapshot,
+  accountingSnapshotFromResponse,
+  accountingSnapshotFreshness,
+  accountingAttemptIsActive,
+  accountingUiRecord,
+  canonicalAccountingIndex
+} from './accounting-ui-utils.js';
 import {
   DEFAULT_GENERATION_JITTER_SECONDS,
   DEFAULT_GENERATION_PAUSE_MINUTES,
@@ -61,8 +71,19 @@ let outputDestination = { mode: 'downloads', folderName: null, permission: 'unkn
 let outputDirectoryHandle = null;
 let queue = { version: 1, groups: Object.fromEntries(QUEUE_GROUP_IDS.map((id) => [id, []])), refs: {}, repairQueue: [] };
 let runtime = { state: 'IDLE', workerCount: 4, slots: [] };
+
+function acceptRuntimeSnapshot(snapshot) {
+  runtime = mergeRuntimeSnapshot(runtime, snapshot && typeof snapshot === 'object' ? snapshot : {});
+  runtime.run = runtime.operationId
+    ? { operationId: runtime.operationId, state: runtime.state || null, pauseReason: runtime.pauseReason || null }
+    : null;
+  return runtime;
+}
+
 let promptText = '';
 let generationMemory = { version: 1, items: {} };
+let accountingSnapshot = null;
+let accountingSnapshotRequestSequence = 0;
 let lastPreflight = null;
 let lastMemoryRenderKey = '';
 let selectedMemoryPartId = '';
@@ -70,6 +91,7 @@ const memoryTreeOpenIds = new Set(['queue:regular']);
 let cachedMemoryTreeGroups = null;
 let cachedMemoryTreeRepairQueue = null;
 let cachedMemoryTreeGenerationMemory = null;
+let cachedMemoryTreeAccountingSnapshot = null;
 let cachedMemoryProgressTree = null;
 let cachedMemoryProgressTreeSignature = '';
 let diagnosticsObservedOperationId = '';
@@ -308,9 +330,11 @@ function renderSelectedPlaylist(part) {
   $('useSelectedPart').hidden = !part || selectedLaunch?.id === part.id;
   $('useSelectedPart').disabled = playlistSelectionLocked();
   if (!part) return;
-  $('partProgressCount').textContent = part.mode === REGENERATION_QUEUE_ID ? `${part.queued} в очереди на повтор` : `${part.done} из ${part.total} готово`;
-  $('partProgressPercent').textContent = part.mode === REGENERATION_QUEUE_ID ? '' : `${part.percent}%`;
-  $('partProgressTrack').hidden = part.mode === REGENERATION_QUEUE_ID;
+  $('partProgressCount').textContent = part.mode === REGENERATION_QUEUE_ID
+    ? `${part.done} из ${part.total} готово · ${part.queued} в очереди на повтор`
+    : `${part.done} из ${part.total} готово`;
+  $('partProgressPercent').textContent = `${part.percent}%`;
+  $('partProgressTrack').hidden = false;
   $('partProgressTrack').setAttribute('aria-valuenow', String(part.percent));
   $('partProgressBar').style.width = `${part.percent}%`;
 }
@@ -332,7 +356,7 @@ function memoryFilterState() {
     search: String($('memorySearch')?.value || '').trim(),
     group: 'all',
     brand: 'all',
-    status: ['all', ...Object.values(GENERATION_MEMORY_STATUSES)].includes(status) ? status : 'all'
+    status: ['all', ...Object.values(GENERATION_MEMORY_STATUSES), 'needs_verification', 'identity_review'].includes(status) ? status : 'all'
   };
 }
 
@@ -348,7 +372,7 @@ function setFilterInputs(filterValue = {}, memoryFilters = {}) {
   }
   if ($('memoryStatusFilter')) {
     const status = String(memoryFilters.status || 'all');
-    $('memoryStatusFilter').value = ['all', ...Object.values(GENERATION_MEMORY_STATUSES)].includes(status)
+    $('memoryStatusFilter').value = ['all', ...Object.values(GENERATION_MEMORY_STATUSES), 'needs_verification', 'identity_review'].includes(status)
       ? status
       : 'all';
   }
@@ -404,11 +428,41 @@ function launchQueueEntries(plan = launchQueuePartPlan()) {
   const partNumber = Number($('runPart')?.value || 0);
   const selectedEntries = queueEntriesForPart(plan, partNumber);
   if (!selectedEntries.length) return [];
+  if (!accountingSnapshot || accountingSnapshot.stale === true
+    || accountingSnapshot.verificationAvailable === false
+    || accountingSnapshot.reconciliationComplete !== true) return [];
   const repairs = repairQueueSourceIds();
+  const canonical = canonicalAccountingIndex(accountingSnapshot);
   if (launchQueueMode() === REGENERATION_QUEUE_ID) {
-    return selectedEntries.filter((entry) => repairs.has(String(entry.sourceId)) && entry.status !== 'running');
+    return selectedEntries.filter((entry) => {
+      const skuKey = String(entry.skuKey || entry.sourceId || '');
+      const model = canonical.get(skuKey);
+      return repairs.has(skuKey)
+        && model?.identityStatus === 'OK'
+        && model.identityQuarantined !== true
+        && model.sourcePresent !== false
+        && model.model?.sourcePresent !== false
+        && !accountingAttemptIsActive(model.activeAttempt);
+    });
   }
-  return selectedEntries.filter((entry) => !repairs.has(String(entry.sourceId)) && !['done', 'running'].includes(entry.status));
+  const actionableCandidates = new Map((accountingSnapshot.candidates || [])
+    .filter((candidate) => ['generate', 'facts'].includes(String(candidate?.task || '').toLowerCase()))
+    .map((candidate) => [String(candidate.skuKey || candidate.sourceId || ''), String(candidate.task).toLowerCase()]));
+  return selectedEntries.filter((entry) => {
+    const skuKey = String(entry.skuKey || entry.sourceId || '');
+    const model = canonical.get(skuKey);
+    const task = actionableCandidates.get(skuKey);
+    const status = String(model?.status || '').toUpperCase();
+    const matchingCanonicalTask = (status === 'NOT_READY' && model?.nextTask === 'generate' && task === 'generate')
+      || (status === 'NEEDS_FACTS' && model?.nextTask === 'facts' && task === 'facts');
+    return !repairs.has(skuKey)
+      && matchingCanonicalTask
+      && model?.identityStatus === 'OK'
+      && model.identityQuarantined !== true
+      && model.sourcePresent !== false
+      && model.model?.sourcePresent !== false
+      && !accountingAttemptIsActive(model.activeAttempt);
+  });
 }
 
 
@@ -468,7 +522,12 @@ function updateLaunchQueueSummary() {
   const selectedNumber = Number(select?.value || 0);
   const selectedPart = plan.parts.find((part) => part.partNumber === selectedNumber);
   const tail = selectedPart ? ` · часть ${selectedPart.partNumber}/${plan.partCount}` : ` · ${plan.partCount} частей`;
-  node.textContent = `${selectedPart?.count || plan.total} моделей${tail}`;
+  const pendingTasks = launchQueueEntries(plan).length;
+  const runLimit = Math.min(RUN_PART_SIZE, normalizeRunLimit($('runLimit')?.value, RUN_PART_SIZE));
+  const plannedTasks = Math.min(runLimit, pendingTasks);
+  node.textContent = selectedPart
+    ? `К запуску ${plannedTasks} задач · в части ${selectedPart.count} моделей${tail}`
+    : `${plan.total} моделей${tail}`;
 }
 
 function filterLabel(filterValue = filterFromInputs()) {
@@ -526,9 +585,9 @@ const RUN_STATE_LABELS = {
 
 const SLOT_STATE_LABELS = {
   IDLE: 'свободна',
-  PREPARING: 'подготавливает слот',
+  PREPARING: 'готовит страницу чата',
   STARTING: 'открывает чат',
-  UPLOADING: 'загружает входные данные',
+  UPLOADING: 'прикрепляет фото и промпт',
   UPLOADING_ATTACHMENTS: 'загружает референсы',
   ATTACHMENTS_READY: 'референсы загружены',
   WAITING_LAUNCH: 'ждёт Send-интервал',
@@ -705,25 +764,14 @@ async function loadBundledPrompt(storedJob = {}) {
   }
 }
 
-function hydrateGenerationMemoryFromQueue() {
-  const items = { ...(generationMemory?.items || {}) };
-  let added = false;
-  for (const groupId of QUEUE_GROUP_IDS) {
-    for (const entry of queue.groups?.[groupId] || []) {
-      if (!entry?.sourceId || items[entry.sourceId]) continue;
-      items[entry.sourceId] = generationMemoryRecordFromEntry(entry, {
-        sourcePresent: true,
-        statusSource: 'automatic'
-      });
-      added = true;
-    }
-  }
-  if (added) generationMemory = { ...generationMemory, items };
-  return added;
-}
-
 async function loadQueue() {
-  const stored = await chrome.storage.local.get(['queue', 'run', 'job', 'history', 'generationMemory', 'folderSelections', 'lastPreflight', 'domDiagnosticsMode', 'outputDestination']);
+  const stored = await chrome.storage.local.get(['queue', 'run', 'runtime', 'job', 'history', 'generationMemory', ACCOUNTING_SNAPSHOT_STORAGE_KEY, 'folderSelections', 'lastPreflight', 'domDiagnosticsMode', 'outputDestination']);
+  if (stored[ACCOUNTING_SNAPSHOT_STORAGE_KEY]) {
+    const cachedSnapshot = { ...stored[ACCOUNTING_SNAPSHOT_STORAGE_KEY], stale: true,
+      staleReason: stored[ACCOUNTING_SNAPSHOT_STORAGE_KEY].staleReason || 'обновляется после открытия панели' };
+    accountingSnapshot = acceptAccountingSnapshot(accountingSnapshot, cachedSnapshot);
+  }
+  if (stored.runtime) acceptRuntimeSnapshot(stored.runtime);
   const savedJob = stored.job ? { ...stored.job } : null;
   // Coverage mode was a temporary debug switch. Remove an old value so it
   // cannot silently change the meaning of the Start button after an update.
@@ -736,52 +784,11 @@ async function loadQueue() {
   if (!catalog.length && oldEntries.length) {
     catalog = modelCatalogRecordsFromGroups(stored.queue.groups);
     await replaceModelCatalog(catalog);
-    const aliases = {};
-    for (const entry of oldEntries) {
-      const skuKey = sourceIdFor(entry.groupId || 'in_sale_good', entry.relativePath || entry.fileName, entry.modelName || entry.fileName);
-      if (entry.sourceId && entry.sourceId !== skuKey) aliases[String(entry.sourceId)] = skuKey;
-    }
-    const memoryItems = { ...(generationMemory.items || {}) };
-    const historyItems = { ...(history.items || {}) };
-    const ignored = { ...(history.ignored || {}) };
-    for (const model of catalog) {
-      const selected = chooseSourceVariant(model.variants || [], {});
-      const selectedVariantId = String(selected?.sourceVariantId || selected?.variantId || '');
-      const selectedLegacyEntry = oldEntries.find((entry) => String(entry?.sourceVariantId || entry?.inputSourceId || '') === selectedVariantId)
-        || oldEntries.find((entry) => aliases[String(entry?.sourceId || '')] === String(model.skuKey));
-      const oldId = String(selectedLegacyEntry?.sourceId || selectedVariantId);
-      if (oldId && memoryItems[oldId] && !memoryItems[model.skuKey]) {
-        memoryItems[model.skuKey] = { ...memoryItems[oldId], sourceId: model.skuKey, sourcePresent: true,
-          sourceVariantId: selectedVariantId || memoryItems[oldId].sourceVariantId || null,
-          legacySourceIds: [...new Set([...(memoryItems[oldId].legacySourceIds || []), oldId])] };
-      }
-      if (oldId && historyItems[oldId] && !historyItems[model.skuKey]) historyItems[model.skuKey] = { ...historyItems[oldId], sourceId: model.skuKey };
-    }
-    for (const [oldId, skuKey] of Object.entries(aliases)) {
-      if (memoryItems[oldId]) memoryItems[oldId] = { ...memoryItems[oldId], sourcePresent: false, migratedToSkuKey: skuKey };
-      if (ignored[oldId]) { ignored[skuKey] = true; delete ignored[oldId]; }
-    }
-    generationMemory = { ...generationMemory, items: memoryItems };
-    history = { ...history, items: historyItems, ignored };
-    await adoptLegacyGenerationRevisions(aliases).catch(() => {});
-    queue = { ...queue, repairQueue: (queue.repairQueue || []).map((item) => {
-      const oldId = String(typeof item === 'string' ? item : item?.sourceId || '');
-      const sourceId = aliases[oldId] || oldId;
-      return typeof item === 'string' ? { sourceId, queuedAt: new Date().toISOString(), generationId: null }
-        : { ...item, sourceId };
-    }).filter((item) => item.sourceId) };
     queue.groups = queueGroupsFromCatalog(catalog, stored.queue.groups);
-    const run = stored.run ? { ...stored.run } : null;
-    if (run) {
-      const mapId = (id) => aliases[String(id)] || String(id || '');
-      run.pendingIds = (run.pendingIds || []).map(mapId);
-      run.plannedIds = (run.plannedIds || []).map(mapId);
-      run.repairQueueClaims = Object.fromEntries(Object.entries(run.repairQueueClaims || {}).map(([id, value]) => [mapId(id), value]));
-      for (const slot of Object.values(run.slots || {})) if (slot?.entryId) slot.entryId = mapId(slot.entryId);
-      for (const owner of Object.values(run.postprocessTabs || {})) if (owner?.entryId) owner.entryId = mapId(owner.entryId);
-      for (const progress of Object.values(run.factsProgress || {})) if (progress?.entryId) progress.entryId = mapId(progress.entryId);
-    }
-    await chrome.storage.local.set({ queue, run, history, generationMemory });
+    // Legacy queue state is useful for rebuilding source membership only.
+    // Readiness, revisions, history and live run leases are reconciled by the
+    // accounting service from per-record evidence; never blanket-rekey them.
+    await chrome.storage.local.set({ queue });
   } else if (catalog.length) {
     queue = { ...queue, groups: queueGroupsFromCatalog(catalog, queue.groups) };
   }
@@ -837,11 +844,34 @@ async function loadQueue() {
   $('generationPauseMinutes').disabled = false;
   $('generationJitterSeconds').disabled = false;
   await restorePersistedInputs();
-  const memoryHydrated = hydrateGenerationMemoryFromQueue();
-  if (memoryHydrated) await chrome.storage.local.set({ generationMemory });
   await chrome.storage.local.set({ queue });
   renderAll();
   await refreshRuntime();
+  await refreshAccountingSnapshot();
+}
+
+async function refreshAccountingSnapshot() {
+  const requestSequence = ++accountingSnapshotRequestSequence;
+  let response = null;
+  try { response = await chrome.runtime.sendMessage({ type: 'GET_ACCOUNTING_SNAPSHOT' }); } catch (_) {}
+  if (requestSequence !== accountingSnapshotRequestSequence) return false;
+  let candidate = accountingSnapshotFromResponse(response);
+  if (!candidate) {
+    const stored = await chrome.storage.local.get(ACCOUNTING_SNAPSHOT_STORAGE_KEY).catch(() => ({}));
+    if (requestSequence !== accountingSnapshotRequestSequence) return false;
+    const cached = stored[ACCOUNTING_SNAPSHOT_STORAGE_KEY];
+    if (cached) candidate = { ...cached, stale: true, staleReason: cached.staleReason || 'сервис проверки недоступен' };
+  }
+  if (!candidate) return false;
+  const previous = accountingSnapshot;
+  accountingSnapshot = acceptAccountingSnapshot(accountingSnapshot, candidate);
+  if (accountingSnapshot !== previous) {
+    cachedMemoryProgressTree = null;
+    lastMemoryRenderKey = '';
+    renderAll();
+    return true;
+  }
+  return false;
 }
 
 async function persistQueue() {
@@ -1055,9 +1085,7 @@ async function scanWatchFolder(filesOverride = null, options = {}) {
   await chrome.storage.local.set({ folderSelections });
   applyGenerationHistory(queue.groups, stored.history);
   generationMemory = stored.generationMemory || generationMemory;
-  const memoryHydrated = hydrateGenerationMemoryFromQueue();
   applyGenerationMemory(queue.groups, generationMemory);
-  if (memoryHydrated) await chrome.storage.local.set({ generationMemory });
   await persistQueue();
   // The worker creates/merges durable memory records. Refresh immediately so
   // the list is visible as soon as the folder picker finishes.
@@ -1411,10 +1439,17 @@ async function saveJob({ requireQueue = false } = {}) {
   if (!selectedPart || String($('runPart')?.dataset.partitionSignature || '') !== partPlan.signature) {
     throw new Error('Выбери часть очереди. Если список изменился, выбери часть заново.');
   }
-  if (requireQueue && !selectedPart.count) {
+  const actionableTasks = launchQueueEntries(partPlan).length;
+  if (requireQueue && !actionableTasks) {
+    if (!accountingSnapshot || accountingSnapshot.stale === true || accountingSnapshot.verificationAvailable === false) {
+      throw new Error('Снимок готовности устарел или недоступен. Дождись повторной проверки результатов.');
+    }
+    if (accountingSnapshot.reconciliationComplete !== true) {
+      throw new Error('Старая память очереди ожидает сверки с каталогом результатов. Запуск станет доступен после завершения проверки.');
+    }
     throw new Error(runQueueMode === REGENERATION_QUEUE_ID
-      ? 'В очереди перегенерации брака пока нет моделей'
-      : 'В выбранной обычной очереди нет моделей');
+      ? 'В очереди перегенерации нет доступных задач с однозначной моделью и свободной вкладкой'
+      : 'В выбранной части нет доступных задач: результаты уже готовы или требуют проверки');
   }
   const referenceKeys = new Set([
     ...referenceFiles.keys(),
@@ -1467,7 +1502,7 @@ async function refreshRuntimeFast() {
   const response = await requestRuntimeFast();
   if (!response?.ok) return false;
   const value = response.value || {};
-  runtime = { ...runtime, ...(value.runtime || {}), run: value.run ?? null };
+  acceptRuntimeSnapshot(value.runtime);
   refreshRunDiagnosticsAtBoundary();
   const pause = ['RUNNING', 'STARTING', 'DRAINING', 'PAUSED'].includes(runtime.state) ? countdown(runtime.rateLimitPauseUntil) : '';
   renderHealth(pause);
@@ -1520,7 +1555,10 @@ function renderRunStatus(pause = countdown(runtime.rateLimitPauseUntil)) {
   const recoveryStage = String(runtime.conversationRecovery?.stage || '').toUpperCase();
   const conversationWait = recoveryStage === 'WAITING' ? countdown(runtime.conversationRecovery?.dueAt) : '';
   let badgeLabel = stateLabel;
-  if (stalledBatchStage === 'CLOSING') badgeLabel = 'ЗАКРЫВАЮ ВКЛАДКИ';
+  if (runtime.pauseReason === 'USER') badgeLabel = 'ПАУЗА';
+  else if (runtime.uploadManualPause) badgeLabel = 'ХРАНИЛИЩЕ CHATGPT ЗАПОЛНЕНО';
+  else if (runtime.uploadCooldownActive) badgeLabel = `ПАУЗА ЗАГРУЗКИ · ${pause || 'скоро'}`;
+  else if (stalledBatchStage === 'CLOSING') badgeLabel = 'ЗАКРЫВАЮ ВКЛАДКИ';
   else if (stalledBatchStage === 'WAITING') badgeLabel = `ОТДЫХ · ${stalledBatchWait || 'скоро'}`;
   else if (stalledBatchStage === 'RESTARTING') badgeLabel = 'ВОЗОБНОВЛЯЮ ПРОГОН';
   else if (stalledBatchStage === 'FAILED') badgeLabel = 'АВТОВОССТАНОВЛЕНИЕ ОСТАНОВЛЕНО';
@@ -1556,14 +1594,26 @@ function renderRunStatus(pause = countdown(runtime.rateLimitPauseUntil)) {
   }
   $('currentAction').textContent = actionText;
 
-  const hasSavedRun = Boolean(runtime.operationId || (runtime.startedAt && ['DONE', 'STOPPED'].includes(state)));
-  const total = Math.max(0, Math.floor(Number(hasSavedRun
-    ? runtime.runTotal
-    : $('runLimit')?.value) || 0));
+  const currentRunStates = ['RUNNING', 'STARTING', 'DRAINING', 'RECONCILING', 'PAUSED', 'DONE', 'STOPPED'];
+  const hasSavedRun = Boolean(runtime.operationId || (runtime.startedAt && currentRunStates.includes(state)));
+  const persistedTotal = Number(runtime.runTotal);
+  const total = hasSavedRun
+    ? Math.max(0, Math.floor(Number.isFinite(persistedTotal) ? persistedTotal : 0))
+    : Math.min(
+      Math.max(0, Math.floor(Number($('runLimit')?.value) || 0)),
+      launchQueueEntries().length
+    );
   const completed = Math.min(total, Math.max(0, Math.floor(Number(hasSavedRun ? runtime.runCompleted : 0) || 0)));
   const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+  const readyProgress = runtime.progressCompletionMode === 'ready';
+  const progressDescription = readyProgress
+    ? 'Готово в этом запуске: сохранённый PNG и проверенная спецификация привязаны к модели.'
+    : 'Результаты текущего запуска: подтверждённые PNG; спецификации проверяются отдельно';
   $('runProgressCount').textContent = `${completed} из ${total}`;
+  $('runProgressCount').title = progressDescription;
   $('runProgressPercent').textContent = `${percent}%`;
+  $('runProgressTrack').title = progressDescription;
+  $('runProgressTrack').setAttribute('aria-label', progressDescription);
   $('runProgressTrack').setAttribute('aria-valuemax', String(total || 1));
   $('runProgressTrack').setAttribute('aria-valuenow', String(completed));
   $('runProgressTrack').setAttribute('aria-valuetext', `${completed} из ${total}`);
@@ -1587,9 +1637,11 @@ function renderRunStatus(pause = countdown(runtime.rateLimitPauseUntil)) {
         : elapsedRunClock(clockRun, Date.now());
   $('runElapsed').textContent = elapsedMs == null ? '—' : formatDuration(elapsedMs);
   $('runAverage').textContent = completed > 0 && elapsedMs != null
-    ? `${formatDuration(elapsedMs / completed)} / фото`
+    ? `${formatDuration(elapsedMs / completed)} / ${readyProgress ? 'результат' : 'фото'}`
     : '—';
-  $('runAverage').title = 'Активное время прогона, делённое на число готовых изображений; время пауз не учитывается.';
+  $('runAverage').title = readyProgress
+    ? 'Активное время прогона, делённое на число полностью готовых результатов: PNG плюс проверенная спецификация. Время пауз не учитывается.'
+    : 'Активное время прогона, делённое на число готовых изображений; время пауз не учитывается.';
 }
 
 function compact(value, max = 88) {
@@ -1720,24 +1772,29 @@ function renderLogs(logs = []) {
 }
 
 function memoryStatusText(status) {
+  if (status === 'needs_verification') return 'Требует проверки';
+  if (status === 'identity_review') return 'Проверка идентичности модели';
   return GENERATION_MEMORY_STATUS_LABELS[status] || GENERATION_MEMORY_STATUS_LABELS.not_ready;
 }
 
 function memoryRecords() {
   const entries = new Map(QUEUE_GROUP_IDS.flatMap((groupId) => queue.groups?.[groupId] || [])
     .filter((entry) => entry?.sourceId)
-    .map((entry) => [String(entry.sourceId), entry]));
-  return [...entries].map(([sourceId, entry]) => generationMemory?.items?.[sourceId]
-    || generationMemoryRecordFromEntry(entry, { sourcePresent: true, statusSource: 'automatic' }))
+    .map((entry) => [String(entry.skuKey || entry.sourceId), entry]));
+  const canonicalBySku = canonicalAccountingIndex(accountingSnapshot);
+  return [...entries].map(([sourceId, entry]) => accountingUiRecord(entry, canonicalBySku.get(sourceId),
+    generationMemory?.items?.[sourceId] || {}))
     .sort((a, b) => String(a.modelName || a.fileName || '').localeCompare(String(b.modelName || b.fileName || ''), 'ru'));
 }
 
 function memoryRecordMatches(record, state = memoryFilterState()) {
   const haystack = `${record?.modelName || ''} ${record?.fileName || ''} ${record?.relativePath || ''}`.toLowerCase();
+  const matchesStatus = state.status === 'all'
+    || (state.status === 'running' ? Boolean(record?.accountingAttemptActive || record?.status === 'running') : record?.status === state.status);
   return (!state.search || haystack.includes(state.search.toLowerCase()))
     && (state.group === 'all' || record?.groupId === state.group)
     && (state.brand === 'all' || brandIdFromModelName(record?.modelName || record?.fileName) === state.brand)
-    && (state.status === 'all' || record?.status === state.status);
+    && matchesStatus;
 }
 
 function visibleMemoryRecords(records = memoryRecords(), state = memoryFilterState()) {
@@ -1747,13 +1804,15 @@ function visibleMemoryRecords(records = memoryRecords(), state = memoryFilterSta
 function updateMemorySummary(records, visible) {
   const counts = {
     ready: records.filter((record) => record.status === 'ready').length,
-    running: records.filter((record) => record.status === 'running').length,
+    running: records.filter((record) => record.accountingAttemptActive || record.status === 'running').length,
     imageSaved: records.filter((record) => record.status === 'image_saved').length,
-    factsPending: records.filter((record) => record.status === 'facts_pending').length,
-    not_ready: records.filter((record) => record.status === 'not_ready').length
+    factsPending: records.filter((record) => record.accountingStatus === 'NEEDS_FACTS' || (!record.accountingStatus && record.status === 'facts_pending')).length,
+    not_ready: records.filter((record) => record.accountingStatus === 'NOT_READY' || (!record.accountingStatus && record.status === 'not_ready')).length,
+    needsVerification: records.filter((record) => record.accountingStatus === 'NEEDS_VERIFICATION' || (!record.accountingStatus && record.status === 'needs_verification')).length,
+    identityReview: records.filter((record) => record.status === 'identity_review').length
   };
   const visibleCount = visible.filter((record) => record.sourcePresent !== false).length;
-  if ($('memoryStats')) $('memoryStats').textContent = records.length ? [counts.running ? `В работе ${counts.running}` : '', counts.imageSaved ? `Фото без спецификации ${counts.imageSaved}` : '', counts.factsPending ? `Получение спецификации ${counts.factsPending}` : '', counts.not_ready ? `Не готово ${counts.not_ready}` : ''].filter(Boolean).join(' · ') : '';
+  if ($('memoryStats')) $('memoryStats').textContent = records.length ? [counts.running ? `Активные попытки ${counts.running}` : '', counts.imageSaved ? `Фото без спецификации ${counts.imageSaved}` : '', counts.factsPending ? `Ожидают спецификацию ${counts.factsPending}` : '', counts.needsVerification ? `Требуют проверки ${counts.needsVerification}` : '', counts.identityReview ? `в т.ч. проверка модели ${counts.identityReview}` : '', counts.not_ready ? `Не готово ${counts.not_ready}` : ''].filter(Boolean).join(' · ') : '';
   if ($('memoryVisibleCount')) $('memoryVisibleCount').textContent = `Показано ${visible.length}/${records.length}`;
 }
 
@@ -1790,6 +1849,9 @@ function memoryTreeSignature(nodes) {
     node.queued,
     node.imageSaved,
     node.factsPending,
+    node.needsVerification,
+    node.identityAmbiguous,
+    node.notReady,
     (node.entries || []).map((entry) => entry.sourceId).join(','),
     memoryTreeSignature(node.children)
   ].join(':')).join('|');
@@ -1799,19 +1861,26 @@ function currentMemoryProgressTree() {
   if (cachedMemoryTreeGroups !== queue.groups
     || cachedMemoryTreeRepairQueue !== queue.repairQueue
     || cachedMemoryTreeGenerationMemory !== generationMemory
+    || cachedMemoryTreeAccountingSnapshot !== accountingSnapshot
     || !cachedMemoryProgressTree) {
     cachedMemoryTreeGroups = queue.groups;
     cachedMemoryTreeRepairQueue = queue.repairQueue;
     cachedMemoryTreeGenerationMemory = generationMemory;
-    cachedMemoryProgressTree = buildPlaylistProgressTree(queue.groups, queue.repairQueue, generationMemory);
+    cachedMemoryTreeAccountingSnapshot = accountingSnapshot;
+    cachedMemoryProgressTree = buildPlaylistProgressTree(queue.groups, queue.repairQueue, generationMemory, accountingSnapshot);
     cachedMemoryProgressTreeSignature = memoryTreeSignature(cachedMemoryProgressTree);
   }
   return { tree: cachedMemoryProgressTree, signature: cachedMemoryProgressTreeSignature };
 }
 
 function memoryProgressLabel(node) {
-  if (node.mode === REGENERATION_QUEUE_ID) return `${node.queued} в очереди${node.running ? ` · ${node.running} в работе` : ''}`;
-  return `${node.done}/${node.total} готово · ${node.percent}%${node.running ? ` · ${node.running} в работе` : ''}${node.imageSaved + node.factsPending ? ` · ${node.imageSaved + node.factsPending} без спецификации` : ''}`;
+  const parts = [`${node.done}/${node.total} готово · ${node.percent}%`];
+  if (node.mode === REGENERATION_QUEUE_ID) parts.push(`${node.queued} в очереди на повтор`);
+  if (node.factsPending) parts.push(`${node.factsPending} ждут спецификацию`);
+  if (node.needsVerification) parts.push(`${node.needsVerification} требуют проверки`);
+  if (node.identityAmbiguous) parts.push(`из них ${node.identityAmbiguous} требуют сверки идентичности`);
+  if (node.running) parts.push(`${node.running} активных попыток`);
+  return parts.join(' · ');
 }
 
 function memoryTreeFolder(node, depth = 0) {
@@ -1926,7 +1995,16 @@ function renderMemoryTree(nodes, selectedPart = null) {
     empty.textContent = search ? 'Очереди не найдены' : playlistMode === REGENERATION_QUEUE_ID ? 'Нет карточек для перегенерации' : 'Нет исходных моделей. Выберите папку в настройках.';
     tree.append(empty);
   }
-  if ($('memoryTreeSummary')) $('memoryTreeSummary').textContent = root ? memoryProgressLabel(root) : '';
+  if ($('memoryTreeSummary')) {
+    const freshness = accountingSnapshotFreshness(accountingSnapshot);
+    $('memoryTreeSummary').textContent = root
+      ? `${memoryProgressLabel(root)} · ${freshness.label}`
+      : freshness.label;
+    $('memoryTreeSummary').title = accountingSnapshot?.generatedAt
+      ? `Снимок готовности создан ${new Date(accountingSnapshot.generatedAt).toLocaleString('ru-RU')}${accountingSnapshot.staleReason ? ` · ${accountingSnapshot.staleReason}` : ''}`
+      : freshness.label;
+    $('memoryTreeSummary').dataset.accountingState = freshness.state;
+  }
   tree.scrollTop = scrollTop;
   if (focusedPart) [...tree.querySelectorAll('[data-part-id]')].find((node) => node.dataset.partId === focusedPart)?.focus({ preventScroll: true });
 }
@@ -1943,7 +2021,7 @@ function renderGenerationMemory() {
   if (!selectedPart && selectedMemoryPartId) selectedMemoryPartId = '';
   selectedPart = findMemoryPart(progressTree, selectedMemoryPartId);
   if (selectedPart) openMemoryPartPath(progressTree, selectedPart.id);
-  const renderKey = `${playlistMode}|${$('playlistSearch')?.value || ''}|${JSON.stringify(memoryFilters)}|${selectedMemoryPartId}|${progressTreeSignature}|${records.map((record) => `${record.sourceId}:${record.status}:${record.sourcePresent}:${repairs.has(String(record.sourceId))}:${record.updatedAt || ''}:${record.lastError || ''}:${record.errorClass || ''}:${record.outputWidth || ''}x${record.outputHeight || ''}`).join(';')}`;
+  const renderKey = `${playlistMode}|${$('playlistSearch')?.value || ''}|${JSON.stringify(memoryFilters)}|${selectedMemoryPartId}|${accountingSnapshot?.revision || accountingSnapshot?.snapshotSequence || 0}:${accountingSnapshot?.stale ? 'stale' : 'fresh'}|${progressTreeSignature}|${records.map((record) => `${record.sourceId}:${record.status}:${record.accountingStatus}:${record.accountingAttemptActive}:${record.sourcePresent}:${repairs.has(String(record.sourceId))}:${record.updatedAt || ''}:${record.lastError || ''}:${record.errorClass || ''}:${record.outputWidth || ''}x${record.outputHeight || ''}`).join(';')}`;
   if (renderKey === lastMemoryRenderKey) return;
   lastMemoryRenderKey = renderKey;
   const partSourceIds = selectedPart ? new Set(selectedPart.sourceIds.map(String)) : null;
@@ -1993,18 +2071,22 @@ function renderGenerationMemory() {
     const details = document.createElement('div');
     details.className = 'memory-details';
     const statusText = record.status === 'ready'
-      ? (record.generatedAt
+      ? `${record.generatedAt
         ? `готово ${shortTime(record.generatedAt)}${record.outputWidth && record.outputHeight ? ` · ${record.outputWidth}×${record.outputHeight}` : ''}`
-        : 'готово')
+        : 'готово'}${record.accountingAttemptActive ? ` · новая попытка в работе${record.accountingAttemptError ? ` · ошибка: ${compact(record.accountingAttemptError, 38)}` : ''}` : ''}`
       : record.status === 'image_saved'
         ? `фото сохранено${record.generatedAt ? ` ${shortTime(record.generatedAt)}` : ''} · ждёт спецификацию`
         : record.status === 'facts_pending'
-          ? 'получение спецификации'
+          ? 'готовое фото · ожидает спецификацию'
+          : record.status === 'needs_verification'
+            ? 'результат требует проверки'
+            : record.status === 'identity_review'
+              ? 'неоднозначный номер модели · требуется сверка'
       : (record.lastError
         ? `${record.errorClass ? `${record.errorClass} · ` : ''}${compact(record.lastError, 44)}`
         : memoryStatusText(record.status));
     details.textContent = repairs.has(String(record.sourceId)) ? `${statusText} · брак в очереди` : statusText;
-    details.title = record.lastError || record.outputPath || (repairs.has(String(record.sourceId)) ? 'Добавлена в отдельную очередь перегенерации брака' : '');
+    details.title = record.accountingAttemptError || record.lastError || record.outputPath || (repairs.has(String(record.sourceId)) ? 'Добавлена в отдельную очередь перегенерации брака' : '');
     row.append(copy, details);
     fragment.append(row);
   }
@@ -2023,7 +2105,7 @@ function updateActionButtons() {
   const conversationRecoveryStage = String(runtime.conversationRecovery?.stage || '').toUpperCase();
   const conversationRecoveryBusy = ['INSPECTING', 'WAITING', 'REOPENING'].includes(conversationRecoveryStage);
   const recoveryCountdown = countdown(runtime.conversationRecovery?.dueAt);
-  const waitingImageLimit = canContinue && runtime.imageLimitDetected === true
+  const waitingImageLimit = canContinue && (runtime.imageLimitDetected === true || runtime.uploadCooldownActive === true)
     && Number(runtime.rateLimitPauseUntil || 0) > Date.now();
   const isRunning = ['RUNNING', 'STARTING', 'DRAINING'].includes(runtime.state);
   const isReconciling = runtime.state === 'RECONCILING';
@@ -2042,7 +2124,7 @@ function updateActionButtons() {
   else if (conversationRecoveryStage === 'INSPECTING') startLabel = 'ПРОВЕРЯЮ ЧАТЫ…';
   else if (conversationRecoveryStage === 'WAITING') startLabel = `ВОССТАНОВЛЕНИЕ ${recoveryCountdown ? `· ${recoveryCountdown}` : ''}`.trim();
   else if (conversationRecoveryStage === 'REOPENING') startLabel = 'ОТКРЫВАЮ ЧАТЫ…';
-  else if (waitingImageLimit) startLabel = 'ОЖИДАНИЕ ЛИМИТА';
+  else if (waitingImageLimit) startLabel = runtime.uploadCooldownActive ? 'ПАУЗА ЗАГРУЗКИ' : 'ОЖИДАНИЕ ЛИМИТА';
   $('start').querySelector('span:last-child').textContent = startLabel === 'СТАРТ' ? 'Запустить' : sentenceCase(startLabel);
   $('start').disabled = isRunning || isReconciling || actionBusy || waitingImageLimit || conversationRecoveryBusy || stalledBatchBusy
     || ['applying', 'restarting', 'syncing-references'].includes(extensionUpdateStatus.phase)
@@ -2111,7 +2193,7 @@ async function refreshRuntime() {
   const response = await requestRuntime();
   if (!response?.ok) return;
   const value = response.value || {};
-  runtime = { ...runtime, ...(value.runtime || {}), run: value.run || null };
+  acceptRuntimeSnapshot(value.runtime);
   if (value.domDiagnosticsMode != null) {
     domDiagnosticsMode = normalizeDomDiagnosticsMode(value.domDiagnosticsMode);
     updateDomDiagnosticsStatus();
@@ -2144,15 +2226,21 @@ async function refreshRuntime() {
   renderSlotGrid();
   const appliedFilter = normalizeWatchFilter(runtime.filter || filterFromInputs());
   const appliedEntries = filterEntries(appliedFilter);
+  const canonicalBySku = canonicalAccountingIndex(accountingSnapshot);
+  const readyInSelected = appliedEntries.filter((entry) => {
+    const row = canonicalBySku.get(String(entry.skuKey || entry.sourceId || ''));
+    return row?.status === 'READY' && row?.identityStatus === 'OK';
+  }).length;
+  const accountingFreshness = accountingSnapshotFreshness(accountingSnapshot);
   const selected = {
     total: appliedEntries.length,
-    done: appliedEntries.filter((entry) => entry.status === 'done').length
+    ready: readyInSelected
   };
   $('meta').textContent = [
     `Фильтр: ${runtime.filterLabel || filterLabel(appliedFilter)}`,
     Number(runtime.runPart || 0) > 0 ? `Часть очереди: ${runtime.runPart}/${runtime.runPartCount || '—'} · назначено ${runtime.runPartCandidateCount || 0}` : '',
     `Прогон: ${runtime.runCompleted ?? 0}/${runtime.runTotal ?? '—'} · осталось ${runtime.runRemaining ?? '—'}`,
-    `Выбранный список: ${selected.done}/${selected.total}`,
+    `В выбранном списке готово по сверке: ${selected.ready}/${selected.total}${accountingFreshness.state === 'confirmed' ? '' : ` · ${accountingFreshness.label}`}`,
     runtime.error ? `Ошибка: ${compact(runtime.error, 160)}` : ''
   ].filter(Boolean).join('\n');
   renderLogs(value.logs || []);
@@ -2350,7 +2438,9 @@ async function refreshRunDiagnosticsList() {
   const select = $('runDiagnosticsSelect');
   if (!select) return;
   const selectedId = select.value;
-  const runs = await listRunDiagnostics({ limit: 500 });
+  const reader = createDiagnosticOutbox({ storage: chrome.storage.local, archive: async () => {} });
+  const runs = await listCompleteRunDiagnosticHeaders({ storage: chrome.storage.local,
+    listArchives: listRunDiagnostics, readOutbox: () => reader.read(), version: chrome.runtime.getManifest?.().version });
   select.replaceChildren(new Option(runs.length ? 'Выберите прогон…' : 'Архив прогонов пуст', ''));
   for (const run of runs) select.add(new Option(runDiagnosticOptionLabel(run), run.operationId));
   select.value = runs.some((run) => run.operationId === selectedId)
@@ -2378,14 +2468,16 @@ function refreshRunDiagnosticsAtBoundary() {
 async function exportSelectedRunDiagnostic() {
   const operationId = $('runDiagnosticsSelect')?.value;
   if (!operationId) throw new Error('Выбери прогон для экспорта');
-  const archive = await getRunDiagnostic(operationId);
+  const archive = await readCompleteRunDiagnostic(operationId);
   if (!archive?.run) throw new Error('Диагностика прогона не найдена. Обнови список и повтори экспорт.');
   const payload = {
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),
     extensionVersion: chrome.runtime.getManifest?.().version || null,
     run: archive.run,
-    events: archive.events
+    events: archive.events,
+    archiveError: archive.archiveError,
+    outboxReadError: archive.outboxReadError || null
   };
   const stamp = String(archive.run.startedAt || new Date().toISOString()).replace(/[:.]/g, '-');
   downloadJson(`watch-automation-run-${stamp}-${String(operationId).slice(0, 8)}.json`, payload);
@@ -2396,12 +2488,28 @@ async function exportDiagnosticSnapshot() {
   const response = await chrome.runtime.sendMessage({ type: 'GET_RUNTIME' });
   if (!response?.ok) throw new Error(response?.error || 'Не удалось получить состояние расширения');
   const value = response.value || {};
+  // The snapshot used to contain only the last 20 events. Keep the separate
+  // persistent run journal too, including after a user resets the session.
+  let runArchive = null;
+  let runArchiveError = null;
+  try {
+    const reader = createDiagnosticOutbox({ storage: chrome.storage.local, archive: async () => {} });
+    const operationId = value.run?.operationId || value.runtime?.operationId
+      || await latestDiagnosticOperationId({ storage: chrome.storage.local,
+        listArchives: listRunDiagnostics, readOutbox: () => reader.read(), version: chrome.runtime.getManifest?.().version });
+    if (operationId) runArchive = await readCompleteRunDiagnostic(operationId);
+    runArchiveError = runArchive?.archiveError || runArchive?.outboxReadError || null;
+  } catch (error) {
+    runArchiveError = error.message;
+  }
   const payload = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     exportedAt: new Date().toISOString(),
     extensionVersion: chrome.runtime.getManifest?.().version || null,
     runtime: value.runtime || null,
     run: value.run || null,
+    runArchive,
+    runArchiveError,
     logs: Array.isArray(value.logs) ? value.logs : [],
     lastPreflight: value.lastPreflight || null,
     domDiagnosticsMode: value.domDiagnosticsMode || null,
@@ -2423,6 +2531,12 @@ async function exportDiagnosticSnapshot() {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   downloadJson(`watch-automation-diagnostics-${stamp}.json`, payload);
   showFeedback('Диагностика сохранена в JSON. Папка локального watcher для этого не нужна.', { type: 'success', autoHide: true });
+}
+
+async function readCompleteRunDiagnostic(operationId) {
+  const reader = createDiagnosticOutbox({ storage: chrome.storage.local, archive: async () => {} });
+  return completeRunDiagnostic(operationId, { storage: chrome.storage.local,
+    readArchive: getRunDiagnostic, readOutbox: id => reader.read(id), version: chrome.runtime.getManifest?.().version });
 }
 
 async function exportGenerationMemory() {
@@ -2854,7 +2968,18 @@ $('feedbackClose')?.addEventListener('click', () => clearFeedback());
 
 let storageListRefreshBusy = false;
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== 'local' || storageListRefreshBusy) return;
+  if (areaName !== 'local') return;
+  if (changes[ACCOUNTING_SNAPSHOT_STORAGE_KEY]) {
+    const incoming = changes[ACCOUNTING_SNAPSHOT_STORAGE_KEY].newValue;
+    const previous = accountingSnapshot;
+    accountingSnapshot = acceptAccountingSnapshot(accountingSnapshot, incoming);
+    if (accountingSnapshot !== previous) {
+      cachedMemoryProgressTree = null;
+      lastMemoryRenderKey = '';
+      renderAll();
+    }
+  }
+  if (storageListRefreshBusy) return;
   if (!changes.queue && !changes.history && !changes.generationMemory && !changes.folderSelections && !changes.lastPreflight && !changes.domDiagnosticsMode && !changes.outputDestination) return;
   storageListRefreshBusy = true;
   chrome.storage.local.get(['queue', 'history', 'generationMemory', 'folderSelections', 'lastPreflight', 'domDiagnosticsMode', 'outputDestination'])
@@ -2873,7 +2998,6 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
       updateDomDiagnosticsStatus();
       refreshOutputDestinationUi().catch(() => {});
       applyGenerationHistory(queue.groups, stored.history);
-      hydrateGenerationMemoryFromQueue();
       applyGenerationMemory(queue.groups, generationMemory);
       renderAll();
     })

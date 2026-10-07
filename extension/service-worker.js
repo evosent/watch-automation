@@ -43,8 +43,13 @@ import {
   getGenerationRevision, getAllGenerationRevisions, getAllModelCatalog, upsertGenerationRevision,
   beginGenerationRevision, cancelUnsubmittedGenerationRevision,
   persistGenerationImageRevision, persistGenerationFactsRevision,
-  rejectGenerationRevision, saveRunDiagnostics, mergeResultsDatabase
+  rejectGenerationRevision, saveRunDiagnostics, mergeResultsDatabase, markGenerationForSessionRetry,
+  getAccountingRecords, getOutputRecoveryRecord, recordExistingVerifiedRevisions, recordUnverifiedOutputCandidate,
+  getRunDiagnostic, listRunDiagnostics,
+  getAllIdentityQuarantines, applyExplicitIdentityMigration
 } from './idb.js';
+import { projectCanonicalAccounting } from './result-accounting-utils.js';
+import { buildIdentityMigrationPlan } from './identity-migration-utils.js';
 import { transferableRevision, planResultsMerge, resultsImportPreview } from './results-transfer-utils.js';
 import { buildInputPlan, normalizeInputMode, DEFAULT_INPUT_MODE } from './input-plan.js';
 import {
@@ -62,15 +67,25 @@ import {
   excludeRepairQueueEntries
 } from './repair-queue-utils.js';
 import { brandPromptPath, buildGenerationPrompt, detectBrandProfile, resolveTitleSpec } from './prompt-profiles.js';
-import { runDiagnosticHeader, sanitizeRunDiagnosticEvent } from './run-diagnostics-utils.js';
+import { runDiagnosticHeader, sanitizeRunDiagnosticEvent, diagnosticCategoryForType } from './run-diagnostics-utils.js';
+import { createDiagnosticOutbox } from './diagnostic-outbox-utils.js';
+import { completeRunDiagnostic, latestDiagnosticOperationId } from './diagnostic-export-utils.js';
+import { ensureSessionWatchdog, noteSessionUsefulProgress, sessionWatchdogDecision } from './session-watchdog-utils.js';
+import { createSessionRestartController } from './session-restart-controller.js';
 import { syncRunClock, elapsedRunClock, pauseRunClock, resumeRunClock, stopRunClock } from './run-clock-utils.js';
+import { syncRunProgress, mergeRuntimeSnapshot } from './run-progress-utils.js';
 import {
   AUTOMATION_ERROR_CLASSES,
   CONVERSATION_LOAD_RECOVERY_DELAY_MS,
   SLOT_PHASES,
   classifyAutomationError,
   coalescedPauseDeadline,
-  imageLimitResumeAt,
+  imageLimitResumeAt as parsedImageLimitResumeAt,
+  imageLimitFallbackResumeAt,
+  uploadLimitResumeAt,
+  isUploadLimitText,
+  isStorageLimitText,
+  isImageLimitText,
   generationId,
   isMeaningfulProgress,
   normalizeGenerationJitterSeconds,
@@ -100,6 +115,7 @@ const AUTOMATION_CONTEXT_KEY = '__watch_automation_context_v2';
 const AUTOMATION_CONTENT_SCRIPT_FILES = [
   'automation-gate.js',
   'dom-recorder.js',
+  'quota-utils.js',
   'selector-resolver.js',
   'overlay.js',
   'facts-json-utils.js',
@@ -119,6 +135,7 @@ const PREPARE_PAGE_TIMEOUT_MS = 300000;
 // failed slot observable for the same 15-minute window as a regular generation.
 const FINAL_CHECK_TIMEOUT_MS = 900000;
 const MAX_AUTOMATIC_PREPARATION_RECOVERIES = 2;
+const UPLOAD_BACKOFF_MS = 3 * 60 * 60_000 + 60_000;
 const MAX_ARTIFACT_REVISION_PERSIST_FAILURES = 3;
 const RATE_LIMIT_PAUSE_MS = 180000;
 const DEFAULT_RATE_LIMIT_PAUSE_MINUTES = RATE_LIMIT_PAUSE_MS / 60000;
@@ -127,6 +144,7 @@ const MAX_RATE_LIMIT_PAUSE_MINUTES = 30;
 const RATE_LIMIT_RESUME_ALARM_NAME = 'watch-automation-rate-limit-resume';
 const CONVERSATION_LOAD_RECOVERY_ALARM_NAME = 'watch-automation-conversation-load-recovery';
 const STALLED_BATCH_RECOVERY_ALARM_NAME = 'watch-automation-stalled-batch-recovery';
+const SESSION_WATCHDOG_ALARM_NAME = 'watch-automation-session-watchdog';
 const REVISION_FACTS_RECOVERY_ALARM_NAME = 'watch-automation-revision-facts-recovery';
 const DEV_RELOAD_ALARM_NAME = 'watch-automation-dev-reload';
 const DEV_RELOAD_STATUS_URL = 'http://127.0.0.1:17321/status';
@@ -144,6 +162,7 @@ const DOM_EVENT_POST_TIMEOUT_MS = 4000;
 const DIAGNOSTIC_ENDPOINT = 'http://127.0.0.1:17321/diagnostics';
 const CLEAR_DIAGNOSTICS_ENDPOINT = 'http://127.0.0.1:17321/clear-diagnostics';
 const OUTPUT_VERIFY_ENDPOINT = 'http://127.0.0.1:17321/output-verify';
+const OUTPUT_ACCOUNTING_VERIFY_ENDPOINT = 'http://127.0.0.1:17321/output-accounting-verify';
 const OUTPUT_DELETE_ENDPOINT = 'http://127.0.0.1:17321/output-delete';
 const OUTPUT_ARCHIVE_REVISION_ENDPOINT = 'http://127.0.0.1:17321/output-archive-revision';
 // Transport probes are deliberately shorter than the generation timeout. A
@@ -154,11 +173,12 @@ const MAX_RUN_EVENTS = 600;
 const RUN_CLOCK_PAUSE_EVENTS = new Set([
   'run_pause_requested', 'run_pause_applied', 'run_paused_on_error',
   'rate_limit_pause', 'image_limit_pause', 'run_retry_backoff_scheduled',
+  'upload_limit_pause', 'upload_backoff_pause',
   'stalled_batch_recovery_started', 'stalled_batch_recovery_waiting',
   'conversation_load_recovery_started', 'run_stop_accepted', 'run_completed'
 ]);
 const OUTPUT_VERIFY_TIMEOUT_MS = 2000;
-const EXTENSION_BUILD_ID = '2026-10-05.4';
+const EXTENSION_BUILD_ID = '2026-10-06.5';
 const PROMPT_PIPELINE_VERSION = '6';
 const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
@@ -189,11 +209,20 @@ let physicalSendChain = Promise.resolve();
 let launchRunId = null;
 let lastLaunchAt = 0;
 let lastAnySendAt = 0;
+let accountingSnapshotCache = null;
+let accountingSnapshotInFlight = null;
+let accountingSnapshotCheckedAt = 0;
+let accountingIdentityMigrationCheckedAt = 0;
+let accountingIdentityMigrationInFlight = null;
+let accountingIdentityMigrationLastOutcome = { checked: false, pending: true, reason: 'not_checked' };
+const customArtifactVerificationCache = new Map();
 // De-duplicate one logical Send task per slot while the MV3 worker is alive.
 // If the worker is suspended, this map disappears; the persisted
 // rateLimitRetryNeeded flag reconstructs the lost task on alarm wake-up.
 const activeLaunchTasks = new Map();
+const activeSlotExecutionTasks = new Map();
 const imageLimitTasks = new Map();
+const uploadLimitTasks = new Map();
 const activeFactsSendTasks = new Map();
 const conversationRecoveryRuns = new Set();
 const stalledBatchRecoveryRuns = new Set();
@@ -240,6 +269,192 @@ let automationWindowPromise = null;
 let automationWindowPromiseRunId = null;
 let interruptedRecoveryPromise = null;
 let resetRunPromise = null;
+let sessionWatchdogInFlight = null;
+let sessionWatchdogTimer = null;
+const diagnosticOutbox = createDiagnosticOutbox({ storage: chrome.storage.local, archive: saveRunDiagnostics });
+const diagnosticDecisionSequences = new Map();
+const sessionRestartController = createSessionRestartController({
+  storage: chrome.storage.local, getStored, lock: withStateLock, save: saveRunAndQueue,
+  record: recordRunEvent, persistDiagnostics: persistRunDiagnosticDecision,
+  recordDetachedFailure: recordDetachedRecoveryFailure,
+  reset: resetRunAndRescan, resume: resumeRun, newId: () => crypto.randomUUID(),
+  buildId: EXTENSION_BUILD_ID,
+  shouldRestart: run => sessionWatchdogDecision(run).due,
+  findEntry: (queue, run, sourceId) => groupEntries(queue, run.groupId).find(entry => entry.sourceId === sourceId),
+  readModel: getModelCatalog, readRevision: getGenerationRevision, markRetry: markGenerationForSessionRetry,
+  isComplete: revisionFactsAreComplete,
+  revisionMatches: (entry, revision) => (!revision.sourceVariantId || !entry.inputSourceId
+    || String(revision.sourceVariantId) === String(entry.inputSourceId))
+    && (!revision.sourceHash || !entry.sourceHash || revision.sourceHash === entry.sourceHash)
+    && (!revision.recipeHash || !entry.recipeHash || revision.recipeHash === entry.recipeHash),
+  resetEntry: resetEntryForSessionRestart, stopPages: stopPagesForSessionRestart
+});
+
+function resetEntryForSessionRestart(stored, entry) {
+  const sourceId = entry.sourceId;
+  Object.assign(entry, { status: 'pending', generationId: null, previousGenerationId: null,
+    generatedAt: null, outputPath: null, outputHash: null, outputWidth: null, outputHeight: null,
+    verificationMode: null, factsStatus: null, factsWarnings: [], lastError: null,
+    errorClass: null, nextRetryAt: null, retryCount: 0, autoRetryPending: false, chatUrl: null });
+  stored.history = normalizeHistory(stored.history);
+  delete stored.history.items[sourceId];
+  stored.history.ignored[sourceId] = true;
+  stored.generationMemory = normalizeGenerationMemory(stored.generationMemory);
+  setGenerationMemoryStatus(stored.generationMemory, entry, GENERATION_MEMORY_STATUSES.NOT_READY, {
+    generationId: null, previousGenerationId: null, generationStartedAt: null, generatedAt: null,
+    outputPath: null, outputHash: null, outputWidth: null, outputHeight: null, factsStatus: null,
+    verificationMode: null, lastRunId: null, retryCount: 0, lastError: null, errorClass: null, nextRetryAt: null
+  });
+}
+
+async function stopPagesForSessionRestart(run) {
+  resetLaunchScheduler(run.operationId);
+  await Promise.all([...Object.values(run.slots || {}), ...Object.values(run.postprocessTabs || {})]
+    .filter(owner => owner.tabId).map(owner => sendTabMessage(owner.tabId, {
+      type: 'STOP', operationId: run.operationId, slotId: owner.slotId,
+      entryId: owner.entryId, leaseId: owner.leaseId || null
+    }, 1500).catch(() => null)));
+}
+
+async function cancelSessionRestartForUserAction(reason) {
+  const { sessionRestartIntent } = await chrome.storage.local.get('sessionRestartIntent');
+  if (sessionRestartIntent) await chrome.storage.local.set({ sessionRestartCancellation: {
+    restartId: sessionRestartIntent.restartId, reason, at: new Date().toISOString()
+  } });
+}
+
+async function ensureSessionWatchdogAlarm() {
+  if (!chrome.alarms?.create) return;
+  const existing = await chrome.alarms.get?.(SESSION_WATCHDOG_ALARM_NAME);
+  if (!existing) await chrome.alarms.create(SESSION_WATCHDOG_ALARM_NAME, { periodInMinutes: 0.5 });
+  if (!sessionWatchdogTimer) sessionWatchdogTimer = setTimeout(() => {
+    sessionWatchdogTimer = null;
+    void checkSessionWatchdog().finally(() => ensureSessionWatchdogAlarm().catch(() => {}));
+  }, 30000);
+}
+
+function checkSessionWatchdog() {
+  if (sessionWatchdogInFlight) return sessionWatchdogInFlight;
+  sessionWatchdogInFlight = (async () => {
+    const stored = await getStored();
+    if (stored.sessionRestartIntent) return runSessionRestartWithTimeout(async () => {
+      const result = await sessionRestartController.continueRestart();
+      if (result.restarted) await resumeRestoredSessionAssignments();
+      return result;
+    });
+    if (!stored.run) { void diagnosticOutbox.drain(); return { skipped: true }; }
+    const locks = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']);
+    const decision = sessionWatchdogDecision(stored.run, Date.now(), locks);
+    if (decision.due) return runSessionRestartWithTimeout(async () => {
+      const result = await sessionRestartController.begin(stored.run,
+        stored.run.jobSnapshot || { ...stored.job, filters: stored.run.filter, inputMode: stored.run.inputMode });
+      if (result.restarted) await resumeRestoredSessionAssignments();
+      return result;
+    });
+    if (stored.run.sessionWatchdog?.blockedReason === (decision.blocked?.reason || null)) return { skipped: true };
+    void withStateLock(async () => {
+      const latest = await getStored();
+      if (latest.run?.operationId !== stored.run.operationId) return;
+      const current = sessionWatchdogDecision(latest.run, Date.now(), locks);
+      const state = latest.run.sessionWatchdog;
+      const reason = current.blocked?.reason || null;
+      if (state.blockedReason !== reason) {
+        if (!reason && state.blockedReason) state.armedAt = Date.now();
+        state.blockedReason = reason;
+        state.blockedUntil = current.blocked?.dueAt || null;
+        recordRunEvent(latest.run, reason ? 'session_watchdog_deferred' : 'session_watchdog_armed', {
+          reason, dueAt: state.blockedUntil, lastUsefulAt: state.lastUsefulAt
+        });
+      }
+      await saveRunAndQueue(latest.run, latest.queue);
+    }).catch(error => recordRecoveryFailure('session_watchdog_failed', error));
+    return { skipped: true };
+  })().catch(async error => {
+    await recordRecoveryFailure('session_watchdog_failed', error);
+    return { failed: true, error: error?.message || String(error) };
+  }).finally(() => { sessionWatchdogInFlight = null; });
+  return sessionWatchdogInFlight;
+}
+
+async function runSessionRestartWithTimeout(task) {
+  const watchdog = setTimeout(() => {
+    void chrome.storage.local.get(['sessionRestartIntent', 'sessionRestartCancellation', 'run']).then(async stored => {
+      const intent = stored.sessionRestartIntent;
+      if (!intent || stored.sessionRestartCancellation?.restartId === intent.restartId
+        || stored.run?.pauseReason === 'USER' || stored.run?.stopBlocked || stored.run?.clockStopped) return;
+      // The state mutex itself may be what hung. Use a separate diagnostic
+      // operation, so this emergency record cannot collide with its sequence.
+      await Promise.race([
+        recordDetachedRecoveryFailure('session_restart_worker_reload',
+          new Error('Восстановление сессии не ответило за 45 секунд'), intent),
+        sleep(2000)
+      ]);
+      chrome.runtime.reload();
+    }).catch(() => {});
+  }, 45000);
+  try { return await task(); }
+  finally { clearTimeout(watchdog); }
+}
+
+async function recordRecoveryFailure(type, error, data = {}) {
+  let detachedIntent = null;
+  await withStateLock(async () => {
+    const stored = await getStored();
+    if (!stored.run) { detachedIntent = stored.sessionRestartIntent || null; return; }
+    recordRunEvent(stored.run, type, { ...data, error: String(error?.message || error) });
+    await saveRunAndQueue(stored.run, stored.queue);
+  });
+  if (detachedIntent) await recordDetachedRecoveryFailure(type, error, detachedIntent);
+  await appendLog('Ошибка защитного механизма', { type, ...data, error: String(error?.message || error) });
+}
+
+async function recordDetachedRecoveryFailure(type, error, intent) {
+  const operationId = `recovery-${crypto.randomUUID()}`;
+  const at = new Date().toISOString();
+  await diagnosticOutbox.persist({ operationId,
+    header: { operationId, startedAt: at, updatedAt: at, state: 'RECOVERY_ERROR',
+      previousOperationId: intent?.operationId || null, sessionRestartId: intent?.restartId || null,
+      extensionVersion: chrome.runtime.getManifest?.().version, eventCount: 1 },
+    records: [sanitizeRunDiagnosticEvent({ operationId, sequence: 1, at, type,
+      previousOperationId: intent?.operationId || null, restartId: intent?.restartId || null,
+      stage: intent?.stage || null,
+      error: String(error?.message || error) })] });
+  void diagnosticOutbox.drain();
+}
+
+async function recordSafetyEvent(operationId, type, data = {}) {
+  await withStateLock(async () => {
+    const stored = await getStored();
+    if (stored.run?.operationId !== operationId) return;
+    const key = JSON.stringify(data);
+    const incident = `${type}:${data.factsJobId || data.generationId || data.entryId || data.slotId || data.tabId || 'run'}`;
+    stored.run.safetyDecisionKeys ||= {};
+    if (stored.run.safetyDecisionKeys[incident] === key) return;
+    stored.run.safetyDecisionKeys[incident] = key;
+    recordRunEvent(stored.run, type, data);
+    await saveRunAndQueue(stored.run, stored.queue);
+  });
+}
+
+function recordRecoveryTransitions(run) {
+  if (!run) return;
+  run.diagnosticRecoveryStates ||= {};
+  const mechanisms = [
+    ['stalled_batch', run.stalledBatchRecovery], ['conversation', run.conversationRecovery],
+    ['run_pause', run.state === 'PAUSED' ? { stage: run.pauseReason || run.status || 'UNKNOWN' }
+      : (run.diagnosticRecoveryStates.run_pause ? { stage: 'ACTIVE' } : null)]
+  ];
+  for (const [mechanism, recovery] of mechanisms) {
+    if (!recovery) continue;
+    const decision = { mechanism, stage: recovery.stage || null, kind: recovery.kind || null,
+      dueAt: recovery.dueAt || null, attempts: recovery.attempts || 0,
+      error: recovery.error || null, exhausted: recovery.exhausted === true };
+    const key = JSON.stringify(decision);
+    if (run.diagnosticRecoveryStates[mechanism] === key) continue;
+    run.diagnosticRecoveryStates[mechanism] = key;
+    recordRunEvent(run, 'recovery_stage_changed', decision);
+  }
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -353,6 +568,10 @@ async function rehydrateWorkerWake() {
     return;
   }
   const stored = await getStored();
+  if (stored.sessionRestartIntent) {
+    void checkSessionWatchdog();
+    return;
+  }
   if (stored.sessionResetIntent) {
     void resumeInterruptedSessionReset(stored.sessionResetIntent).catch((error) => appendLog(
       'Не удалось завершить запрошенный сброс после пробуждения расширения', { error: error.message }
@@ -361,6 +580,23 @@ async function rehydrateWorkerWake() {
   }
   const run = stored.run;
   if (!run) return;
+  if (run.uploadCooldownActive || run.uploadManualPause) {
+    if (run.uploadPauseSettled !== true && !run.clockStopped && !run.stopBlocked
+      && !['STOPPED', 'DONE'].includes(run.state)) {
+      await pauseForUploadLimit(run.operationId, {
+        inferred: run.uploadLimitDetected !== true,
+        text: run.rateLimitReason,
+        resumeAtMs: run.rateLimitPauseUntil,
+        autoResume: !run.uploadManualPause
+      });
+    }
+    if (hasObservationWork(run)) startAuditMonitor();
+    if (run.uploadManualPause) return;
+    const dueAt = Number(run.rateLimitPauseUntil || 0);
+    if (dueAt > Date.now()) scheduleRateLimitResume(run.operationId, dueAt);
+    else await resumeAfterRateLimitPause();
+    return;
+  }
   const batchRecoveryStage = String(run.stalledBatchRecovery?.stage || '').toUpperCase();
   const preparationStallWaiting = run.stalledBatchRecovery?.kind === 'PREPARATION_STALL'
     && batchRecoveryStage === 'WAITING';
@@ -383,14 +619,14 @@ async function rehydrateWorkerWake() {
   if (run.state === 'PAUSED' && preparationStallWaiting
     && !hasObservationWork(run) && !hasScheduledRunRetries(run, stored.queue)) return;
   const conversationStage = String(run.conversationRecovery?.stage || '').toUpperCase();
-  if (conversationStage === 'INSPECTING') {
+  if (conversationStage === 'INSPECTING' && canResumeConversationRecovery(run)) {
     void beginConversationLoadRecovery(run.operationId, {
       slotId: run.conversationRecovery?.triggerSlotId,
       entryId: run.conversationRecovery?.triggerEntryId
     });
     return;
   }
-  if (['WAITING', 'REOPENING'].includes(conversationStage)) {
+  if (['WAITING', 'REOPENING'].includes(conversationStage) && canResumeConversationRecovery(run)) {
     void (async () => {
       await closeConversationRecoveryTabs(run.operationId);
       if (conversationStage === 'WAITING' && Number(run.conversationRecovery.dueAt || 0) > Date.now()) {
@@ -455,6 +691,7 @@ async function rehydrateWorkerWake() {
 
   if (hasObservationWork(run)) startAuditMonitor();
   if (run.state !== 'RUNNING') return;
+  if (run.sessionRestartId) await resumeRestoredSessionAssignments();
   for (const slot of Object.values(run.slots || {})) {
     const unsubmitted = Boolean(slot.entryId)
       && !slot.generationSubmittedAt
@@ -503,6 +740,7 @@ function ensureSlotGenerationIdentity(run, slot, entry, generationMemory = null)
 function recordRunEvent(run, type, data = {}) {
   if (!run) return;
   const eventAtMs = Date.now();
+  noteSessionUsefulProgress(run, type, data, eventAtMs);
   if (type === 'run_stop_requested') stopRunClock(run, eventAtMs);
   else if (RUN_CLOCK_PAUSE_EVENTS.has(type)) pauseRunClock(run, eventAtMs);
   const events = Array.isArray(run.eventJournal) ? run.eventJournal : [];
@@ -538,6 +776,20 @@ function recordRunEvent(run, type, data = {}) {
   run.eventJournal = events.slice(-MAX_RUN_EVENTS);
   run.eventSequence = sequence;
   run.eventCount = sequence;
+}
+
+async function persistRunDiagnosticDecision(run, queue, force = false) {
+  if (!run?.operationId) return;
+  const events = run.eventJournal || [];
+  const importantSequence = Math.max(0, ...events
+    .filter(event => diagnosticCategoryForType(event.type) !== 'step')
+    .map(event => Number(event.sequence || 0)));
+  if (!force && importantSequence <= Number(diagnosticDecisionSequences.get(run.operationId) || 0)) return;
+  const snapshot = { operationId: run.operationId,
+    header: runDiagnosticHeader(run, queue, chrome.runtime.getManifest?.().version),
+    records: events.map(event => sanitizeRunDiagnosticEvent(event)) };
+  await diagnosticOutbox.persist(snapshot);
+  diagnosticDecisionSequences.set(run.operationId, importantSequence);
 }
 
 function scheduleRunDiagnosticsFlush(delayMs = RUN_DIAGNOSTICS_FLUSH_DELAY_MS) {
@@ -642,7 +894,16 @@ async function flushQueuedRunDiagnostics() {
       const state = runDiagnosticPersistenceState.get(operationId) || { persistedSequence: 0, failures: 0, retryAt: 0 };
       pendingRunDiagnosticSnapshots.delete(operationId);
       try {
-        await saveRunDiagnostics(snapshot.header, snapshot.records);
+        await diagnosticOutbox.persist(snapshot);
+        const drained = await diagnosticOutbox.drain();
+        const failure = drained.failures.find(item => item.operationId === operationId);
+        if (failure) throw new Error(failure.error);
+        const stillPending = await diagnosticOutbox.read(operationId);
+        if (stillPending) {
+          // A bounded/concurrent drain may not have reached this run yet.
+          // Keep the durable payload and retry without acknowledging it.
+          throw new Error('Архив диагностики ещё обрабатывает сохранённые события');
+        }
         const nextState = {
           ...state,
           persistedSequence: Math.max(Number(state.persistedSequence || 0), snapshot.maxSequence),
@@ -842,6 +1103,37 @@ async function verifyDownloadedArtifact(downloadItem, entry = null, fallbackVeri
   };
 }
 
+function normalizedArtifactProofPath(value) {
+  return String(value || '').trim().replaceAll('\\', '/').replace(/\/{2,}/g, '/').replace(/\/$/, '').toLowerCase();
+}
+
+function fileVerificationForCompletedArtifact({ verification, generationId, sourceId, outputPath, downloadItem = null }) {
+  const mode = String(verification?.verificationMode || '');
+  const actualHash = String(verification?.sha256 || '').toLowerCase();
+  const outputPathValue = String(outputPath || '');
+  const bytes = Number(verification?.sizeBytes ?? verification?.bytes ?? downloadItem?.fileSize ?? downloadItem?.bytesReceived ?? 0);
+  const validPngEvidence = verification?.valid === true && verification?.verified === true
+    && /^[a-f0-9]{64}$/.test(actualHash) && Number.isSafeInteger(bytes) && bytes > 0;
+  const watcherPathMatches = mode === 'watcher'
+    && normalizedArtifactProofPath(outputPathValue) === normalizedArtifactProofPath(downloadItem?.filename);
+  const fileSystemAccessReadback = mode === 'file-system-access'
+    && verification?.fileReadBackVerified === true
+    && verification?.exists === true && verification?.isFile === true
+    && normalizedArtifactProofPath(outputPathValue) === normalizedArtifactProofPath(verification?.outputPath);
+  const physicalProof = validPngEvidence && (watcherPathMatches || fileSystemAccessReadback);
+  return {
+    verified: physicalProof,
+    exists: physicalProof,
+    isFile: physicalProof,
+    sizeBytes: bytes,
+    generationId: String(generationId || ''),
+    sourceId: String(sourceId || ''),
+    outputPath: outputPathValue,
+    outputHash: actualHash,
+    verifiedAt: verification?.verifiedAt || verification?.checkedAt || new Date().toISOString()
+  };
+}
+
 function resetLaunchScheduler(operationId) {
   launchRunId = operationId;
   launchChain = Promise.resolve();
@@ -904,16 +1196,23 @@ function chatTabFingerprint(value) {
 }
 
 async function captureStalledBatchTabTargets(run) {
-  const slots = Object.values(run?.slots || {}).filter((slot) => Number(slot?.tabId || 0) > 0);
-  const targets = await Promise.all(slots.map(async (slot) => {
-    const tabId = Number(slot.tabId);
+  const candidates = [
+    ...Object.values(run?.slots || {}).filter((slot) => Number(slot?.tabId || 0) > 0)
+      .map((slot) => ({ ...slot, ownerType: 'slot' })),
+    ...Object.values(run?.postprocessTabs || {}).filter((owner) => Number(owner?.tabId || 0) > 0)
+      .map((owner) => ({ ...owner, ownerType: 'postprocess' }))
+  ];
+  const unique = new Map(candidates.map((candidate) => [Number(candidate.tabId), candidate]));
+  const targets = await Promise.all([...unique.values()].map(async (candidate) => {
+    const tabId = Number(candidate.tabId);
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     const url = String(tab?.url || tab?.pendingUrl || '');
     if (!tab || !/^https:\/\/chatgpt\.com\//i.test(url)) return null;
     return {
       tabId,
-      slotId: Number(slot.slotId),
-      entryId: slot.entryId || null,
+      slotId: Number.isFinite(Number(candidate.slotId)) ? Number(candidate.slotId) : null,
+      entryId: candidate.entryId || null,
+      ownerType: candidate.ownerType,
       windowId: Number(tab.windowId || 0) || null,
       urlFingerprint: chatTabFingerprint(url)
     };
@@ -1100,7 +1399,8 @@ async function schedulePreparationStallRecovery(operationId, entryIds = []) {
     const run = stored.run;
     if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)
       || run.clockStopped || run.stopBlocked
-      || ['USER', 'RESTART', 'IMAGE_LIMIT'].includes(run.pauseReason)) return { skipped: true };
+      || ['USER', 'RESTART', 'IMAGE_LIMIT', 'UPLOAD_LIMIT'].includes(run.pauseReason)
+      || run.uploadCooldownActive) return { skipped: true };
     const recovery = run.stalledBatchRecovery;
     if (['CLOSING', 'WAITING', 'RESTARTING'].includes(recovery?.stage)) {
       return recovery.kind === 'PREPARATION_STALL' ? { scheduled: true } : { skipped: true };
@@ -1109,7 +1409,7 @@ async function schedulePreparationStallRecovery(operationId, entryIds = []) {
     const exhausted = attempts >= MAX_AUTOMATIC_PREPARATION_RECOVERIES;
     run.preparationRecoveryAttempts = exhausted ? attempts : attempts + 1;
     run.stalledBatchRecovery = {
-      kind: 'PREPARATION_STALL', stage: 'CLOSING',
+      kind: 'PREPARATION_STALL', stage: exhausted ? 'UPLOAD_COOLDOWN' : 'CLOSING',
       attempts: run.preparationRecoveryAttempts, exhausted,
       triggeredAt: new Date().toISOString(), dueAt: null,
       triggerEntryIds: [...new Set(entryIds.map(String))]
@@ -1123,9 +1423,14 @@ async function schedulePreparationStallRecovery(operationId, entryIds = []) {
     });
     await saveRunAndQueue(run, stored.queue);
     await publishRun(run, stored.queue);
-    return { scheduled: !exhausted, terminal: exhausted };
+    return { scheduled: true, cooldown: exhausted };
   });
-  if (!plan.skipped) {
+  if (plan.cooldown) {
+    await pauseForUploadLimit(operationId, {
+      inferred: true, text: 'Повторяющийся сбой прикрепления фотографий после двух попыток восстановления',
+      resumeAtMs: Date.now() + UPLOAD_BACKOFF_MS
+    });
+  } else if (!plan.skipped) {
     scheduleStalledBatchRecovery(operationId, Date.now() + 5000);
     await resumePreparationStallRecovery();
   }
@@ -1145,6 +1450,12 @@ async function resumePreparationStallRecovery() {
     let run = initial.run;
     if (run.clockStopped || run.stopBlocked || run.pauseReason !== 'ERROR'
       || run.state !== 'PAUSED') return { skipped: true };
+    if (run.stalledBatchRecovery.exhausted && ['CLOSING', 'FAILED'].includes(run.stalledBatchRecovery.stage)) {
+      await pauseForUploadLimit(operationId, { inferred: true,
+        text: 'Повторяющийся сбой прикрепления фотографий после двух попыток восстановления',
+        resumeAtMs: Date.now() + UPLOAD_BACKOFF_MS });
+      return { cooldown: true };
+    }
     if (run.stalledBatchRecovery.stage === 'CLOSING') {
       // pauseRun releases only conclusively unsent drafts; real Send leases,
       // downloads and verified results retain their existing ownership.
@@ -1216,13 +1527,15 @@ async function restoreStalledBatchRecovery(operationId) {
 
 async function closeConversationRecoveryTabs(operationId) {
   const { run } = await getStored();
-  if (!run || run.operationId !== operationId) return { closed: 0 };
+  if (!run || run.operationId !== operationId || !canResumeConversationRecovery(run)) return { closed: 0 };
   const stage = String(run.conversationRecovery?.stage || '').toUpperCase();
   if (!['WAITING', 'REOPENING'].includes(stage)) return { closed: 0 };
   const tabs = Array.isArray(run.conversationRecovery?.closeTabs) ? run.conversationRecovery.closeTabs : [];
   const failures = [];
   let closed = 0;
   for (const saved of tabs) {
+    const current = (await getStored()).run;
+    if (current?.operationId !== operationId || !canResumeConversationRecovery(current)) return { closed };
     const tabId = Number(saved?.tabId || 0);
     if (!tabId) continue;
     const tab = await chrome.tabs.get(tabId).catch(() => null);
@@ -1245,7 +1558,7 @@ async function failConversationLoadRecovery(operationId, message, { attempt = nu
   await withStateLock(async () => {
     const stored = await getStored();
     const run = stored.run;
-    if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)) return;
+    if (!run || run.operationId !== operationId || conversationRecoveryPauseBlocked(run)) return;
     const previous = run.conversationRecovery || {};
     run.conversationRecovery = {
       ...previous,
@@ -1293,7 +1606,7 @@ async function beginConversationLoadRecovery(operationId, signal = null) {
 async function beginConversationLoadRecoveryInternal(operationId, signal = null) {
   let initial = await getStored();
   let run = initial.run;
-  if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)) return { skipped: true };
+  if (!run || run.operationId !== operationId || conversationRecoveryPauseBlocked(run)) return { skipped: true };
   let previousRecovery = run.conversationRecovery || {};
   let previousStage = String(previousRecovery.stage || '').toUpperCase();
   if (['WAITING', 'REOPENING', 'FAILED'].includes(previousStage)) return { skipped: true, stage: previousStage };
@@ -1309,7 +1622,7 @@ async function beginConversationLoadRecoveryInternal(operationId, signal = null)
     const claimed = await withStateLock(async () => {
       const stored = await getStored();
       const current = stored.run;
-      if (!current || current.operationId !== operationId || ['DONE', 'STOPPED'].includes(current.state)) return false;
+      if (!current || current.operationId !== operationId || conversationRecoveryPauseBlocked(current)) return false;
       const stage = String(current.conversationRecovery?.stage || '').toUpperCase();
       if (['INSPECTING', 'WAITING', 'REOPENING', 'FAILED'].includes(stage)) return false;
       current.conversationRecovery = {
@@ -1406,7 +1719,7 @@ async function beginConversationLoadRecoveryInternal(operationId, signal = null)
   const commit = await withStateLock(async () => {
     const stored = await getStored();
     const currentRun = stored.run;
-    if (!currentRun || currentRun.operationId !== operationId || ['DONE', 'STOPPED'].includes(currentRun.state)) return null;
+    if (!currentRun || currentRun.operationId !== operationId || conversationRecoveryPauseBlocked(currentRun)) return null;
     const stage = String(currentRun.conversationRecovery?.stage || '').toUpperCase();
     if (['WAITING', 'REOPENING', 'FAILED'].includes(stage)) return null;
     const history = normalizeHistory(stored.history);
@@ -1503,9 +1816,7 @@ async function beginConversationLoadRecoveryInternal(operationId, signal = null)
     }
     const protectedIds = new Set(recoverySlots.map((item) => item.entryId));
     const plannedIds = new Set(Array.isArray(currentRun.plannedIds) ? currentRun.plannedIds : []);
-    currentRun.pendingIds = currentEntries
-      .filter((entry) => plannedIds.has(entry.sourceId) && entry.status !== 'done' && !protectedIds.has(entry.sourceId))
-      .map((entry) => entry.sourceId);
+    currentRun.pendingIds = pendingPlannedIds(currentRun, currentEntries, protectedIds);
     const now = Date.now();
     currentRun.conversationRecovery = {
       stage: 'WAITING',
@@ -1570,12 +1881,25 @@ async function beginConversationLoadRecoveryInternal(operationId, signal = null)
   return { waiting: true, dueAt: current.run?.conversationRecovery?.dueAt || null };
 }
 
+function conversationRecoveryPauseBlocked(run) {
+  return !run || ['DONE', 'STOPPED'].includes(run.state) || run.clockStopped || Boolean(run.stopBlocked)
+    || ['USER', 'RESTART', 'IMAGE_LIMIT', 'UPLOAD_LIMIT'].includes(run.pauseReason)
+    || run.imageLimitDetected || run.uploadCooldownActive || run.uploadManualPause
+    || Number(run.rateLimitPauseUntil || 0) > Date.now();
+}
+
+function canResumeConversationRecovery(run) {
+  return Boolean(run && run.state === 'PAUSED' && run.pauseReason === 'CONVERSATION_LOAD'
+    && !conversationRecoveryPauseBlocked(run));
+}
+
 async function resumeConversationLoadRecovery(operationId = null) {
   const initial = await getStored();
   const run = initial.run;
   const recovery = run?.conversationRecovery;
   const stage = String(recovery?.stage || '').toUpperCase();
-  if (!run || (operationId && run.operationId !== operationId) || !['WAITING', 'REOPENING'].includes(stage)) return { skipped: true };
+  if (!run || (operationId && run.operationId !== operationId) || !canResumeConversationRecovery(run)
+    || !['WAITING', 'REOPENING'].includes(stage)) return { skipped: true };
   if (stage === 'WAITING' && Number(recovery.dueAt || 0) > Date.now()) {
     scheduleConversationLoadRecovery(run.operationId, recovery.dueAt);
     return { waiting: true, dueAt: recovery.dueAt };
@@ -1584,7 +1908,7 @@ async function resumeConversationLoadRecovery(operationId = null) {
   await closeConversationRecoveryTabs(run.operationId);
   await withStateLock(async () => {
     const stored = await getStored();
-    if (!stored.run || stored.run.operationId !== run.operationId) return;
+    if (!stored.run || stored.run.operationId !== run.operationId || !canResumeConversationRecovery(stored.run)) return;
     const currentStage = String(stored.run.conversationRecovery?.stage || '').toUpperCase();
     if (!['WAITING', 'REOPENING'].includes(currentStage)) return;
     stored.run.conversationRecovery.stage = 'REOPENING';
@@ -1597,12 +1921,13 @@ async function resumeConversationLoadRecovery(operationId = null) {
   try {
     const host = await ensureAutomationWindow(run.operationId);
     const latest = await getStored();
+    if (latest.run?.operationId !== run.operationId || !canResumeConversationRecovery(latest.run)) return { skipped: true };
     const snapshotSlots = latest.run?.conversationRecovery?.slots || [];
     const opened = [];
     for (let index = 0; index < snapshotSlots.length; index += 1) {
       const saved = snapshotSlots[index];
       const current = await getStored();
-      if (current.run?.operationId !== run.operationId
+      if (current.run?.operationId !== run.operationId || !canResumeConversationRecovery(current.run)
         || String(current.run.conversationRecovery?.stage || '').toUpperCase() !== 'REOPENING') return { skipped: true };
       const slot = current.run.slots?.[saved.slotId];
       if (!slot || slot.entryId !== saved.entryId) continue;
@@ -1611,14 +1936,16 @@ async function resumeConversationLoadRecovery(operationId = null) {
       if (!wantedUrl) throw new Error(`У слота ${Number(saved.slotId) + 1} нет сохранённой ссылки на разговор.`);
       if (!tab || normalizeChatConversationUrl(tab.url || tab.pendingUrl) !== wantedUrl) {
         if (index > 0) await sleep(900);
+        const beforeOpen = (await getStored()).run;
+        if (beforeOpen?.operationId !== run.operationId || !canResumeConversationRecovery(beforeOpen)) return { skipped: true };
         tab = await chrome.tabs.create({
           windowId: host.windowId,
           url: automationConversationUrl(wantedUrl),
           active: false
         });
-        await withStateLock(async () => {
+        const attached = await withStateLock(async () => {
           const stored = await getStored();
-          if (stored.run?.operationId !== run.operationId
+          if (stored.run?.operationId !== run.operationId || !canResumeConversationRecovery(stored.run)
             || String(stored.run.conversationRecovery?.stage || '').toUpperCase() !== 'REOPENING') return;
           const latestSlot = stored.run.slots?.[saved.slotId];
           if (!latestSlot || latestSlot.entryId !== saved.entryId) return;
@@ -1634,7 +1961,12 @@ async function resumeConversationLoadRecovery(operationId = null) {
             recoverySlot.reopenedAt = new Date().toISOString();
           }
           await saveRunAndQueue(stored.run, stored.queue);
+          return true;
         });
+        if (!attached) {
+          await chrome.tabs.remove(tab.id).catch(() => {});
+          return { skipped: true };
+        }
       }
       await waitTabReady(tab.id, 90000);
       await markTabAsAutomation(tab.id, {
@@ -1677,7 +2009,7 @@ async function resumeConversationLoadRecovery(operationId = null) {
 
     await withStateLock(async () => {
       const stored = await getStored();
-      if (!stored.run || stored.run.operationId !== run.operationId) return;
+      if (!stored.run || stored.run.operationId !== run.operationId || !canResumeConversationRecovery(stored.run)) return;
       const currentRecovery = stored.run.conversationRecovery;
       if (String(currentRecovery?.stage || '').toUpperCase() !== 'REOPENING') return;
       for (const item of probes) {
@@ -1708,6 +2040,9 @@ async function resumeConversationLoadRecovery(operationId = null) {
       await saveRunAndQueue(stored.run, stored.queue);
       await publishRun(stored.run, stored.queue);
     });
+    const finished = (await getStored()).run;
+    if (finished?.operationId !== run.operationId || !canResumeConversationRecovery(finished)
+      || finished.conversationRecovery?.stage !== 'COMPLETED') return { skipped: true };
     if (chrome.alarms?.clear) await chrome.alarms.clear(CONVERSATION_LOAD_RECOVERY_ALARM_NAME).catch(() => {});
     await resumeRun({ conversationRecoveryInternal: true });
     await appendLog('Сохранённые разговоры восстановлены; генерационные промпты повторно не отправлялись', {
@@ -1832,6 +2167,14 @@ async function updateFactsStage(message, sender, overrides = {}) {
       postprocessOwner.baselineAssistantCount = run.factsProgress[factsJobId].baselineAssistantCount;
       postprocessOwner.baselineUserCount = run.factsProgress[factsJobId].baselineUserCount;
     }
+    if (!previous || previous.stage !== stage || previous.error !== run.factsProgress[factsJobId].error
+      || Number(previous.waitUntil || 0) !== Number(run.factsProgress[factsJobId].waitUntil || 0)) {
+      recordRunEvent(run, 'facts_stage', { entryId, generationId: generationIdValue,
+        factsJobId, slotId, tabId: stageTabId, stage,
+        waitUntil: run.factsProgress[factsJobId].waitUntil, error: run.factsProgress[factsJobId].error });
+      queueRunDiagnostics(run);
+      await persistRunDiagnosticDecision(run, null).catch(() => {});
+    }
     await chrome.storage.local.set({ run });
     summary = factsProgressSummaries(run);
   });
@@ -1857,7 +2200,8 @@ async function requestFactsSendPermit(message, sender) {
   const task = physicalSendChain.then(async () => {
     const first = await chrome.storage.local.get('run');
     const run = first.run;
-    if (!run || run.operationId !== operationId || !['RUNNING', 'DRAINING', 'PAUSED'].includes(run.state)) {
+    if (!run || run.operationId !== operationId || run.pauseReason === 'SESSION_RESTART'
+      || !['RUNNING', 'DRAINING', 'PAUSED'].includes(run.state)) {
       throw new Error('Постпроверка отменена: запуск больше не активен');
     }
     const ownedBySlot = Object.values(run.slots || {}).some((slot) => slot?.entryId === entryId && slot?.factsJobId === factsJobId);
@@ -1882,7 +2226,8 @@ async function requestFactsSendPermit(message, sender) {
       await sleep(waitMs);
     }
     const latest = await chrome.storage.local.get('run');
-    if (!latest.run || latest.run.operationId !== operationId || !['RUNNING', 'DRAINING', 'PAUSED'].includes(latest.run.state)) {
+    if (!latest.run || latest.run.operationId !== operationId || latest.run.pauseReason === 'SESSION_RESTART'
+      || !['RUNNING', 'DRAINING', 'PAUSED'].includes(latest.run.state)) {
       throw new Error('Постпроверка отменена перед Send');
     }
     const latestPauseUntil = Number(latest.run.rateLimitPauseUntil || 0);
@@ -2033,6 +2378,92 @@ async function pauseNewLaunchesForRateLimit(operationId, details = {}) {
   return pauseUntil;
 }
 
+function imageLimitResumeAt(text, now = Date.now()) {
+  return parsedImageLimitResumeAt(text, now) || imageLimitFallbackResumeAt(text, now);
+}
+
+// Upload refusals happen before Send. Release drafts while keeping submitted
+// requests under observation; an upload outage must not discard their images.
+function pauseForUploadLimit(operationId, details = {}) {
+  const inFlight = uploadLimitTasks.get(operationId);
+  if (inFlight) {
+    // A full storage is a stronger, manual-only condition. Do not discard it
+    // while a timed sweep is in progress. New Sends are already paused.
+    if (details.autoResume === false) {
+      return inFlight.catch(() => null).then(() => pauseForUploadLimit(operationId, details));
+    }
+    return inFlight;
+  }
+  const task = (async () => {
+    let deadline = null;
+    let pauseReason = 'UPLOAD_LIMIT';
+    let accepted = false;
+    await withStateLock(async () => {
+      const stored = await getStored();
+      const run = stored.run;
+      if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)
+        || run.clockStopped || run.stopBlocked) return;
+      accepted = true;
+      const manual = details.autoResume === false || run.uploadManualPause === true;
+      const existing = Number(run.rateLimitPauseUntil || 0);
+      const requested = Number(details.resumeAtMs || 0) || (details.inferred === true
+        ? Date.now() + UPLOAD_BACKOFF_MS : uploadLimitResumeAt(details.text));
+      deadline = manual ? null : (run.uploadCooldownActive && existing > Date.now()
+        ? existing : Math.max(existing, requested || Date.now() + UPLOAD_BACKOFF_MS));
+      pauseReason = run.pauseReason === 'USER' ? 'USER' : 'UPLOAD_LIMIT';
+      run.uploadCooldownActive = true;
+      run.uploadPauseSettled = false;
+      run.uploadLimitDetected = run.uploadLimitDetected === true || details.inferred !== true;
+      run.uploadManualPause = manual;
+      run.rateLimitPauseUntil = deadline;
+      run.rateLimitPauseStartedAt ||= new Date().toISOString();
+      run.rateLimitReason = details.text || 'Фотографии не прикрепляются к ChatGPT';
+      run.rateLimitIgnoreUntil = null;
+      run.state = 'PAUSED';
+      run.pauseReason = pauseReason;
+      run.status = deadline ? 'RATE_LIMIT_PAUSE' : 'PAUSED_ON_ERROR';
+      run.stalledBatchRecovery = run.stalledBatchRecovery
+        ? { ...run.stalledBatchRecovery, stage: 'UPLOAD_COOLDOWN', dueAt: deadline } : null;
+      if (run.conversationRecovery && ['INSPECTING', 'WAITING', 'REOPENING'].includes(run.conversationRecovery.stage)) {
+        run.conversationRecovery.stage = 'CANCELLED_BY_QUOTA';
+      }
+      recordRunEvent(run, details.inferred === true ? 'upload_backoff_pause' : 'upload_limit_pause', {
+        until: deadline, inferred: details.inferred === true, manual, text: run.rateLimitReason,
+        slotId: details.slotId ?? null, attempts: Number(run.preparationRecoveryAttempts || 0)
+      });
+      await saveRunAndQueue(run, stored.queue);
+      await publishRun(run, stored.queue);
+    });
+    if (!accepted) return null;
+    await pauseRun(pauseReason, operationId);
+    await withStateLock(async () => {
+      const stored = await getStored();
+      const run = stored.run;
+      if (!run || run.operationId !== operationId || !run.uploadCooldownActive
+        || run.clockStopped || run.stopBlocked || ['STOPPED', 'DONE'].includes(run.state)) return;
+      const userPaused = run.pauseReason === 'USER';
+      run.uploadPauseSettled = true;
+      run.currentAction = run.uploadManualPause
+        ? 'ChatGPT отказал в загрузке: хранилище файлов заполнено. Освободи место в ChatGPT и нажми «Продолжить».'
+        : `${details.inferred === true ? 'Фотографии не прикрепляются' : 'Лимит загрузки файлов'}. Очередь сохранена; ${userPaused ? 'пауза пользователя сохраняется' : `повторю загрузку в ${clockTime(deadline)}`}. Уже отправленные генерации досматриваются.`;
+      run.status = hasObservationWork(run) ? 'PAUSED_RECOVERING'
+        : (run.uploadManualPause ? 'PAUSED_ON_ERROR' : (deadline ? 'RATE_LIMIT_PAUSE' : 'PAUSED_ON_ERROR'));
+      await saveRunAndQueue(run, stored.queue);
+      await publishRun(run, stored.queue);
+    });
+    const latest = (await getStored()).run;
+    if (latest?.operationId === operationId && !latest.clockStopped && !latest.stopBlocked
+      && !['STOPPED', 'DONE'].includes(latest.state)) {
+      if (latest.uploadManualPause) {
+        if (chrome.alarms?.clear) await chrome.alarms.clear(RATE_LIMIT_RESUME_ALARM_NAME).catch(() => {});
+      } else if (deadline) scheduleRateLimitResume(operationId, deadline);
+    }
+    return deadline;
+  })().finally(() => uploadLimitTasks.delete(operationId));
+  uploadLimitTasks.set(operationId, task);
+  return task;
+}
+
 function pauseForImageLimit(operationId, details, parsedResumeAt) {
   const existing = imageLimitTasks.get(operationId);
   if (existing) return existing;
@@ -2042,17 +2473,19 @@ function pauseForImageLimit(operationId, details, parsedResumeAt) {
     await withStateLock(async () => {
       const stored = await getStored();
       const { run, queue } = stored;
-      if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)) return;
+      if (!run || run.operationId !== operationId || ['DONE', 'STOPPED'].includes(run.state)
+        || run.clockStopped || run.stopBlocked) return;
       if (run.imageLimitDetected === true
         && !Object.values(run.slots || {}).some((slot) => slot.entryId && !slot.downloadId)) {
         pauseUntil = Number(run.rateLimitPauseUntil || 0);
         alreadySettled = true;
         return;
       }
-      const existingImageDeadline = run.imageLimitDetected === true
-        ? Number(run.rateLimitPauseUntil || 0) : 0;
-      pauseUntil = Math.max(existingImageDeadline, parsedResumeAt,
-        parsedResumeAt <= Date.now() ? Date.now() + 60000 : 0);
+      const existingImageDeadline = Number(run.rateLimitPauseUntil || 0);
+      const requestedDeadline = run.imageLimitDetected && existingImageDeadline > Date.now()
+        ? existingImageDeadline : parsedResumeAt;
+      pauseUntil = Math.max(existingImageDeadline, requestedDeadline,
+        requestedDeadline <= Date.now() ? Date.now() + 60000 : 0);
       run.state = 'PAUSED';
       run.status = 'RATE_LIMIT_PAUSE';
       run.pauseReason = run.pauseReason === 'USER' ? 'USER' : 'IMAGE_LIMIT';
@@ -2061,6 +2494,10 @@ function pauseForImageLimit(operationId, details, parsedResumeAt) {
       run.rateLimitPauseStartedAt ||= new Date().toISOString();
       run.rateLimitReason = details.text || 'Достигнут лимит создания изображений';
       run.rateLimitIgnoreUntil = null;
+      if (run.conversationRecovery && ['INSPECTING', 'WAITING', 'REOPENING'].includes(run.conversationRecovery.stage)) {
+        run.conversationRecovery.stage = 'CANCELLED_BY_QUOTA';
+        run.conversationRecovery.dueAt = null;
+      }
       run.currentAction = `Лимит изображений. Проверяю готовые результаты; очередь возобновится в ${clockTime(pauseUntil)}`;
       run.lastActivityAt = new Date().toISOString();
       recordRunEvent(run, 'image_limit_pause', {
@@ -2089,7 +2526,8 @@ function pauseForImageLimit(operationId, details, parsedResumeAt) {
     const released = await withStateLock(async () => {
       const stored = await getStored();
       const { run, queue } = stored;
-      if (!run || run.operationId !== operationId || run.imageLimitDetected !== true) return null;
+      if (!run || run.operationId !== operationId || run.imageLimitDetected !== true
+        || run.clockStopped || run.stopBlocked || ['STOPPED', 'DONE'].includes(run.state)) return null;
       const history = normalizeHistory(stored.history);
       const memory = normalizeGenerationMemory(stored.generationMemory);
       const entries = groupEntries(queue, run.groupId);
@@ -2098,6 +2536,15 @@ function pauseForImageLimit(operationId, details, parsedResumeAt) {
       const returned = [];
       for (const slot of Object.values(run.slots || {})) {
         if (!slot.entryId || slot.downloadId) continue;
+        // A quota in one conversation is not evidence that another submitted
+        // image failed. Retain its lease and keep looking for its result.
+        if (slotGenerationSubmitted(slot) && Number(slot.slotId) !== Number(details.slotId ?? -1)) {
+          slot.status = 'OBSERVING';
+          slot.phase = SLOT_PHASES.OBSERVING;
+          slot.finalCheckPending = true;
+          slot.finalCheckDeadlineAt ||= finalCheckDeadline();
+          continue;
+        }
         const entry = entries.find((item) => item.sourceId === slot.entryId);
         if (slot.tabId) tabIds.push(slot.tabId);
         if (entry?.status !== 'done') {
@@ -2130,9 +2577,10 @@ function pauseForImageLimit(operationId, details, parsedResumeAt) {
       }
       const planned = new Set(run.plannedIds || []);
       const occupied = new Set(Object.values(run.slots || {}).map((slot) => slot.entryId).filter(Boolean));
-      run.pendingIds = entries.filter((entry) => planned.has(entry.sourceId)
-        && entry.status !== 'done' && !occupied.has(entry.sourceId)).map((entry) => entry.sourceId);
+      run.pendingIds = pendingPlannedIds(run, entries, occupied);
       run.currentAction = `Лимит изображений. ${returned.length} моделей возвращено в очередь. Продолжу в ${clockTime(pauseUntil)}`;
+      if (run.pauseReason === 'USER') run.currentAction = 'Лимит изображений. Очередь остаётся на твоей паузе.';
+      if (run.uploadManualPause) run.currentAction = 'Хранилище ChatGPT заполнено. Освободи место и нажми «Продолжить».';
       recordRunEvent(run, 'image_limit_requeued', { entryIds: returned });
       await saveRunAndQueue(run, queue, history, memory);
       await publishRun(run, queue);
@@ -2150,6 +2598,8 @@ function pauseForImageLimit(operationId, details, parsedResumeAt) {
       await chrome.tabs.remove(tabId).catch(() => null);
     }));
     await closeAutomationWindowIfEmpty(operationId);
+    const latest = (await getStored()).run;
+    if (latest?.operationId === operationId && hasObservationWork(latest)) startAuditMonitor();
     await appendLog('Лимит создания изображений: незавершённые модели возвращены в очередь', {
       until: new Date(pauseUntil).toISOString(), returned: released.returned.length
     });
@@ -2160,7 +2610,7 @@ function pauseForImageLimit(operationId, details, parsedResumeAt) {
 }
 
 function armRateLimitIgnoreWindow(run, pauseStartedAt = run?.rateLimitPauseStartedAt, now = Date.now()) {
-  if (!run) return false;
+  if (!run || run.imageLimitDetected || run.uploadCooldownActive || run.uploadLimitDetected) return false;
   const pauseKey = String(pauseStartedAt || run.rateLimitPauseUntil || '');
   if (run.rateLimitIgnoreAfterPause === pauseKey) return false;
   const ignoreMinutes = normalizeRateLimitIgnoreMinutes(run.rateLimitIgnoreMinutes);
@@ -2180,11 +2630,13 @@ function armRateLimitIgnoreWindow(run, pauseStartedAt = run?.rateLimitPauseStart
 }
 
 async function ignoreRateLimitDuringWindow(operationId, details = {}) {
+  if (isUploadLimitText(details.text) || isStorageLimitText(details.text) || isImageLimitText(details.text)) return false;
   let ignored = false;
   await withStateLock(async () => {
     const stored = await getStored();
     const { run, queue } = stored;
-    if (!run || run.operationId !== operationId) return;
+    if (!run || run.operationId !== operationId || run.imageLimitDetected
+      || run.uploadCooldownActive || run.uploadLimitDetected || run.uploadManualPause) return;
     const now = Date.now();
     const expiredPause = Number(run.rateLimitPauseUntil || 0);
     const pauseKey = String(run.rateLimitPauseStartedAt || expiredPause || '');
@@ -2249,6 +2701,7 @@ async function waitForRateLimitClear(operationId) {
         current.run.status = hasUnresolvedSlotErrors(current.run) ? 'RUNNING_WITH_ERRORS' : 'RUNNING';
         current.run.currentAction = 'Ограничение снято. Продолжаю очередь.';
         current.run.lastActivityAt = new Date().toISOString();
+        recordRunEvent(current.run, 'rate_limit_resume', { source: 'launch_waiter', paused: false, quota: false });
         await saveRunAndQueue(current.run, current.queue);
         await publishRun(current.run, current.queue);
       });
@@ -2264,12 +2717,13 @@ async function resumeAfterRateLimitPause() {
 
   // The alarm can fire while the image-limit sweep is still downloading a
   // finished result and returning the remaining slots to the queue.
-  if (imageLimitTasks.has(initialRun.operationId)) {
+  if (imageLimitTasks.has(initialRun.operationId) || uploadLimitTasks.has(initialRun.operationId)) {
     scheduleRateLimitResume(initialRun.operationId, Date.now() + 5000);
     return;
   }
 
   const pauseUntil = Number(initialRun.rateLimitPauseUntil || 0);
+  if (initialRun.uploadManualPause) return;
   if (!pauseUntil) return;
   if (pauseUntil > Date.now()) {
     scheduleRateLimitResume(initialRun.operationId, pauseUntil);
@@ -2282,31 +2736,50 @@ async function resumeAfterRateLimitPause() {
     const stored = await getStored();
     const run = stored.run;
     if (!run || run.operationId !== initialRun.operationId || ['STOPPED', 'DONE'].includes(run.state)) return;
+    if (run.uploadManualPause || run.clockStopped || run.stopBlocked) return;
+    if (imageLimitTasks.has(run.operationId) || uploadLimitTasks.has(run.operationId)) {
+      scheduleRateLimitResume(run.operationId, Date.now() + 5000);
+      return;
+    }
     const currentPauseUntil = Number(run.rateLimitPauseUntil || 0);
     if (currentPauseUntil > Date.now()) {
       scheduleRateLimitResume(run.operationId, currentPauseUntil);
       return;
     }
 
-    const wasImageLimit = run.imageLimitDetected === true;
-    if (!wasImageLimit) {
+    const wasQuotaLimit = run.imageLimitDetected === true || run.uploadCooldownActive === true || run.uploadLimitDetected === true;
+    if (!wasQuotaLimit) {
       armRateLimitIgnoreWindow(run, run.rateLimitPauseStartedAt || currentPauseUntil);
     }
     run.imageLimitDetected = false;
+    if (run.uploadCooldownActive) {
+      run.preparationRecoveryAttempts = 0;
+      run.attachmentFailureBaselineAt = new Date().toISOString();
+      if (run.stalledBatchRecovery?.stage === 'UPLOAD_COOLDOWN') run.stalledBatchRecovery.stage = 'COMPLETED';
+    }
+    run.uploadCooldownActive = false;
+    run.uploadPauseSettled = false;
+    run.uploadLimitDetected = false;
+    run.uploadManualPause = false;
     run.rateLimitPauseUntil = null;
     run.rateLimitPauseStartedAt = null;
     run.rateLimitReason = null;
     run.rateLimitPauseMinutes = normalizeRateLimitPauseMinutes(run.rateLimitPauseMinutes);
     const pausedByUserOrRestart = run.state === 'PAUSED'
       && ['USER', 'RESTART'].includes(String(run.pauseReason || '').toUpperCase());
-    run.status = pausedByUserOrRestart
+    const pausedByRecovery = run.state === 'PAUSED' && run.pauseReason === 'ERROR'
+      && ['CLOSING', 'WAITING', 'RESTARTING'].includes(run.stalledBatchRecovery?.stage);
+    const keepPaused = pausedByUserOrRestart || pausedByRecovery || run.clockStopped || Boolean(run.stopBlocked)
+      || (run.pauseReason === 'CONVERSATION_LOAD'
+        && ['INSPECTING', 'WAITING', 'REOPENING'].includes(run.conversationRecovery?.stage));
+    run.status = keepPaused
       ? (hasObservationWork(run) ? 'PAUSED_RECOVERING' : 'PAUSED')
       : (hasUnresolvedSlotErrors(run) ? 'RUNNING_WITH_ERRORS' : 'RUNNING');
-    run.currentAction = pausedByUserOrRestart
+    run.currentAction = keepPaused
       ? 'Ограничение снято. Очередь остаётся на паузе; уже отправленные генерации продолжаю досматривать.'
       : 'Ограничение снято. Возобновляю очередь.';
     run.lastActivityAt = new Date().toISOString();
-    recordRunEvent(run, 'rate_limit_resume', { paused: pausedByUserOrRestart });
+    recordRunEvent(run, 'rate_limit_resume', { paused: keepPaused, quota: wasQuotaLimit });
     for (const slot of Object.values(run.slots || {})) {
       const unsubmitted = Boolean(slot.entryId)
         && !slot.generationSubmittedAt
@@ -2315,7 +2788,7 @@ async function resumeAfterRateLimitPause() {
       const persistedDeferredLaunch = slot.rateLimitRetryNeeded === true
         || slot.phase === SLOT_PHASES.RATE_LIMIT_PAUSE
         || (slot.preparedForSubmit === true && ['READY_TO_SEND', 'WAITING_LAUNCH', 'SENDING'].includes(String(slot.status || '').toUpperCase()));
-      if (!pausedByUserOrRestart && unsubmitted && persistedDeferredLaunch) {
+      if (!keepPaused && unsubmitted && persistedDeferredLaunch) {
         const prepared = slot.preparedForSubmit === true && Number(slot.tabId || 0) > 0;
         // Keep retryNeeded set until ChatGPT actually accepts the prompt. If
         // the MV3 worker is suspended again between this alarm and the click,
@@ -2342,7 +2815,7 @@ async function resumeAfterRateLimitPause() {
     ));
 
     if (run.state === 'PAUSED') {
-      restart = !['USER', 'RESTART'].includes(String(run.pauseReason || '').toUpperCase());
+      restart = !keepPaused;
     } else if (run.state === 'RUNNING' && !hasLiveSlotWork(run) && hasUnfinishedPlanned) {
       run.state = 'PAUSED';
       run.status = 'PAUSED_ON_ERROR';
@@ -2359,10 +2832,19 @@ async function resumeAfterRateLimitPause() {
     await publishRun(run, stored.queue);
   });
 
-  if (restart && !retryAssignments.length) {
-    await resumeRun();
+  if (restart) {
+    await resumeRun({ rateLimitRecoveryInternal: true });
   } else {
     const { run } = await getStored();
+    if (run?.pauseReason === 'CONVERSATION_LOAD' && !conversationRecoveryPauseBlocked(run)) {
+      const stage = String(run.conversationRecovery?.stage || '').toUpperCase();
+      if (stage === 'INSPECTING') {
+        await beginConversationLoadRecovery(run.operationId);
+      } else if (['WAITING', 'REOPENING'].includes(stage)) {
+        scheduleConversationLoadRecovery(run.operationId, Math.max(Date.now() + 1000,
+          Number(run.conversationRecovery?.dueAt || 0)));
+      }
+    }
     if (run && ['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)) startAuditMonitor();
     if (run && ['RUNNING', 'STARTING', 'DRAINING'].includes(run.state)) {
       for (const assignment of retryAssignments) {
@@ -2585,7 +3067,7 @@ function withStateLock(task) {
 async function getStored() {
   return chrome.storage.local.get([
     'job', 'queue', 'run', 'runtime', 'logs', 'lastDiagnostic', 'history', 'generationMemory', 'lastPreflight', 'domDiagnosticsMode',
-    'sessionResetIntent'
+    'sessionResetIntent', 'sessionRestartIntent', 'sessionRestartCancellation', 'manualExtensionUpdateLock', 'resultsImportJournal'
   ]);
 }
 
@@ -2801,6 +3283,7 @@ async function reconcileRunVerifiedRevisions(run, queue, history, generationMemo
   for (const [index, event] of events.entries()) {
     if (laterRejected.has(String(event.generationId))) continue;
     const revision = revisions[index];
+    if (revision?.supersededBySessionRestartId) continue;
     if (!verifiedRevisionMatchesEvent(event, revision, run.operationId)) continue;
     const factsProgress = Object.values(run.factsProgress || {}).find((item) => (
       String(item?.generationId || '') === String(revision.generationId)
@@ -2863,7 +3346,7 @@ async function reconcilePersistedCurrentRevisions(queue, history, generationMemo
     if (!generationIdValue) continue;
     const revision = await getGenerationRevision(generationIdValue).catch(() => null);
     if (!revision || String(revision.sourceId || '') !== String(model.skuKey || '')
-      || revision.reviewStatus === 'rejected'
+      || revision.reviewStatus === 'rejected' || revision.supersededBySessionRestartId
       || !revision.outputPath
       || !/^[a-f0-9]{64}$/i.test(String(revision.outputHash || ''))) continue;
     const entry = selectedEntries.get(String(model.skuKey));
@@ -3086,9 +3569,7 @@ async function releaseRetryableRecoveredSlots(runId, results, reason) {
     const entries = groupEntries(stored.queue, run.groupId);
     const plannedIds = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
     const protectedIds = new Set(Object.values(run.slots || {}).filter((slot) => slot.entryId).map((slot) => slot.entryId));
-    run.pendingIds = entries
-      .filter((entry) => plannedIds.has(entry.sourceId) && entry.status !== 'done' && !protectedIds.has(entry.sourceId))
-      .map((entry) => entry.sourceId);
+    run.pendingIds = pendingPlannedIds(run, entries, protectedIds);
     if (run.state === 'PAUSED' && !hasObservationWork(run)) {
       const userPaused = String(run.pauseReason || '').toUpperCase() === 'USER';
       run.status = userPaused ? 'PAUSED' : 'PAUSED_ON_RESTART';
@@ -3210,6 +3691,10 @@ async function reconcilePostprocessOwners(runSnapshot, reason = 'Перезап�
 
 async function recoverInterruptedRun(reason) {
   const startupSnapshot = await getStored();
+  if (startupSnapshot.sessionRestartIntent) {
+    await checkSessionWatchdog();
+    return;
+  }
   if (startupSnapshot.sessionResetIntent) {
     await resumeInterruptedSessionReset(startupSnapshot.sessionResetIntent);
     return;
@@ -3229,14 +3714,14 @@ async function recoverInterruptedRun(reason) {
   const initialRun = initial.run;
   const initialMemory = normalizeGenerationMemory(initial.generationMemory);
   const recoveryStage = String(initialRun?.conversationRecovery?.stage || '').toUpperCase();
-  if (initialRun && recoveryStage === 'INSPECTING') {
+  if (initialRun && recoveryStage === 'INSPECTING' && canResumeConversationRecovery(initialRun)) {
     await beginConversationLoadRecovery(initialRun.operationId, {
       slotId: initialRun.conversationRecovery?.triggerSlotId,
       entryId: initialRun.conversationRecovery?.triggerEntryId
     });
     return;
   }
-  if (initialRun && ['WAITING', 'REOPENING'].includes(recoveryStage)) {
+  if (initialRun && ['WAITING', 'REOPENING'].includes(recoveryStage) && canResumeConversationRecovery(initialRun)) {
     try {
       await closeConversationRecoveryTabs(initialRun.operationId);
     } catch (error) {
@@ -3309,26 +3794,27 @@ async function recoverInterruptedRun(reason) {
         runQueueMode: run.groupId === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular'
       });
       const planned = new Set(run.plannedIds || []);
-      run.pendingIds = groupEntries(queue, run.groupId)
-        .filter((entry) => planned.has(entry.sourceId) && entry.status !== 'done')
-        .map((entry) => entry.sourceId);
+      run.pendingIds = pendingPlannedIds(run, groupEntries(queue, run.groupId));
       clearResolvedRunError(run, queue);
-      const imageLimitWaiting = run.pauseReason === 'IMAGE_LIMIT' && Number(run.rateLimitPauseUntil || 0) > Date.now();
+      const imageLimitWaiting = (run.imageLimitDetected || run.uploadCooldownActive)
+        && Number(run.rateLimitPauseUntil || 0) > Date.now();
       const blockedRevisionCount = Object.values(run.slots || {}).filter((slot) => slot.revisionPersistBlocked).length;
       run.status = imageLimitWaiting ? 'RATE_LIMIT_PAUSE' : (blockedRevisionCount || hasUnresolvedSlotErrors(run) ? 'PAUSED_ON_ERROR' : 'PAUSED');
       run.currentAction = imageLimitWaiting
-        ? `Лимит изображений. Автоматически продолжу в ${clockTime(run.rateLimitPauseUntil)}`
+        ? `${run.uploadCooldownActive ? 'Пауза загрузки фотографий' : 'Лимит изображений'}. Автоматически продолжу в ${clockTime(run.rateLimitPauseUntil)}`
+        : (run.uploadManualPause ? 'Хранилище ChatGPT заполнено. Освободи место и нажми «Продолжить».'
         : (blockedRevisionCount
           ? `${blockedRevisionCount} PNG уже скачаны, но их ревизии требуют повтора записи. «Продолжить» повторит сохранение без генерации изображения.`
           : (run.pendingIds.length
             ? `Сохранённые результаты сверены. Осталось ${run.pendingIds.length} моделей; продолжение запустит только их.`
-            : 'Сохранённые результаты сверены. Очередь завершена.'));
+            : 'Сохранённые результаты сверены. Очередь завершена.')));
       await saveRunAndQueue(run, queue, history, memory);
       await publishRun(run, queue);
     });
-    if (initialRun.pauseReason === 'IMAGE_LIMIT' && Number(initialRun.rateLimitPauseUntil || 0) > Date.now()) {
+    if ((initialRun.imageLimitDetected || initialRun.uploadCooldownActive) && !initialRun.uploadManualPause
+      && Number(initialRun.rateLimitPauseUntil || 0) > Date.now()) {
       scheduleRateLimitResume(initialRun.operationId, initialRun.rateLimitPauseUntil);
-    } else if (initialRun.pauseReason === 'IMAGE_LIMIT') {
+    } else if ((initialRun.imageLimitDetected || initialRun.uploadCooldownActive) && !initialRun.uploadManualPause) {
       await resumeAfterRateLimitPause();
     }
     return;
@@ -3342,8 +3828,8 @@ async function recoverInterruptedRun(reason) {
     buildId: EXTENSION_BUILD_ID
   });
   const preserveImageLimitPause = initialRun.state === 'PAUSED'
-    && String(initialRun.pauseReason || '').toUpperCase() === 'IMAGE_LIMIT'
-    && Number(initialRun.rateLimitPauseUntil || 0) > Date.now();
+    && (initialRun.imageLimitDetected || initialRun.uploadCooldownActive || initialRun.uploadManualPause)
+    && (initialRun.uploadManualPause || Number(initialRun.rateLimitPauseUntil || 0) > Date.now());
   const preserveUserPause = initialRun.state === 'PAUSED'
     && String(initialRun.pauseReason || '').toUpperCase() === 'USER';
 
@@ -3461,21 +3947,21 @@ async function recoverInterruptedRun(reason) {
 
     const entries = groupEntries(queue, run.groupId);
     const plannedIds = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
-    run.pendingIds = entries
-      .filter((entry) => plannedIds.has(entry.sourceId) && entry.status !== 'done')
-      .filter((entry) => !Object.values(run.slots || {}).some((slot) => slot.entryId === entry.sourceId))
-      .map((entry) => entry.sourceId);
+    run.pendingIds = pendingPlannedIds(run, entries,
+      new Set(Object.values(run.slots || {}).map((slot) => String(slot.entryId || '')).filter(Boolean)));
     run.state = 'PAUSED';
-    run.pauseReason = preserveImageLimitPause ? 'IMAGE_LIMIT' : (preserveUserPause ? 'USER' : 'RESTART');
+    run.pauseReason = preserveUserPause ? 'USER' : (preserveImageLimitPause
+      ? (run.uploadCooldownActive ? 'UPLOAD_LIMIT' : 'IMAGE_LIMIT') : 'RESTART');
     const blockedRevisionCount = Object.values(run.slots || {}).filter((slot) => slot.revisionPersistBlocked).length;
-    run.status = preserveImageLimitPause ? 'RATE_LIMIT_PAUSE' : (blockedRevisionCount
+    run.status = preserveImageLimitPause ? (run.uploadManualPause ? 'PAUSED_ON_ERROR' : 'RATE_LIMIT_PAUSE') : (blockedRevisionCount
       ? 'PAUSED_ON_ERROR'
       : (shouldResumeObservation
         ? 'PAUSED_RECOVERING'
         : (preserveUserPause ? 'PAUSED' : 'PAUSED_ON_RESTART')));
     run.error = null;
     run.currentAction = preserveImageLimitPause
-      ? `Лимит изображений. Автоматически продолжу в ${clockTime(run.rateLimitPauseUntil)}`
+      ? (run.uploadManualPause ? 'Хранилище ChatGPT заполнено. Освободи место и нажми «Продолжить».'
+        : `${run.uploadCooldownActive ? 'Пауза загрузки фотографий' : 'Лимит изображений'}. ${preserveUserPause ? 'Очередь остаётся на твоей паузе.' : `Продолжу в ${clockTime(run.rateLimitPauseUntil)}`}`)
       : (blockedRevisionCount
         ? `${blockedRevisionCount} PNG уже скачаны, но их ревизии требуют повтора записи. «Продолжить» повторит сохранение без генерации изображения.`
         : (shouldResumeObservation
@@ -3493,7 +3979,7 @@ async function recoverInterruptedRun(reason) {
     await sendTabMessage(tabId, { type: 'STOP' }).catch(() => null);
     await chrome.tabs.remove(tabId).catch(() => null);
   }));
-  if (preserveImageLimitPause && recoveredRunId) {
+  if (preserveImageLimitPause && recoveredRunId && !initialRun.uploadManualPause) {
     scheduleRateLimitResume(recoveredRunId, initialRun.rateLimitPauseUntil);
   }
 
@@ -3525,7 +4011,9 @@ function initializeBrowserSessionTasks() {
     // storage.session survives MV3 worker suspension and clears with the
     // browser session. Reconcile before reconstructing any Send tasks.
     const stored = await getStored();
-    if (stored.sessionResetIntent) {
+    if (stored.sessionRestartIntent) {
+      await checkSessionWatchdog();
+    } else if (stored.sessionResetIntent) {
       await resumeInterruptedSessionReset(stored.sessionResetIntent);
     } else if (['CLOSING', 'WAITING', 'RESTARTING', 'FAILED'].includes(
       String(stored.run?.stalledBatchRecovery?.stage || '').toUpperCase()
@@ -3546,6 +4034,10 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm.name === SESSION_WATCHDOG_ALARM_NAME) {
+    void checkSessionWatchdog();
+    return;
+  }
   if (alarm.name === DEV_RELOAD_ALARM_NAME) {
     Promise.all([
       pollDevReload('alarm'),
@@ -3579,10 +4071,11 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
     return;
   }
   if (alarm.name !== AUDIT_ALARM_NAME) return;
-  auditActiveRun().catch((error) => appendLog('Ошибка фоновой проверки генераций', { error: error.message }));
+  auditActiveRun().catch((error) => recordRecoveryFailure('audit_failed', error));
 });
 
 function ensureDevReloadAlarm() {
+  void ensureSessionWatchdogAlarm().catch(error => recordRecoveryFailure('session_watchdog_alarm_failed', error));
   if (!chrome.alarms?.create) return;
   Promise.resolve(chrome.alarms.create(DEV_RELOAD_ALARM_NAME, { periodInMinutes: 0.5 })).catch(() => {});
 }
@@ -4161,6 +4654,7 @@ async function applyControlJobPatch(payload = {}) {
 
 async function executeControlCommand(command) {
   const payload = command?.payload && typeof command.payload === 'object' ? command.payload : {};
+  if (command.command === 'DIAGNOSTICS') return buildControlDiagnosticSnapshot();
   if (command.command === 'STATUS') {
     const stored = await getStored();
     const [referenceKeys, watchKeys] = await Promise.all([
@@ -4447,12 +4941,23 @@ function queueDiagnosticBridge(diagnostic) {
     .catch(() => {});
 }
 
+let runtimeUpdateChain = Promise.resolve();
 async function updateRuntime(patch) {
-  const current = (await chrome.storage.local.get('runtime')).runtime || {};
-  const runtime = { ...current, buildId: EXTENSION_BUILD_ID, ...patch, updatedAt: Date.now() };
-  await chrome.storage.local.set({ runtime });
-  try { await chrome.runtime.sendMessage({ type: 'RUNTIME_UPDATED', runtime }); } catch (_) {}
-  return runtime;
+  // Independent status/facts publishers must merge with the latest counters.
+  // Keep this chain separate from stateChain: callers can hold the state lock.
+  const task = runtimeUpdateChain.then(async () => {
+    const current = (await chrome.storage.local.get('runtime')).runtime || {};
+    const runtime = mergeRuntimeSnapshot(current, {
+      ...patch, buildId: EXTENSION_BUILD_ID,
+      runtimeSequence: Math.max(0, Number(current.runtimeSequence) || 0) + 1,
+      updatedAt: Date.now()
+    });
+    await chrome.storage.local.set({ runtime });
+    try { await chrome.runtime.sendMessage({ type: 'RUNTIME_UPDATED', runtime }); } catch (_) {}
+    return runtime;
+  });
+  runtimeUpdateChain = task.catch(() => {});
+  return task;
 }
 
 function flushPendingLogsSoon(delayMs = 250) {
@@ -4556,7 +5061,7 @@ function slotGenerationSubmitted(slot) {
 function currentSlotSendClicked(slot) {
   const clickedAt = Date.parse(slot?.lastSendClickedAt || '') || 0;
   const preparedAt = Date.parse(slot?.preparedAt || '') || 0;
-  return clickedAt > 0 && (preparedAt === 0 || clickedAt >= preparedAt);
+  return clickedAt > Math.max(0, Number(slot?.rejectedSendAtMs || 0)) && (preparedAt === 0 || clickedAt >= preparedAt);
 }
 
 async function pauseStalledPreparedSlots(operationId) {
@@ -4603,8 +5108,7 @@ async function pauseStalledPreparedSlots(operationId) {
       slot.launchWaitUntil = null;
     }
     const planned = new Set(run.plannedIds || []);
-    run.pendingIds = entries.filter((entry) => planned.has(entry.sourceId) && entry.status !== 'done')
-      .map((entry) => entry.sourceId);
+    run.pendingIds = pendingPlannedIds(run, entries);
     const factsPending = Object.keys(run.postprocessTabs || {}).length > 0;
     finished = run.pendingIds.length === 0 && !factsPending;
     run.state = finished ? 'DONE' : (factsPending && !run.pendingIds.length ? 'DRAINING' : 'PAUSED');
@@ -4645,6 +5149,212 @@ function scheduledRetriesForRun(run, queue, now = Date.now()) {
 
 function hasScheduledRunRetries(run, queue, now = Date.now()) {
   return scheduledRetriesForRun(run, queue, now).length > 0;
+}
+
+function plannedTaskForRun(run, sourceId) {
+  const id = String(sourceId || '');
+  const planned = Array.isArray(run?.plannedTasks)
+    ? run.plannedTasks.find((task) => String(task?.sourceId || task?.taskId || '') === id)
+    : null;
+  return planned || { taskId: id, sourceId: id, kind: run?.plannedTaskKinds?.[id] || 'generate' };
+}
+
+function applyPlannedTaskToSlot(slot, run, sourceId) {
+  const task = plannedTaskForRun(run, sourceId);
+  slot.taskKind = task.kind === 'facts' ? 'facts' : 'generate';
+  if (slot.taskKind === 'facts') {
+    slot.generationId = String(task.generationId || '');
+    slot.factsJobId = String(task.factsJobId || '');
+    slot.chatUrl = String(task.chatUrl || '');
+    slot.outputPath = String(task.outputPath || '');
+    slot.outputHash = String(task.outputHash || '');
+    slot.savedFactsTask = true;
+    slot.status = 'FACTS_STARTING';
+  } else {
+    slot.savedFactsTask = false;
+  }
+  return task;
+}
+
+function markReadyTaskCompleted(run, sourceId) {
+  if (!run || run.progressCompletionMode !== 'ready' || !sourceId) return false;
+  const id = String(sourceId);
+  if (!(run.plannedIds || []).includes(id)) return false;
+  run.completedTaskIds ||= [];
+  if (run.completedTaskIds.includes(id)) return false;
+  run.completedTaskIds.push(id);
+  run.lastProgressAt = new Date().toISOString();
+  return true;
+}
+
+function plannedTaskIsCompleted(run, sourceId) {
+  if (run?.progressCompletionMode === 'ready') {
+    return (run.completedTaskIds || []).map(String).includes(String(sourceId || ''));
+  }
+  return arguments.length > 2 && arguments[2] === 'done';
+}
+
+function pendingPlannedIds(run, entries, protectedIds = new Set()) {
+  const planned = new Set((run?.plannedIds || []).map(String));
+  const protectedEntries = protectedIds instanceof Set ? protectedIds : new Set(protectedIds || []);
+  const factsOwners = new Set(Object.values(run?.postprocessTabs || {})
+    .filter((owner) => owner?.entryId && owner?.generationId)
+    .map((owner) => String(owner.entryId)));
+  return (entries || []).filter((entry) => {
+    const sourceId = String(entry?.sourceId || '');
+    return planned.has(sourceId) && !plannedTaskIsCompleted(run, sourceId, entry?.status)
+      && !protectedEntries.has(sourceId) && !factsOwners.has(sourceId);
+  }).map((entry) => String(entry.sourceId));
+}
+
+function pendingStalledBatchRecoveryIds(run, entries) {
+  const byId = new Map((entries || []).map((entry) => [String(entry?.sourceId || ''), entry]));
+  return (run?.plannedIds || []).map(String).filter((entryId) => {
+    const entry = byId.get(entryId);
+    if (!entry) return false;
+    return run?.progressCompletionMode === 'ready'
+      ? !plannedTaskIsCompleted(run, entryId, entry.status)
+      : entry.status !== 'done';
+  });
+}
+
+function preserveStalledBatchSavedResult(run, entryId, entry) {
+  return run?.progressCompletionMode === 'ready'
+    && entry?.status === 'done'
+    && !plannedTaskIsCompleted(run, entryId, entry.status);
+}
+
+function releaseStalledBatchPostprocessOwners(run, closedTabIds, at = new Date().toISOString()) {
+  const closed = new Set((closedTabIds || []).map((tabId) => String(Number(tabId))));
+  const released = [];
+  run.postprocessTabs ||= {};
+  run.factsProgress ||= {};
+  for (const [tabKey, owner] of Object.entries(run.postprocessTabs)) {
+    if (!closed.has(String(Number(owner?.tabId || tabKey)))) continue;
+    const tabId = Number(owner?.tabId || tabKey) || null;
+    const factsJobId = String(owner?.factsJobId || owner?.generationId || '');
+    const entryId = String(owner?.entryId || '');
+    delete run.postprocessTabs[tabKey];
+    if (factsJobId && entryId && run.progressCompletionMode === 'ready'
+      && !plannedTaskIsCompleted(run, entryId)) {
+      const previous = run.factsProgress[factsJobId] || {};
+      run.factsProgress[factsJobId] = {
+        ...previous,
+        factsJobId,
+        entryId,
+        generationId: owner?.generationId || previous.generationId || null,
+        outputPath: owner?.outputPath || previous.outputPath || null,
+        outputHash: owner?.outputHash || previous.outputHash || null,
+        chatUrl: owner?.chatUrl || previous.chatUrl || null,
+        slotId: Number.isFinite(Number(owner?.slotId)) ? Number(owner.slotId) : previous.slotId ?? null,
+        tabId: null,
+        stage: 'QUEUED',
+        stageAt: at,
+        stageAtMs: Date.parse(at) || Date.now(),
+        waitUntil: null,
+        error: null
+      };
+    }
+    released.push({ tabId, entryId: entryId || null, generationId: owner?.generationId || null, factsJobId: factsJobId || null });
+  }
+  return released;
+}
+
+function reconcileReadyRunTaskPlan(run, queue, snapshot) {
+  if (!run || run.progressCompletionMode !== 'ready') return { ok: true, changed: false, blocked: [] };
+  const migrationDeferredForThisRun = snapshot?.migrationPending === true
+    && snapshot?.reconciliationState === 'active_run';
+  if ((!snapshot?.reconciliationComplete && !migrationDeferredForThisRun)
+    || snapshot?.stale || !snapshot?.verificationAvailable) {
+    return { ok: false, changed: false, blocked: ['каноническая проверка результатов недоступна'] };
+  }
+  const tasksById = new Map((run.plannedTasks || []).map((task) => [String(task.sourceId || task.taskId || ''), { ...task }]));
+  const entries = groupEntries(queue, run.groupId);
+  const entryById = new Map(entries.map((entry) => [String(entry.sourceId || ''), entry]));
+  const canonicalById = new Map((snapshot.entries || []).map((entry) => [String(entry.skuKey || ''), entry]));
+  const candidateById = new Map((snapshot.candidates || []).map((candidate) => [String(candidate.skuKey || ''), candidate]));
+  const protectedIds = new Set([
+    ...Object.values(run.slots || {}).filter((slot) => slot?.entryId && (
+      slot.downloadId || slot.finalCheckPending || (slot.status && !['IDLE', 'DONE', 'PAUSED', 'STOPPED'].includes(slot.status))
+    )).map((slot) => String(slot.entryId)),
+    ...Object.values(run.postprocessTabs || {}).filter((owner) => owner?.entryId && owner?.generationId)
+      .map((owner) => String(owner.entryId))
+  ]);
+  const completed = new Set((run.completedTaskIds || []).map(String));
+  const blocked = [];
+  let changed = false;
+  for (const rawId of run.plannedIds || []) {
+    const id = String(rawId || '');
+    if (!id || completed.has(id) || protectedIds.has(id)) continue;
+    const queueEntry = entryById.get(id);
+    const skuKey = String(queueEntry?.skuKey || id);
+    const canonical = canonicalById.get(skuKey);
+    if (!canonical || canonical.sourcePresent !== true || canonical.identityStatus !== 'OK' || canonical.identityQuarantined) {
+      blocked.push(`${queueEntry?.fileName || id}: идентичность или присутствие в очереди требует сверки`);
+      continue;
+    }
+    if (run.groupId === REGENERATION_QUEUE_ID) {
+      if (canonical.activeAttempt?.active) {
+        blocked.push(`${queueEntry?.fileName || id}: уже есть активная попытка перегенерации`);
+        continue;
+      }
+      tasksById.set(id, { ...(tasksById.get(id) || {}), taskId: id, sourceId: id,
+        kind: 'generate', explicitRepair: true, generationId: null, factsJobId: null,
+        outputPath: null, outputHash: null, chatUrl: null });
+      changed = true;
+      continue;
+    }
+    if (canonical.status === 'READY') {
+      completed.add(id);
+      changed = true;
+      continue;
+    }
+    if (canonical.activeAttempt?.active) {
+      blocked.push(`${queueEntry?.fileName || id}: обнаружена незавершённая попытка; задача оставлена без повторной отправки`);
+      continue;
+    }
+    const candidate = candidateById.get(skuKey);
+    const previous = tasksById.get(id) || { taskId: id, sourceId: id };
+    if (canonical.status === 'NEEDS_FACTS' && candidate?.task === 'facts') {
+      const target = candidate.targetRevision || canonical.actionRevision || {};
+      if (!target.generationId || !target.factsJobId || !target.outputPath
+        || !/^[a-f0-9]{64}$/i.test(String(target.outputHash || ''))
+        || !target.chatUrl || canonical.artifactVerification?.status !== 'VERIFIED') {
+        blocked.push(`${queueEntry?.fileName || id}: привязка сохранённого изображения к спецификации не подтверждена`);
+        continue;
+      }
+      tasksById.set(id, {
+        ...previous,
+        taskId: id, sourceId: id, kind: 'facts',
+        generationId: String(target.generationId), factsJobId: String(target.factsJobId),
+        outputPath: String(target.outputPath), outputHash: String(target.outputHash).toLowerCase(),
+        chatUrl: String(target.chatUrl), imageUrlFingerprint: target.imageUrlFingerprint || null
+      });
+      changed = true;
+      continue;
+    }
+    if (canonical.status === 'NOT_READY' && canonical.nextTask === 'generate' && candidate?.task === 'generate') {
+      tasksById.set(id, { ...previous, taskId: id, sourceId: id, kind: 'generate',
+        generationId: null, factsJobId: null, outputPath: null, outputHash: null, chatUrl: null });
+      changed = true;
+      continue;
+    }
+    blocked.push(`${queueEntry?.fileName || id}: статус ${canonical.status} не разрешает безопасное продолжение`);
+  }
+  const plannedIds = (run.plannedIds || []).map(String);
+  const plannedTasks = plannedIds.map((id) => tasksById.get(id) || { taskId: id, sourceId: id, kind: 'generate' });
+  const completedTaskIds = plannedIds.filter((id) => completed.has(id));
+  const plannedTaskKinds = Object.fromEntries(plannedTasks.map((task) => [String(task.sourceId), task.kind === 'facts' ? 'facts' : 'generate']));
+  const imagePlannedIds = plannedTasks.filter((task) => task.kind !== 'facts').map((task) => String(task.sourceId));
+  if (JSON.stringify(run.plannedTasks || []) !== JSON.stringify(plannedTasks)
+    || JSON.stringify(run.completedTaskIds || []) !== JSON.stringify(completedTaskIds)
+    || JSON.stringify(run.plannedTaskKinds || {}) !== JSON.stringify(plannedTaskKinds)
+    || JSON.stringify(run.imagePlannedIds || []) !== JSON.stringify(imagePlannedIds)) changed = true;
+  run.plannedTasks = plannedTasks;
+  run.completedTaskIds = completedTaskIds;
+  run.plannedTaskKinds = plannedTaskKinds;
+  run.imagePlannedIds = imagePlannedIds;
+  return { ok: blocked.length === 0, changed, blocked, protectedIds };
 }
 
 function activeSlots(run) {
@@ -4722,23 +5432,27 @@ function finalizeDrainingRun(run, queue = null) {
   } else {
     const factsErrors = Object.values(run.factsProgress || {})
       .filter((facts) => String(facts?.stage || '').toUpperCase() === 'ERROR').length;
+    const plannedCount = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []).size;
+    const completedCount = run.progressCompletionMode === 'ready'
+      ? new Set((run.completedTaskIds || []).filter((id) => (run.plannedIds || []).includes(id))).size
+      : (queue?.groups?.[run.groupId] || [])
+        .filter((entry) => (run.plannedIds || []).includes(entry.sourceId) && entry.status === 'done').length;
+    const incompleteCount = Math.max(0, plannedCount - completedCount);
     run.state = 'DONE';
-    run.status = factsErrors ? 'DONE_WITH_FACTS_ERRORS' : 'DONE';
+    run.status = factsErrors || incompleteCount ? 'DONE_WITH_FACTS_ERRORS' : 'DONE';
     run.finishedAt ||= new Date().toISOString();
     run.rateLimitPauseUntil = null;
     run.rateLimitPauseStartedAt = null;
     run.rateLimitReason = null;
     run.error = null;
-    run.currentAction = factsErrors
-      ? `Фото скачаны. Ошибок спецификации: ${factsErrors}. Повторное чтение доступно в галерее.`
-      : 'Все запущенные генерации скачаны, спецификации сохранены.';
+    run.currentAction = factsErrors || incompleteCount
+      ? `Готово ${completedCount} из ${plannedCount}. Ошибки спецификации: ${factsErrors}; незавершённых результатов: ${incompleteCount}.`
+      : 'Все запущенные генерации и спецификации сохранены.';
     const planned = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
-    const completedCount = (queue?.groups?.[run.groupId] || [])
-      .filter((entry) => planned.has(entry.sourceId) && entry.status === 'done').length;
     recordRunEvent(run, 'run_completed', {
       plannedCount: planned.size,
       completedCount,
-      pendingCount: Math.max(0, planned.size - completedCount),
+      pendingCount: incompleteCount,
       factsErrorCount: factsErrors,
       finishedAt: run.finishedAt
     });
@@ -4886,7 +5600,7 @@ function scheduleAudit(delay = AUDIT_INTERVAL_MS) {
     if (!auditMonitorDesired || timerGeneration !== auditTimerGeneration) return;
     auditTimer = null;
     auditActiveRun()
-      .catch((error) => appendLog('Ошибка фоновой проверки генераций', { error: error.message }))
+      .catch((error) => recordRecoveryFailure('audit_failed', error))
       .finally(async () => {
         const { run, queue } = await getStored().catch(() => ({ run: null, queue: null }));
         if (timerGeneration !== auditTimerGeneration) return;
@@ -4902,7 +5616,7 @@ function shouldWakeSlot(slot, now = Date.now()) {
   return !Number.isFinite(lastFocusAt) || now - lastFocusAt >= FOCUS_AUDIT_INTERVAL_MS;
 }
 
-function phaseForProbeState(state, { finalCheckPending = false, generationSubmitted = false, downloadId = null, preparedForSubmit = false } = {}) {
+function phaseForProbeState(state, { finalCheckPending = false, generationSubmitted = false, downloadId = null, preparedForSubmit = false, currentPhase = null } = {}) {
   const normalized = String(state || '').toUpperCase();
   if (normalized === 'READY') return SLOT_PHASES.IMAGE_FOUND;
   if (normalized === 'DOWNLOADING') return SLOT_PHASES.DOWNLOADING;
@@ -4920,7 +5634,8 @@ function phaseForProbeState(state, { finalCheckPending = false, generationSubmit
   // that state cannot advance an unsent slot into GENERATING.
   if (generationSubmitted === false && !downloadId) {
     if (['WAITING_ASSISTANT', 'WAITING_GENERATION', 'WAITING_IMAGE'].includes(normalized)) {
-      return preparedForSubmit ? SLOT_PHASES.WAITING_LAUNCH : SLOT_PHASES.PREPARING;
+      return preparedForSubmit ? SLOT_PHASES.WAITING_LAUNCH
+        : (currentPhase === SLOT_PHASES.UPLOADING ? SLOT_PHASES.UPLOADING : SLOT_PHASES.PREPARING);
     }
     if (normalized === 'GENERATING') return null;
   }
@@ -4960,8 +5675,7 @@ async function wakeTabForAudit(operationId, candidate) {
 function runSummary(run, queue) {
   const elapsedMs = elapsedRunClock(run, Date.now());
   const entries = groupEntries(queue, run?.groupId);
-  const plannedIds = Array.isArray(run?.plannedIds) ? run.plannedIds : entries.map((entry) => entry.sourceId);
-  const planned = entries.filter((entry) => plannedIds.includes(entry.sourceId));
+  const progress = syncRunProgress(run, queue ? entries : undefined);
   const filter = normalizeWatchFilter(
     run?.filter || parseFilterSelectionId(run?.groupId) || filterFromQueueGroup(run?.groupId)
   );
@@ -4971,6 +5685,10 @@ function runSummary(run, queue) {
     status: run?.status || null,
     pauseReason: run?.pauseReason || null,
     imageLimitDetected: run?.imageLimitDetected === true,
+    uploadCooldownActive: run?.uploadCooldownActive === true,
+    uploadLimitDetected: run?.uploadLimitDetected === true,
+    uploadManualPause: run?.uploadManualPause === true,
+    uploadPauseSettled: run?.uploadPauseSettled === true,
     stalledBatchRecovery: run?.stalledBatchRecovery ? {
       stage: run.stalledBatchRecovery.stage || null,
       attempts: Number(run.stalledBatchRecovery.attempts || 0),
@@ -5007,11 +5725,12 @@ function runSummary(run, queue) {
     filterLabel: run?.filterLabel || watchFilterLabel(filter),
     coverageMode: normalizeCoverageMode(run?.coverageMode),
     activeSlots: activeSlots(run),
-    completed: entries.filter((entry) => entry.status === 'done').length,
-    pending: entries.filter((entry) => entry.status !== 'done').length,
-    runTotal: planned.length,
-    runCompleted: planned.filter((entry) => entry.status === 'done').length,
-    runRemaining: planned.filter((entry) => entry.status !== 'done').length,
+    ...(queue ? {
+      completed: entries.filter((entry) => entry.status === 'done').length,
+      pending: entries.filter((entry) => entry.status !== 'done').length
+    } : {}),
+    ...progress,
+    progressCompletionMode: run?.progressCompletionMode || null,
     runLimit: run?.runLimit ?? null,
     runPart: run?.runPart ?? null,
     runPartCount: run?.runPartCount ?? null,
@@ -5031,6 +5750,15 @@ function runSummary(run, queue) {
     lastActivityAt: run?.lastActivityAt || null,
     lastCheckAt: run?.lastCheckAt || null,
     lastProgressAt: run?.lastProgressAt || null,
+    sessionWatchdog: run?.sessionWatchdog ? {
+      lastUsefulAt: run.sessionWatchdog.lastUsefulAt,
+      lastUsefulKind: run.sessionWatchdog.lastUsefulKind || null,
+      blockedReason: run.sessionWatchdog.blockedReason || null,
+      blockedUntil: run.sessionWatchdog.blockedUntil || null,
+      restartCount: Number(run.sessionWatchdog.restartCount || 0)
+    } : null,
+    sessionRestartId: run?.sessionRestartId || null,
+    previousOperationId: run?.previousOperationId || null,
     noProgressSince: run?.noProgressSince || null,
     noProgressCycles: Number(run?.noProgressCycles || 0),
     eventCount: Number(run?.eventCount || run?.eventJournal?.length || 0),
@@ -5106,7 +5834,22 @@ async function ensureAutomationScripts(tabId) {
   return true;
 }
 
-async function reloadTabForRecovery(tabId, slotId, {
+async function reloadTabForRecovery(tabId, slotId, options = {}) {
+  const stored = await getStored();
+  const operationId = stored.run?.operationId;
+  const data = { tabId, slotId, entryId: options.entryId || null, leaseId: options.leaseId || null };
+  await recordSafetyEvent(operationId, 'tab_recovery_started', data).catch(() => {});
+  try {
+    const result = await reloadTabForRecoveryInternal(tabId, slotId, options);
+    await recordSafetyEvent(operationId, 'tab_recovery_completed', { ...data, result: result || 'reused' }).catch(() => {});
+    return result;
+  } catch (error) {
+    await recordSafetyEvent(operationId, 'tab_recovery_failed', { ...data, error: error?.message || String(error) }).catch(() => {});
+    throw error;
+  }
+}
+
+async function reloadTabForRecoveryInternal(tabId, slotId, {
   force = false, leaseId = null, entryId = null, conversationUrl = null
 } = {}) {
   const beforeReload = await getStored();
@@ -5184,8 +5927,9 @@ async function sha256Blob(blob) {
 
 async function requestInputFile(sourceKey, { allowMissing = false } = {}) {
   // Shared references are identical for every worker. Decode/base64-encode a
-  // source only once per run; six workers must not repeat the same multi-MB
-  // IndexedDB -> ArrayBuffer -> base64 conversion six times.
+  // reference only once per run. Individual product photos are deduplicated
+  // while loading, then released; retaining thousands of base64 strings used
+  // to make worker memory grow with every completed generation.
   if (inputFilePromiseCache.has(sourceKey)) {
     const cached = await inputFilePromiseCache.get(sourceKey);
     if (!cached && !allowMissing) throw new Error(`Файл недоступен: ${sourceKey}. Выбери папки заново.`);
@@ -5209,8 +5953,12 @@ async function requestInputFile(sourceKey, { allowMissing = false } = {}) {
     if (!file && !allowMissing) throw new Error(`Файл недоступен: ${sourceKey}. Выбери папки заново.`);
     return file;
   } catch (error) {
-    inputFilePromiseCache.delete(sourceKey);
+    if (inputFilePromiseCache.get(sourceKey) === promise) inputFilePromiseCache.delete(sourceKey);
     throw error;
+  } finally {
+    if (!String(sourceKey).startsWith('ref:') && inputFilePromiseCache.get(sourceKey) === promise) {
+      inputFilePromiseCache.delete(sourceKey);
+    }
   }
 }
 
@@ -5222,9 +5970,9 @@ async function requestInputFileFromCandidates(sourceKeys) {
   throw new Error(`Файл недоступен: ${sourceKeys.join(' или ')}. Выбери папку референсов заново.`);
 }
 
-async function runPreflight({ selectedIds = [], queueMode = null, partNumber = null, validateLaunchSelection = true } = {}) {
+async function runPreflight({ selectedIds = [], queueMode = null, partNumber = null, validateLaunchSelection = true, jobSnapshot = null, exactPlannedScope = false, accountingSnapshot = null, requireCanonicalAccounting = false } = {}) {
   const stored = await getStored();
-  const job = stored.job || {};
+  const job = jobSnapshot || stored.job || {};
   const queue = stored.queue || {};
   const inputPlan = buildInputPlan(job.inputMode);
   const requested = new Set((Array.isArray(selectedIds) ? selectedIds : [])
@@ -5269,6 +6017,7 @@ async function runPreflight({ selectedIds = [], queueMode = null, partNumber = n
   const scopeEntries = pool.filter((entry) => {
     const sourceId = String(entry.sourceId || '');
     if (requested.size && !requested.has(sourceId)) return false;
+    if (exactPlannedScope && requested.size) return true;
     if (runQueueMode === REGENERATION_QUEUE_ID) {
       if (!repairIds.has(sourceId)) return false;
       return !validateLaunchSelection || requested.size > 0 || entry.status !== 'running';
@@ -5285,7 +6034,27 @@ async function runPreflight({ selectedIds = [], queueMode = null, partNumber = n
       recipeHashes.set(entry.sourceId, null);
     }
   }
-  const selectedEntries = scopeEntries.filter((entry) => {
+  const canonicalBySku = new Map((accountingSnapshot?.entries || []).map((row) => [String(row.skuKey || ''), row]));
+  const canonicalCandidateBySku = new Map((accountingSnapshot?.candidates || []).map((row) => [String(row.skuKey || ''), row]));
+  const allowExistingRunSnapshot = exactPlannedScope === true
+    && accountingSnapshot?.migrationPending === true
+    && accountingSnapshot?.reconciliationState === 'active_run'
+    && accountingSnapshot?.verificationAvailable === true
+    && accountingSnapshot?.stale !== true;
+  const useCanonicalAccounting = accountingSnapshot?.reconciliationComplete === true || allowExistingRunSnapshot;
+  const canonicalUnavailable = requireCanonicalAccounting === true
+    && (!useCanonicalAccounting || accountingSnapshot?.stale === true);
+  const selectedEntries = canonicalUnavailable ? [] : useCanonicalAccounting
+    ? scopeEntries.filter((entry) => {
+      const canonical = canonicalBySku.get(String(entry.skuKey || entry.sourceId || ''));
+      if (!canonical || canonical.identityStatus !== 'OK' || canonical.identityQuarantined
+        || canonical.sourcePresent !== true || canonical.activeAttempt?.active) return false;
+      if (runQueueMode === REGENERATION_QUEUE_ID) return true;
+      if (canonical.status === 'NEEDS_FACTS') return canonicalCandidateBySku.get(String(canonical.skuKey))?.task === 'facts';
+      return canonical.status === 'NOT_READY' && canonical.nextTask === 'generate'
+        && canonicalCandidateBySku.get(String(canonical.skuKey))?.task === 'generate';
+    })
+    : scopeEntries.filter((entry) => {
     if (runQueueMode === REGENERATION_QUEUE_ID) return requested.size > 0 || entry.status !== 'running';
     if (entry.status !== 'done') return true;
     const expected = recipeHashes.get(entry.sourceId);
@@ -5294,11 +6063,33 @@ async function runPreflight({ selectedIds = [], queueMode = null, partNumber = n
     // regenerate forever. startOrResumeRun backfills the current recipe once.
     return Boolean(expected && entry.recipeHash && entry.recipeHash !== expected);
   });
+  const plannedTaskKinds = new Map(selectedEntries.map((entry) => {
+    const skuKey = String(entry.skuKey || entry.sourceId || '');
+    const canonical = canonicalBySku.get(skuKey);
+    return [entry.sourceId, runQueueMode === REGENERATION_QUEUE_ID ? 'generate'
+      : (canonical?.status === 'NEEDS_FACTS' ? 'facts' : 'generate')];
+  }));
+  const launchCandidateCount = Math.min(
+    selectedEntries.length,
+    Number.isSafeInteger(requestedRunLimit) && requestedRunLimit > 0 ? requestedRunLimit : 0
+  );
+  const launchEntries = selectedEntries.slice(0, launchCandidateCount);
+  const generationEntries = launchEntries.filter((entry) => plannedTaskKinds.get(entry.sourceId) !== 'facts');
+  const hasGenerationTasks = generationEntries.length > 0;
 
   const referenceKeys = new Set(await getAssetKeys('ref:').catch(() => []));
   const watchKeys = new Set(await getAssetKeys('watch:').catch(() => []));
   const checks = [];
   const add = (id, label, ok, blocking = true, details = '') => checks.push({ id, label, ok: Boolean(ok), blocking, details });
+  if (requireCanonicalAccounting) {
+    add(
+      'canonical-accounting',
+      'Каноническая сверка результатов доступна',
+      useCanonicalAccounting && accountingSnapshot?.stale !== true,
+      true,
+      accountingSnapshot?.reconciliationState || accountingSnapshot?.staleReason || 'снимок не получен'
+    );
+  }
   add(
     'launch-selection',
     'Очередь, фильтры и часть выбраны точно',
@@ -5309,19 +6100,20 @@ async function runPreflight({ selectedIds = [], queueMode = null, partNumber = n
       : `очередь ${queueModeIsExact ? runQueueMode : 'не выбрана'} · ${filterIsExact ? watchFilterLabel(filter) : 'точная категория и бренд обязательны'} · часть ${selectedPartNumber || 'не выбрана'} из ${partPlan.partCount || 0} · фото за запуск ${runLimitIsExact ? requestedRunLimit : 'укажи 1–100'}`
   );
   const promptText = String(job.prompt || '');
-  add('prompt', 'Промпт загружен', Boolean(promptText.trim()), true, 'Base Prompt v5.txt');
+  add('prompt', 'Промпт загружен', !hasGenerationTasks || Boolean(promptText.trim()), true, 'Base Prompt v5.txt');
   add(
     'prompt-format',
     'Промпт поддерживает динамические референсы',
-    /\{\{REF_TEMPLATE\}\}/.test(promptText) && /\{\{REF_WATCH\}\}/.test(promptText),
+    !hasGenerationTasks || (/\{\{REF_TEMPLATE\}\}/.test(promptText) && /\{\{REF_WATCH\}\}/.test(promptText)),
     true,
-    `режим ${inputPlan.mode}: ${inputPlan.roles.join(' + ')}`
+    hasGenerationTasks ? `режим ${inputPlan.mode}: ${inputPlan.roles.join(' + ')}` : 'только чтение уже сохранённых спецификаций'
   );
-  add('queue', 'Очередь содержит модели', Boolean(queue.groups && selectedEntries.length), true, `${selectedEntries.length} кандидатов`);
+  add('queue', 'Очередь содержит модели', Boolean(queue.groups && launchCandidateCount), true,
+    `${launchCandidateCount} задач к запуску${selectedEntries.length > launchCandidateCount ? ` из ${selectedEntries.length} доступных` : ''}`);
 
   const missingBrands = [];
   const checkedProfiles = new Set();
-  for (const entry of scopeEntries) {
+  for (const entry of generationEntries) {
     const profile = detectBrandProfile(entry.modelName);
     if (!checkedProfiles.has(profile)) {
       checkedProfiles.add(profile);
@@ -5351,7 +6143,7 @@ async function runPreflight({ selectedIds = [], queueMode = null, partNumber = n
   add('watcher', 'Файловый watcher', watcherOk, false, watcherOk ? 'онлайн' : 'офлайн: проверка PNG будет локальной/по Downloads API');
 
   const outputAccess = await outputDirectoryAccess().catch(() => ({ config: { mode: 'downloads' }, handle: null, permission: 'unknown' }));
-  if (outputAccess.config.mode === 'custom') {
+  if (hasGenerationTasks && outputAccess.config.mode === 'custom') {
     add(
       'output-directory',
       'Папка результатов доступна для записи',
@@ -5361,7 +6153,7 @@ async function runPreflight({ selectedIds = [], queueMode = null, partNumber = n
         ? `${outputAccess.handle.name}: ${outputAccess.permission}`
         : 'выбери папку результатов заново'
     );
-  } else {
+  } else if (hasGenerationTasks) {
     add('output-directory', 'Папка результатов: Downloads', true, false, 'Downloads/WatchAutomation');
   }
 
@@ -5526,12 +6318,25 @@ async function sendTabMessage(tabId, message, timeout = TAB_MESSAGE_TIMEOUT_MS) 
 
 async function sendToTab(tabId, message, timeout = TAB_MESSAGE_TIMEOUT_MS) {
   const response = await sendTabMessage(tabId, message, timeout);
-  if (!response?.ok) throw new Error(response?.error?.message || response?.error || 'Ответ страницы неуспешен');
+  if (!response?.ok) {
+    const details = response?.error;
+    const error = new Error(details?.message || details || 'Ответ страницы неуспешен');
+    if (details && typeof details === 'object') {
+      error.code = details.code;
+      error.responseText = details.responseText;
+      error.resumeAtMs = details.resumeAtMs;
+      error.autoResume = details.autoResume;
+    }
+    throw error;
+  }
   return response.value;
 }
 
 async function saveRunAndQueue(run, queue, history = undefined, generationMemory = undefined) {
   if (run) syncRunClock(run, Date.now());
+  if (run && queue) syncRunProgress(run, groupEntries(queue, run.groupId));
+  if (run) ensureSessionWatchdog(run);
+  recordRecoveryTransitions(run);
   for (const groupId of QUEUE_GROUP_IDS) {
     for (const entry of queue?.groups?.[groupId] || []) {
       const variantId = String(entry.inputSourceId || entry.sourceVariantId || '');
@@ -5550,6 +6355,12 @@ async function saveRunAndQueue(run, queue, history = undefined, generationMemory
   if (history !== undefined) value.history = history;
   if (generationMemory !== undefined) value.generationMemory = generationMemory;
   queueRunDiagnostics(run, queue);
+  await persistRunDiagnosticDecision(run, queue).catch(async error => {
+    run.diagnosticsPersistenceError = `Диагностика решения не сохранена: ${String(error?.message || error)}`;
+    await chrome.storage.local.set({ runDiagnosticsPersistenceError: {
+      operationId: run.operationId, error: run.diagnosticsPersistenceError, failedAt: new Date().toISOString()
+    } }).catch(() => {});
+  });
   await chrome.storage.local.set(value);
 }
 
@@ -5652,9 +6463,24 @@ async function writeGeneratedToCustomDirectory(entry, blob) {
   await writable.close();
   const written = await fileHandle.getFile();
   if (Number(written.size || 0) !== Number(blob.size || 0)) throw new Error('Размер записанного файла не совпадает с исходным PNG');
+  const readBackVerification = await verifyPngBlob(written);
+  if (!readBackVerification.valid || String(readBackVerification.sha256 || '').toLowerCase() !== String(verification.sha256 || '').toLowerCase()) {
+    throw new Error('Контрольная сумма PNG после записи в выбранную папку не совпадает с исходным изображением');
+  }
+  const outputPath = `custom://${access.handle.name}/${groupName}/${fileName}`;
   return {
-    outputPath: `custom://${access.handle.name}/${groupName}/${fileName}`,
-    verification: { ...verification, filename: fileName, folderName: access.handle.name },
+    outputPath,
+    verification: {
+      ...readBackVerification,
+      filename: fileName,
+      folderName: access.handle.name,
+      outputPath,
+      exists: true,
+      isFile: true,
+      sizeBytes: Number(written.size || 0),
+      fileReadBackVerified: true,
+      verifiedAt: new Date().toISOString()
+    },
     folderName: access.handle.name,
     groupName,
     fileName,
@@ -6107,15 +6933,19 @@ async function beginStalledBatchRecovery(operationId, candidate) {
     if (snapshot.run?.operationId !== operationId) return { skipped: true };
     if (Object.values(snapshot.run.slots || {}).some((slot) => slot.downloadId)) {
       scheduleStalledBatchRecovery(operationId, Date.now() + 5000);
+      await recordSafetyEvent(operationId, 'stalled_batch_recovery_deferred', { reason: 'download_in_progress' });
       await appendLog('Перезапуск набора отложен: ожидаю завершения активного PNG', { operationId });
       return { deferred: true, downloadsPending: true };
     }
 
     const closeTabs = await captureStalledBatchTabTargets(snapshot.run);
-    const referencedTabIds = [...new Set(Object.values(snapshot.run.slots || {})
-      .map((slot) => Number(slot.tabId || 0))
+    const referencedTabIds = [...new Set([
+      ...Object.values(snapshot.run.slots || {}),
+      ...Object.values(snapshot.run.postprocessTabs || {})
+    ].map((owner) => Number(owner.tabId || 0))
       .filter((tabId) => tabId > 0))];
     if (closeTabs.length !== referencedTabIds.length) {
+      await recordSafetyEvent(operationId, 'stalled_batch_recovery_deferred', { reason: 'tab_address_changed', referencedTabIds });
       await appendLog('Автоперезапуск отложен: рабочая вкладка изменила адрес, поэтому её оставляю открытой', {
         operationId,
         referencedTabIds
@@ -6139,9 +6969,13 @@ async function beginStalledBatchRecovery(operationId, candidate) {
       const history = normalizeHistory(stored.history);
       const generationMemory = normalizeGenerationMemory(stored.generationMemory);
       const entries = groupEntries(stored.queue, run.groupId);
+      const now = new Date().toISOString();
       const plannedIds = Array.isArray(run.plannedIds) ? [...run.plannedIds] : [];
       const excludedFromCatalogReconcile = plannedIds.filter((entryId) => (
-        entries.some((entry) => entry.sourceId === entryId && entry.status !== 'done')
+        entries.some((entry) => entry.sourceId === entryId
+          && (run.progressCompletionMode === 'ready'
+            ? !plannedTaskIsCompleted(run, entryId, entry.status)
+            : entry.status !== 'done'))
       ));
       await reconcileRunVerifiedRevisions(run, stored.queue, history, generationMemory);
       await reconcilePersistedCurrentRevisions(stored.queue, history, generationMemory, {
@@ -6151,10 +6985,7 @@ async function beginStalledBatchRecovery(operationId, candidate) {
       });
 
       const refreshedEntries = groupEntries(stored.queue, run.groupId);
-      const returnedIds = plannedIds.filter((entryId) => {
-        const entry = refreshedEntries.find((item) => item.sourceId === entryId);
-        return entry && entry.status !== 'done';
-      });
+      const returnedIds = pendingStalledBatchRecoveryIds(run, refreshedEntries);
       if (!returnedIds.length) {
         run.pendingIds = [];
         finalizeDrainingRun(run, stored.queue);
@@ -6163,12 +6994,26 @@ async function beginStalledBatchRecovery(operationId, candidate) {
         return { completed: true };
       }
 
-      const now = new Date().toISOString();
+      const releasedPostprocessOwners = releaseStalledBatchPostprocessOwners(
+        run, closeTabs.map((target) => target.tabId), now
+      );
       const retryCountById = new Map();
       for (const entryId of returnedIds) {
         const entry = refreshedEntries.find((item) => item.sourceId === entryId);
         if (!entry) continue;
         retryCountById.set(entryId, Number(entry.retryCount || 0));
+        if (preserveStalledBatchSavedResult(run, entryId, entry)) {
+          // Queue `done` records a saved PNG. In READY-mode the task remains
+          // pending until its exact facts revision is accepted, so retain the
+          // image/history tuple and let canonical resume reconciliation choose
+          // the safe facts-only task (or an explicitly permitted replacement).
+          recordRunEvent(run, 'stalled_batch_saved_result_preserved', {
+            entryId,
+            generationId: entry.generationId || null,
+            factsStatus: entry.factsStatus || null
+          });
+          continue;
+        }
         entry.status = 'pending';
         entry.autoRetryPending = false;
         entry.lastError = null;
@@ -6233,6 +7078,7 @@ async function beginStalledBatchRecovery(operationId, candidate) {
         abnormalSlotIds: currentCandidate.abnormalSlotIds,
         requeuedIds: returnedIds,
         requeuedCount: returnedIds.length,
+        releasedPostprocessOwners,
         closeTabs
       };
       run.state = 'PAUSED';
@@ -6453,6 +7299,7 @@ function auditActiveRun() {
     const safeUnsubmittedRepairs = [];
     const stalledPreparationEntryIds = new Set();
     const expiredAttentionSlotIds = [];
+    const pendingObservationExpiries = [];
     let meaningfulProgress = false;
     let globalNoProgress = false;
     await withStateLock(async () => {
@@ -6603,7 +7450,8 @@ function auditActiveRun() {
               ? value.generationSubmitted
               : slotGenerationSubmitted(slot),
             downloadId: slot.downloadId,
-            preparedForSubmit: slot.preparedForSubmit
+            preparedForSubmit: slot.preparedForSubmit,
+            currentPhase: slot.phase
           });
           if (probePhase) slot.phase = probePhase;
           if (value.error) slot.lastCheckError = value.error;
@@ -6681,19 +7529,28 @@ function auditActiveRun() {
         // result during that short hand-off window.
         const downloadInProgress = ['READY', 'DOWNLOADING'].includes(resultState) || Boolean(slot.downloadId);
         if (!downloadInProgress && shouldExpireSubmittedObservation(slot, Date.now())) {
-          if (markObservationNeedsManualAttention(
-            current.run, current.queue, current.generationMemory, slot,
-            'После отправки прошло 15 минут без скачанного результата', Date.now()
-          )) expiredAttentionSlotIds.push(Number(slot.slotId));
+          pendingObservationExpiries.push({ slot,
+            reason: 'После отправки прошло 15 минут без скачанного результата' });
         }
         if (slot.finalCheckPending && deadlineAt > 0 && Date.now() >= deadlineAt && !slot.downloadId && !downloadInProgress) {
-          if (!slot.observationExpired && markObservationNeedsManualAttention(
-            current.run, current.queue, current.generationMemory, slot,
-            'Окно наблюдения завершено без найденного результата', Date.now()
-          )) expiredAttentionSlotIds.push(Number(slot.slotId));
+          pendingObservationExpiries.push({ slot,
+            reason: 'Окно наблюдения завершено без найденного результата' });
         }
         if (isStalledUnsubmittedPreparation(slot, Date.now(), PREPARATION_STALL_AFTER_MS)
           && !slotGenerationSubmitted(slot)) stalledPreparationEntryIds.add(String(slot.entryId));
+      }
+      // Preserve transport evidence until its own continuous NO_RESPONSE
+      // window matures; Send's earlier deadline must not hide these leases.
+      // Responsive pages still expire normally. The original silence start
+      // remains fixed, so another failed probe cannot renew the waiting time.
+      const batchEvidence = findStalledBatchRecoveryCandidate(current.run, Date.now(), 0);
+      const protectedBatchSlots = new Set(batchEvidence
+        ? [batchEvidence.slotId, ...batchEvidence.abnormalSlotIds] : []);
+      for (const { slot, reason } of pendingObservationExpiries) {
+        if (protectedBatchSlots.has(Number(slot.slotId)) && slot.lastCheckState === 'NO_RESPONSE') continue;
+        if (markObservationNeedsManualAttention(
+          current.run, current.queue, current.generationMemory, slot, reason, Date.now()
+        )) expiredAttentionSlotIds.push(Number(slot.slotId));
       }
       current.run.lastCheckAt = checkedAt;
       if (meaningfulProgress) {
@@ -6865,22 +7722,25 @@ async function claimNext(runId, slotId) {
     }
     const entry = groupEntries(queue, run.groupId).find((item) => item.sourceId === entryId);
     if (!entry) throw new Error(`Очередь не содержит ${entryId}`);
-    entry.status = 'running';
-    entry.autoRetryPending = false;
-    entry.lastError = null;
-    entry.errorClass = null;
-    entry.nextRetryAt = null;
-    setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.RUNNING, {
-      statusSource: 'automatic',
-      generationStartedAt: new Date().toISOString(),
-      lastError: null,
-      lastRunId: run.operationId,
-      retryCount: Number(entry.retryCount || 0),
-      errorClass: null,
-      nextRetryAt: null,
-    });
-    delete history.items[entry.sourceId];
-    history.ignored[entry.sourceId] = true;
+    const task = plannedTaskForRun(run, entryId);
+    if (task.kind !== 'facts') {
+      entry.status = 'running';
+      entry.autoRetryPending = false;
+      entry.lastError = null;
+      entry.errorClass = null;
+      entry.nextRetryAt = null;
+      setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.RUNNING, {
+        statusSource: 'automatic',
+        generationStartedAt: new Date().toISOString(),
+        lastError: null,
+        lastRunId: run.operationId,
+        retryCount: Number(entry.retryCount || 0),
+        errorClass: null,
+        nextRetryAt: null,
+      });
+      delete history.items[entry.sourceId];
+      history.ignored[entry.sourceId] = true;
+    }
     const slot = {
       ...oldSlot,
       ...freshSlotRevisionFields(),
@@ -6921,6 +7781,7 @@ async function claimNext(runId, slotId) {
       rateLimitRetryNeeded: false,
       startedAt: new Date().toISOString()
     };
+    applyPlannedTaskToSlot(slot, run, entryId);
     recordRunEvent(run, 'slot_claimed', { slotId, entryId, leaseId: slot.leaseId, attempt: slot.attempt });
     run.slots[slotId] = slot;
     await saveRunAndQueue(run, queue, history, generationMemory);
@@ -7155,6 +8016,14 @@ async function bootstrapAutomationTab(tabId, windowId, context = {}) {
     type: 'BOOTSTRAP_AUTOMATION_TAB',
     timeoutMs: 8000
   }, 10000).catch(() => null);
+  if ([AUTOMATION_ERROR_CLASSES.HISTORY_LOAD_ERROR, AUTOMATION_ERROR_CLASSES.UPLOAD_LIMIT]
+    .includes(response?.error?.code)) {
+    const error = new Error(response.error.message || 'Не удалось загрузить историю ChatGPT');
+    error.code = response.error.code;
+    error.autoResume = response.error.autoResume;
+    error.resumeAtMs = response.error.resumeAtMs;
+    throw error;
+  }
   // Some ChatGPT pages mount the composer only after their first activation.
   // Activate once only when the background-ready probe proves insufficient.
   if (!response?.ok || response?.value?.composerReady !== true) {
@@ -7172,7 +8041,11 @@ async function bootstrapAutomationTab(tabId, windowId, context = {}) {
     }
   }
   if (!response?.ok || response?.value?.composerReady !== true) {
-    throw new Error(response?.error?.message || 'ChatGPT renderer не подготовил composer');
+    const error = new Error(response?.error?.message || 'ChatGPT renderer не подготовил composer');
+    if (response?.error?.code) error.code = response.error.code;
+    error.autoResume = response?.error?.autoResume;
+    error.resumeAtMs = response?.error?.resumeAtMs;
+    throw error;
   }
   await appendLog('Renderer рабочей вкладки инициализирован', {
     tabId: Number(tabId),
@@ -7292,18 +8165,167 @@ async function createOrReuseTab(runId, slotId) {
   return createOrReuseTabUnlocked(runId, slotId);
 }
 
-async function executeSlot(runId, slotId, entryId) {
+function executeSlot(runId, slotId, entryId) {
+  const key = `${runId}:${slotId}:${entryId}`;
+  if (activeSlotExecutionTasks.has(key)) return activeSlotExecutionTasks.get(key);
+  const task = executeSlotInternal(runId, slotId, entryId).finally(() => activeSlotExecutionTasks.delete(key));
+  activeSlotExecutionTasks.set(key, task);
+  return task;
+}
+
+async function resumeRestoredSessionAssignments() {
+  const stored = await getStored();
+  const run = stored.run;
+  if (!run?.sessionRestartId || run.state !== 'RUNNING' || run.pauseReason === 'USER'
+    || run.stopBlocked || run.clockStopped) return;
+  const entries = groupEntries(stored.queue, run.groupId);
+  for (const slot of Object.values(run.slots || {})) {
+    if (!slot.entryId || !slot.leaseId || slot.preparedForSubmit || slotGenerationSubmitted(slot)
+      || slot.downloadId || slot.pageRunAcceptedAt || slot.rendererBootstrappedAt
+      || !['STARTING', 'PREPARING'].includes(String(slot.status))) continue;
+    if (!entries.some(entry => entry.sourceId === slot.entryId)) continue;
+    // resumeRun can be interrupted between persisting assignments and their
+    // allocation. In-memory coalescing avoids repeating a still-live task.
+    void executeSlot(run.operationId, slot.slotId, slot.entryId);
+  }
+}
+
+async function executeSavedFactsTask(runId, slotId, entryId, tabId, ownerLeaseId) {
+  const initial = await getStored();
+  const run = initial.run;
+  const slot = run?.slots?.[slotId];
+  const task = plannedTaskForRun(run, entryId);
+  const entry = groupEntries(initial.queue, run?.groupId).find((item) => item.sourceId === entryId);
+  if (!run || run.operationId !== runId || run.state !== 'RUNNING' || slot?.entryId !== entryId
+    || slot.leaseId !== ownerLeaseId || task.kind !== 'facts' || !entry) {
+    throw new Error('Задание сохранённой спецификации больше не принадлежит этому слоту');
+  }
+  const revision = await getGenerationRevision(task.generationId).catch(() => null);
+  const catalog = await getModelCatalog(entryId).catch(() => null);
+  const journal = await getOutputRecoveryRecord(task.generationId).catch(() => null);
+  const exactTuple = Boolean(revision && catalog
+    && String(revision.sourceId || '') === String(entryId)
+    && String(revision.generationId || '') === String(task.generationId)
+    && String(revision.factsJobId || '') === String(task.factsJobId)
+    && String(revision.outputPath || '').replaceAll('\\', '/') === String(task.outputPath || '').replaceAll('\\', '/')
+    && String(revision.outputHash || '').toLowerCase() === String(task.outputHash || '').toLowerCase()
+    && normalizeChatConversationUrl(revision.chatUrl || revision.facts?.chatUrl) === normalizeChatConversationUrl(task.chatUrl)
+    && revision.reviewStatus !== 'rejected' && !revision.identityQuarantined
+    && !revision.supersededBySessionRestartId
+    && journal?.state === 'revision_registered'
+    && String(journal.sourceId || '') === String(entryId)
+    && String(journal.outputPath || '').replaceAll('\\', '/') === String(task.outputPath || '').replaceAll('\\', '/')
+    && String(journal.outputHash || '').toLowerCase() === String(task.outputHash || '').toLowerCase());
+  if (!exactTuple) throw new Error('Сверка сохранённого PNG и спецификации не подтвердила точную ревизию');
+  const proof = await verifyCanonicalArtifacts([revision]);
+  const check = proof.checks[String(task.generationId)];
+  if (!proof.verificationAvailable || !verifiedJournalProofForRevision(revision, check)) {
+    throw new Error('Файл сохранённой генерации сейчас нельзя подтвердить на диске');
+  }
+  const tabState = await chrome.tabs.get(Number(tabId)).catch(() => null);
+  if (!tabState) throw new Error('Вкладка для проверки сохранённой спецификации недоступна');
+  await chrome.tabs.update(Number(tabId), { url: normalizeChatConversationUrl(task.chatUrl), active: false });
+  await waitTabReady(Number(tabId), 60000);
+  await markTabAsAutomation(Number(tabId), { operationId: runId, slotId, entryId }).catch(() => {});
+
+  const acceptedId = String(catalog.latestReadyGenerationId || '') === String(task.generationId)
+    ? String(task.generationId) : null;
+  await withStateLock(async () => {
+    const current = await getStored();
+    const liveRun = current.run;
+    const liveSlot = liveRun?.slots?.[slotId];
+    if (!liveRun || liveRun.operationId !== runId || liveRun.state !== 'RUNNING'
+      || liveSlot?.entryId !== entryId || liveSlot.leaseId !== ownerLeaseId
+      || Number(liveSlot.tabId) !== Number(tabId)) throw new Error('Задание спецификации отменено до отправки');
+    liveSlot.generationId = String(task.generationId);
+    liveSlot.factsJobId = String(task.factsJobId);
+    liveSlot.outputPath = String(task.outputPath);
+    liveSlot.outputHash = String(task.outputHash);
+    liveSlot.chatUrl = String(task.chatUrl);
+    liveSlot.savedFactsTask = true;
+    liveSlot.status = 'FACTS_EXTRACTING';
+    liveSlot.phase = SLOT_PHASES.OBSERVING;
+    liveSlot.pageRunAcceptedAt = new Date().toISOString();
+    liveRun.postprocessTabs ||= {};
+    liveRun.postprocessTabs[String(tabId)] = {
+      tabId: Number(tabId), entryId,
+      modelName: entry.modelName || entry.fileName || null,
+      outputFileName: String(task.outputPath).replaceAll('\\', '/').split('/').at(-1) || null,
+      factsJobId: String(task.factsJobId), generationId: String(task.generationId),
+      chatUrl: String(task.chatUrl), outputPath: String(task.outputPath), outputHash: String(task.outputHash),
+      slotId: Number(slotId), savedImageFacts: true,
+      authorizedAcceptedGenerationId: acceptedId,
+      startedAt: new Date().toISOString(), recoveryDeadlineAt: Date.now() + FINAL_CHECK_TIMEOUT_MS,
+      lastPulseAt: null
+    };
+    liveRun.lastPostprocessSendAt = Date.now();
+    liveRun.currentAction = `Проверяю сохранённую спецификацию: ${entry.fileName}`;
+    liveRun.lastActivityAt = new Date().toISOString();
+    recordRunEvent(liveRun, 'saved_image_facts_started', {
+      slotId, entryId, generationId: task.generationId, factsJobId: task.factsJobId,
+      acceptedPointerAuthorized: Boolean(acceptedId)
+    });
+    await saveRunAndQueue(liveRun, current.queue, current.history, current.generationMemory);
+    await publishRun(liveRun, current.queue);
+  });
+  const factsPrompt = buildFactsExtractionPrompt(entry);
+  try {
+    const response = await sendToTab(Number(tabId), {
+      type: 'BOOTSTRAP_SAVED_FACTS',
+      operationId: runId,
+      slotId: Number(slotId),
+      leaseId: ownerLeaseId,
+      entryId,
+      generationId: String(task.generationId),
+      factsJobId: String(task.factsJobId),
+      factsPrompt,
+      modelName: entry.modelName || entry.fileName || null,
+      outputFileName: String(task.outputPath).replaceAll('\\', '/').split('/').at(-1) || null,
+      outputPath: String(task.outputPath),
+      outputHash: String(task.outputHash),
+      chatUrl: String(task.chatUrl),
+      imageUrlFingerprint: task.imageUrlFingerprint || null,
+      factsExtractorVersion: FACTS_EXTRACTOR_VERSION,
+      buildId: EXTENSION_BUILD_ID
+    }, FACTS_START_ACK_TIMEOUT_MS);
+    if (response?.accepted !== true) throw new Error('Страница не подтвердила старт безопасной проверки спецификации');
+  } catch (error) {
+    const owner = (await getStored()).run?.postprocessTabs?.[String(tabId)] || {
+      tabId, slotId, entryId, generationId: task.generationId, factsJobId: task.factsJobId
+    };
+    await finishSavedFactsTaskOwner(runId, owner, {
+      error: `Не удалось подтвердить старт постпроверки спецификации: ${error?.message || String(error)}`
+    });
+    return;
+  }
+  startFactsPulseMonitor(0);
+  await appendLog('Запущено повторное чтение спецификации сохранённой генерации', {
+    operationId: runId, slotId, entryId, generationId: task.generationId, tabId
+  });
+}
+
+async function executeSlotInternal(runId, slotId, entryId) {
   let tabId = null;
   let ownerLeaseId = null;
   try {
     const stored = await getStored();
     const run = stored.run;
     const queue = stored.queue;
-    const job = stored.job;
+    const job = run?.jobSnapshot || stored.job;
     const entry = groupEntries(queue, run?.groupId).find((item) => item.sourceId === entryId);
     if (!run || run.operationId !== runId || !entry || !job) throw new Error('Данные запуска устарели');
     ownerLeaseId = run.slots?.[slotId]?.leaseId;
     if (!ownerLeaseId || run.slots[slotId].entryId !== entryId || run.clockStopped || run.stopBlocked) return;
+
+    if (plannedTaskForRun(run, entryId).kind === 'facts') {
+      tabId = await createOrReuseTab(runId, slotId);
+      const current = await getStored();
+      const currentSlot = current.run?.slots?.[slotId];
+      if (current.run?.operationId !== runId || current.run.state !== 'RUNNING'
+        || currentSlot?.entryId !== entryId || currentSlot.leaseId !== ownerLeaseId) return;
+      await executeSavedFactsTask(runId, slotId, entryId, tabId, ownerLeaseId);
+      return;
+    }
 
     // PREPARE has no intentional delay. Tabs are preallocated in parallel;
     // page readiness, input transfer, upload and prompt filling proceed as
@@ -7494,6 +8516,8 @@ async function executeSlot(runId, slotId, entryId) {
       entryId,
       tabId,
       leaseId: ownerLeaseId,
+      phase,
+      source: 'prepare_command',
       generationSubmitted: slotGenerationSubmitted(currentSlot),
       errorClass: classifyAutomationError(error, { phase })
     });
@@ -7638,14 +8662,30 @@ async function runDry() {
 async function startRun(options = {}) {
   await assertManualExtensionUpdateNotApplying();
   await waitForStartupReconciliation();
+  const pendingRestart = await chrome.storage.local.get('sessionRestartIntent');
+  if (pendingRestart.sessionRestartIntent) throw new Error('Восстановление текущего прогона ещё выполняется. Дождись его завершения.');
+  const accountingSnapshot = await refreshCanonicalAccountingSnapshot({ force: true });
+  const accountingAgeMs = Date.now() - (Date.parse(accountingSnapshot?.generatedAt || '') || 0);
+  if (!accountingSnapshot || accountingSnapshot.stale || !accountingSnapshot.verificationAvailable
+    || !accountingSnapshot.reconciliationComplete || accountingAgeMs > 15000) {
+    const reason = accountingSnapshot?.staleReason || accountingSnapshot?.reconciliationState || 'сверка результатов ещё не завершена';
+    throw new Error(`Запуск заблокирован: канонический учёт пока не подтверждён (${reason}). Обнови очередь и повтори проверку.`);
+  }
   const requestedIds = Array.isArray(options?.selectedIds)
     ? [...new Set(options.selectedIds.map((value) => String(value || '').trim()).filter(Boolean))]
     : [];
   const preferredWindowId = Number(options?.preferredWindowId || 0) || null;
-  const preflight = await runPreflight({ selectedIds: requestedIds, validateLaunchSelection: true });
+  const preflight = await runPreflight({ selectedIds: requestedIds, validateLaunchSelection: true, accountingSnapshot });
   if (!preflight.ok) {
     const failed = preflight.checks.filter((check) => check.blocking && !check.ok).map((check) => check.label).join(', ');
     throw new Error(`Предварительная проверка не пройдена: ${failed || 'проверь входные данные'}`);
+  }
+  const commitAccountingSnapshot = await refreshCanonicalAccountingSnapshot({ force: true });
+  const commitSnapshotAgeMs = Date.now() - (Date.parse(commitAccountingSnapshot?.generatedAt || '') || 0);
+  if (!commitAccountingSnapshot || commitAccountingSnapshot.stale || !commitAccountingSnapshot.reconciliationComplete
+    || !commitAccountingSnapshot.verificationAvailable || commitSnapshotAgeMs > 15000
+    || Number(commitAccountingSnapshot.revision) !== Number(accountingSnapshot.revision)) {
+    throw new Error('Канонический учёт изменился во время предварительной проверки. Обнови список очереди и запусти проверку ещё раз.');
   }
   const assignments = await withStateLock(async () => {
     const updateLock = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']);
@@ -7655,6 +8695,7 @@ async function startRun(options = {}) {
     }
     const stored = await getStored();
     const { job, run: oldRun } = stored;
+    if (stored.sessionRestartIntent) throw new Error('Восстановление текущего прогона ещё выполняется.');
     let { queue, history, generationMemory } = stored;
     const persistedCatalog = await getAllModelCatalog().catch(() => []);
     if (persistedCatalog.length) {
@@ -7720,55 +8761,6 @@ async function startRun(options = {}) {
     }
     const inputMode = normalizeInputMode(job.inputMode, DEFAULT_INPUT_MODE);
 
-    // A generated card is valid only for the exact prompt/reference recipe
-    // that produced it. Changing the 2/3/4-input mode, the base prompt, a
-    // brand profile, a template/Ozon/logo reference or the watch source makes
-    // an earlier READY result stale and returns it to the queue.
-    for (const entry of entries) {
-      if (runQueueMode === REGENERATION_QUEUE_ID) continue;
-      if (entry.status !== 'done') continue;
-      const expectedRecipeHash = await computeEntryRecipeHash({ ...job, inputMode }, queue, entry);
-      if (!expectedRecipeHash) continue;
-      if (!entry.recipeHash) {
-        // Migration for results created by 0.3.17 and older: their PNG/history
-        // was valid, but the recipe hash lived only on the slot and was lost
-        // at finalization. Backfill it once so future real prompt changes can
-        // still invalidate the result correctly.
-        entry.recipeHash = expectedRecipeHash;
-        const mem = generationMemory.items?.[entry.sourceId];
-        if (mem) mem.recipeHash = expectedRecipeHash;
-        const hist = history.items?.[entry.sourceId];
-        if (hist) hist.recipeHash = expectedRecipeHash;
-        continue;
-      }
-      if (expectedRecipeHash === entry.recipeHash) continue;
-      entry.status = 'pending';
-      entry.generatedAt = null;
-      entry.outputPath = null;
-      entry.outputHash = null;
-      entry.outputWidth = null;
-      entry.outputHeight = null;
-      entry.verificationMode = null;
-      entry.lastError = null;
-      entry.errorClass = null;
-      entry.nextRetryAt = null;
-      delete history.items[entry.sourceId];
-      history.ignored[entry.sourceId] = true;
-      setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.NOT_READY, {
-        statusSource: 'automatic',
-        generationStartedAt: null,
-        generatedAt: null,
-        outputPath: null,
-        outputHash: null,
-        outputWidth: null,
-        outputHeight: null,
-        verificationMode: null,
-        lastError: null,
-        errorClass: null,
-        nextRetryAt: null
-      });
-    }
-
     const runLimitValue = Number(job.runLimit);
     if (!Number.isSafeInteger(runLimitValue) || runLimitValue < 1 || runLimitValue > RUN_PART_SIZE) {
       throw new Error(`Количество фото за запуск должно быть от 1 до ${RUN_PART_SIZE}`);
@@ -7780,13 +8772,62 @@ async function startRun(options = {}) {
     const generationPauseMinutes = normalizeGenerationPauseMinutes(job.generationPauseMinutes);
     const generationJitterSeconds = normalizeGenerationJitterSeconds(job.generationJitterSeconds);
     const coverageMode = 'queue';
-    const plannedIds = runQueueMode === REGENERATION_QUEUE_ID
-      ? entries.filter((entry) => entry.status !== 'running').slice(0, runLimit).map((entry) => entry.sourceId)
-      : (explicitSelection
-        ? pendingEntryIdsForFilter(entries, runLimit, 'queue')
-        : pendingEntryIdsForFilter(entries, runLimit, coverageMode));
+    const canonicalBySku = new Map((commitAccountingSnapshot.entries || []).map((row) => [String(row.skuKey || ''), row]));
+    const canonicalCandidates = new Map((commitAccountingSnapshot.candidates || []).map((row) => [String(row.skuKey || ''), row]));
+    const taskCandidates = [];
+    const blocked = [];
+    for (const entry of entries) {
+      const skuKey = String(entry.skuKey || entry.sourceId || '');
+      const canonical = canonicalBySku.get(skuKey);
+      if (!canonical) {
+        blocked.push(`${entry.fileName || skuKey}: отсутствует в каноническом каталоге`);
+        continue;
+      }
+      if (canonical.sourcePresent !== true || canonical.identityStatus !== 'OK' || canonical.identityQuarantined) {
+        blocked.push(`${entry.fileName || skuKey}: идентичность модели требует сверки`);
+        continue;
+      }
+      if (canonical.activeAttempt?.active) {
+        blocked.push(`${entry.fileName || skuKey}: уже есть активная попытка генерации`);
+        continue;
+      }
+      if (runQueueMode === REGENERATION_QUEUE_ID) {
+        taskCandidates.push({ taskId: skuKey, sourceId: skuKey, kind: 'generate', explicitRepair: true,
+          generationId: null, factsJobId: null, outputPath: null, outputHash: null, chatUrl: null });
+        continue;
+      }
+      if (canonical.status === 'READY') continue;
+      const candidate = canonicalCandidates.get(skuKey);
+      if (canonical.status === 'NEEDS_FACTS') {
+        const target = candidate?.targetRevision || canonical.actionRevision;
+        const expectedHash = String(target?.outputHash || '');
+        if (candidate?.task !== 'facts' || !target?.generationId || !target?.factsJobId
+          || !target?.outputPath || !/^[a-f0-9]{64}$/i.test(expectedHash) || !target?.chatUrl
+          || canonical.artifactVerification?.status !== 'VERIFIED') {
+          blocked.push(`${entry.fileName || skuKey}: сохранённое изображение нельзя безопасно связать со спецификацией`);
+          continue;
+        }
+        taskCandidates.push({ taskId: skuKey, sourceId: skuKey, kind: 'facts',
+          generationId: String(target.generationId), factsJobId: String(target.factsJobId),
+          outputPath: String(target.outputPath), outputHash: expectedHash.toLowerCase(),
+          chatUrl: String(target.chatUrl), imageUrlFingerprint: target.imageUrlFingerprint || null });
+        continue;
+      }
+      if (canonical.status === 'NOT_READY' && canonical.nextTask === 'generate' && candidate?.task === 'generate') {
+        taskCandidates.push({ taskId: skuKey, sourceId: skuKey, kind: 'generate',
+          generationId: null, factsJobId: null, outputPath: null, outputHash: null, chatUrl: null });
+        continue;
+      }
+      blocked.push(`${entry.fileName || skuKey}: статус ${canonical.status} требует ручной сверки`);
+    }
+    const plannedTasks = taskCandidates.slice(0, runLimit);
+    if (explicitSelection && plannedTasks.length !== requestedIds.length) {
+      throw new Error('Канонический статус выбранных моделей изменился. Обнови очередь и выбери элементы заново.');
+    }
+    const plannedIds = plannedTasks.map((task) => task.sourceId);
     if (!plannedIds.length) {
       await chrome.storage.local.set({ queue, history, generationMemory });
+      if (blocked.length) throw new Error(`Запуск заблокирован: ${blocked.slice(0, 3).join('; ')}`);
       throw new Error('По выбранному фильтру нет новых товаров для генерации');
     }
     const run = {
@@ -7831,11 +8872,17 @@ async function startRun(options = {}) {
       rateLimitIgnoreUntil: null,
       rateLimitIgnoreAfterPause: null,
       rateLimitIgnoredSlots: [],
+      progressCompletionMode: 'ready',
+      completedTaskIds: [],
       plannedIds,
+      plannedTasks,
+      plannedTaskKinds: Object.fromEntries(plannedTasks.map((task) => [task.sourceId, task.kind])),
+      imagePlannedIds: plannedTasks.filter((task) => task.kind === 'generate').map((task) => task.sourceId),
       pendingIds: [...plannedIds],
       repairQueueClaims: runQueueMode === REGENERATION_QUEUE_ID
         ? Object.fromEntries(plannedIds.map((id) => [id, repairItems.find((item) => item.sourceId === id)?.queuedAt || null]))
         : {},
+      jobSnapshot: structuredClone(job),
       slots: {},
       factsProgress: {},
       postprocessTabs: {},
@@ -7873,21 +8920,34 @@ async function startRun(options = {}) {
       const entryId = run.pendingIds.shift();
       if (!entryId) break;
       const entry = entries.find((item) => item.sourceId === entryId);
-      entry.status = 'running';
-      entry.lastError = null;
-      entry.errorClass = null;
-      entry.nextRetryAt = null;
-      setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.RUNNING, {
-        statusSource: 'automatic',
-        generationStartedAt: new Date().toISOString(),
-        lastError: null,
-        lastRunId: run.operationId,
-        retryCount: Number(entry.retryCount || 0),
-        errorClass: null,
-        nextRetryAt: null,
-      });
-      delete history.items[entry.sourceId];
-      history.ignored[entry.sourceId] = true;
+      const task = plannedTaskForRun(run, entryId);
+      if (task.kind !== 'facts') {
+        entry.status = 'running';
+        entry.generatedAt = null;
+        entry.outputPath = null;
+        entry.outputHash = null;
+        entry.outputWidth = null;
+        entry.outputHeight = null;
+        entry.verificationMode = null;
+        entry.factsStatus = null;
+        entry.lastError = null;
+        entry.errorClass = null;
+        entry.nextRetryAt = null;
+        setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.RUNNING, {
+          statusSource: 'automatic',
+          generationStartedAt: new Date().toISOString(),
+          generatedAt: null,
+          outputPath: null,
+          outputHash: null,
+          lastError: null,
+          lastRunId: run.operationId,
+          retryCount: Number(entry.retryCount || 0),
+          errorClass: null,
+          nextRetryAt: null,
+        });
+        delete history.items[entry.sourceId];
+        history.ignored[entry.sourceId] = true;
+      }
       const slot = {
         slotId,
         tabId: null,
@@ -7926,6 +8986,7 @@ async function startRun(options = {}) {
         failed: false,
         rateLimitRetryNeeded: false
       };
+      applyPlannedTaskToSlot(slot, run, entryId);
       run.slots[slotId] = slot;
       recordRunEvent(run, 'slot_claimed', { slotId, entryId, leaseId: slot.leaseId, attempt: slot.attempt });
       assignments.push({ entry, slot });
@@ -7946,6 +9007,7 @@ async function startRun(options = {}) {
 }
 
 async function pauseRun(reason = 'USER', expectedRunId = null) {
+  if (reason === 'USER') await cancelSessionRestartForUserAction('pause');
   const result = await withStateLock(async () => {
     const stored = await getStored();
     const { run, queue } = stored;
@@ -7955,12 +9017,21 @@ async function pauseRun(reason = 'USER', expectedRunId = null) {
 
     const stateBeforePause = run.state;
     const requestedPauseReason = String(reason || 'USER').toUpperCase();
-    const pauseReason = ['ERROR', 'RESTART', 'IMAGE_LIMIT'].includes(requestedPauseReason)
+    if (['STOPPED', 'DONE'].includes(run.state)
+      || (requestedPauseReason !== 'USER' && (run.clockStopped || run.stopBlocked || run.pauseReason === 'USER'))) {
+      return { runId: null, cancelTabIds: [], cancelRevisions: [], observing: false };
+    }
+    const pauseReason = ['ERROR', 'RESTART', 'IMAGE_LIMIT', 'UPLOAD_LIMIT'].includes(requestedPauseReason)
       ? requestedPauseReason
       : 'USER';
-    if (pauseReason === 'USER' && run.stalledBatchRecovery?.kind === 'PREPARATION_STALL') {
+    if (pauseReason === 'USER' && run.stalledBatchRecovery) {
       run.stalledBatchRecovery.stage = 'MANUAL_PAUSE';
       run.stalledBatchRecovery.dueAt = null;
+    }
+    if (pauseReason === 'USER' && run.conversationRecovery
+      && ['INSPECTING', 'WAITING', 'REOPENING'].includes(run.conversationRecovery.stage)) {
+      run.conversationRecovery.stage = 'MANUAL_PAUSE';
+      run.conversationRecovery.dueAt = null;
     }
     recordRunEvent(run, 'run_pause_requested', {
       requestedReason: requestedPauseReason,
@@ -8003,6 +9074,31 @@ async function pauseRun(reason = 'USER', expectedRunId = null) {
     for (const slot of Object.values(run.slots || {})) {
       if (!slot.entryId) continue;
       const entry = groupEntries(queue, run.groupId).find((item) => item.sourceId === slot.entryId);
+      if (slot.savedFactsTask) {
+        const owner = slot.tabId ? run.postprocessTabs?.[String(slot.tabId)] : null;
+        if (owner && String(owner.entryId || '') === String(slot.entryId)
+          && String(owner.generationId || '') === String(slot.generationId || '')) {
+          // OCR on an already saved PNG may finish during a user pause. Keep
+          // its exact owner so the result can be persisted without relaunching
+          // generation or losing the planned READY task.
+          observing = true;
+          slot.status = 'FACTS_EXTRACTING';
+          slot.phase = SLOT_PHASES.OBSERVING;
+          continue;
+        }
+        if (slot.tabId) cancelTabIds.push(slot.tabId);
+        slot.tabId = null;
+        slot.entryId = null;
+        slot.status = 'IDLE';
+        slot.phase = SLOT_PHASES.IDLE;
+        slot.finalCheckPending = false;
+        slot.finalCheckDeadlineAt = null;
+        slot.finalCheckAttempts = 0;
+        slot.failed = false;
+        slot.leaseId = null;
+        Object.assign(slot, freshSlotRevisionFields());
+        continue;
+      }
       const submitted = slotGenerationSubmitted(slot);
 
       if (submitted) {
@@ -8061,9 +9157,7 @@ async function pauseRun(reason = 'USER', expectedRunId = null) {
     const entries = groupEntries(queue, run.groupId);
     const plannedIds = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
     const protectedIds = new Set(Object.values(run.slots || {}).filter((slot) => slot.entryId).map((slot) => slot.entryId));
-    run.pendingIds = entries
-      .filter((entry) => plannedIds.has(entry.sourceId) && entry.status !== 'done' && !protectedIds.has(entry.sourceId))
-      .map((entry) => entry.sourceId);
+    run.pendingIds = pendingPlannedIds(run, entries, protectedIds);
     run.status = observing ? 'PAUSED_RECOVERING' : (pauseReason === 'ERROR' ? 'PAUSED_ON_ERROR' : 'PAUSED');
     recordRunEvent(run, 'run_pause_applied', {
       requestedReason: requestedPauseReason,
@@ -8099,6 +9193,7 @@ async function pauseRun(reason = 'USER', expectedRunId = null) {
 }
 
 async function stopRun() {
+  await cancelSessionRestartForUserAction('stop');
   await setUserStopReloadBoundary(true).catch(() => {});
   try {
   const snapshot = await withStateLock(async () => {
@@ -8123,8 +9218,9 @@ async function stopRun() {
   const { run, queue } = snapshot;
   const entries = run ? groupEntries(queue, run.groupId) : [];
   const plannedIds = new Set(Array.isArray(run?.plannedIds) ? run.plannedIds : []);
-  const runTotal = plannedIds.size;
-  const runCompleted = entries.filter((entry) => plannedIds.has(entry.sourceId) && entry.status === 'done').length;
+  const progress = syncRunProgress(run, entries);
+  const runTotal = progress.runTotal || 0;
+  const runCompleted = progress.runCompleted || 0;
   const unsaved = run ? (await Promise.all(Object.values(run.slots || {}).map(async (slot) => {
     if (!slot.entryId || !slotGenerationSubmitted(slot)) return null;
     const entry = entries.find((item) => item.sourceId === slot.entryId);
@@ -8167,7 +9263,8 @@ async function stopRun() {
     reason: 'Пользователь остановил генерацию',
     automatic: false,
     salvageReady: true,
-    preserveLogs: true
+    preserveLogs: true,
+    preserveRunProgress: true
   });
   const stoppedAt = Date.now();
   const stoppedElapsedMs = run ? elapsedRunClock(run, stoppedAt) : null;
@@ -8187,6 +9284,7 @@ async function stopRun() {
     runTotal,
     runCompleted,
     runRemaining: Math.max(0, runTotal - runCompleted),
+    progressRunId: progress.progressRunId || null,
     slots: [],
     factsJobs: [],
     currentAction: 'Генерация остановлена. Подтверждённые результаты сохранены; незавершённые модели доступны для нового запуска.',
@@ -8552,6 +9650,602 @@ async function resultsTransferInfo() {
     lastImport: pending.lastResultsImport || null };
 }
 
+function canonicalSnapshotEntriesFromProjection(projection) {
+  return (projection?.entries || []).map((entry) => ({
+    skuKey: entry.skuKey,
+    brandId: entry.brandId,
+    model: entry.model,
+    identityStatus: entry.identityStatus,
+    identityCandidates: entry.identityCandidates,
+    identityQuarantined: entry.identityQuarantined,
+    identityQuarantine: entry.identityQuarantine,
+    outputRecoveryRequired: entry.outputRecoveryRequired,
+    artifactRecoveryPending: entry.artifactRecoveryPending,
+    outputRecoveryReason: entry.outputRecoveryReason,
+    outputRecoveryGenerationId: entry.outputRecoveryGenerationId,
+    status: entry.status,
+    statusReason: entry.statusReason,
+    acceptedGenerationId: entry.acceptedGenerationId,
+    acceptedRevision: entry.acceptedRevision,
+    actionRevision: entry.actionRevision,
+    activeAttempt: entry.activeAttempt,
+    replacementRequired: entry.replacementRequired,
+    retryRequired: entry.retryRequired,
+    sourcePresent: entry.sourcePresent,
+    groupIds: entry.groupIds,
+    nextTask: entry.nextTask,
+    artifactVerification: entry.artifactVerification,
+    revisionCount: entry.revisionCount
+  }));
+}
+
+function isIdentityMigrationSafeWhileIdle(run, sessionRestartIntent) {
+  if (sessionRestartIntent || runHasActiveAutomationWork(run)) return false;
+  if (!run) return true;
+  if (Object.keys(run.postprocessTabs || {}).length || Object.keys(run.recoveryTabs || {}).length) return false;
+  const slots = Object.values(run.slots || {});
+  if (slots.some((slot) => slot?.entryId || slot?.tabId)) return false;
+  // A completed slot may keep its old leaseId as audit history. That lease
+  // cannot own work once the slot is terminal, and must not keep canonical
+  // catalog reconciliation permanently deferred after the run is DONE.
+  if (slots.some((slot) => slot?.leaseId
+    && !['DONE', 'STOPPED', 'IDLE'].includes(String(slot.phase || slot.status || '').toUpperCase()))) return false;
+  return ['DONE', 'STOPPED', 'ERROR', 'IDLE'].includes(String(run.state || '').toUpperCase());
+}
+
+async function buildControlDiagnosticSnapshot() {
+  const value = await ensureGenerationMemoryState();
+  let runArchive = null;
+  let runArchiveError = null;
+  try {
+    const version = chrome.runtime.getManifest?.().version || null;
+    const operationId = value.run?.operationId || value.runtime?.operationId
+      || await latestDiagnosticOperationId({
+        storage: chrome.storage.local,
+        listArchives: listRunDiagnostics,
+        readOutbox: (id) => diagnosticOutbox.read(id),
+        version
+      });
+    if (operationId) {
+      runArchive = await completeRunDiagnostic(operationId, {
+        storage: chrome.storage.local,
+        readArchive: getRunDiagnostic,
+        readOutbox: (id) => diagnosticOutbox.read(id),
+        version
+      });
+    }
+    runArchiveError = runArchive?.archiveError || runArchive?.outboxReadError || null;
+  } catch (error) {
+    runArchiveError = error?.message || String(error);
+  }
+  const domSnapshots = [];
+  try {
+    const run = value.run || {};
+    const trackedTabIds = Object.values(run.slots || {})
+      .map((slot) => Number(slot?.tabId || 0))
+      .filter((tabId) => Number.isInteger(tabId) && tabId > 0);
+    const windowId = Number(value.runtime?.automationWindowId || run.automationWindowId || 0);
+    const tabs = typeof chrome.tabs?.query === 'function'
+      ? await chrome.tabs.query(windowId > 0 ? { windowId } : {})
+      : [];
+    const byId = new Map((tabs || []).filter((tab) => Number.isInteger(Number(tab?.id)))
+      .map((tab) => [Number(tab.id), tab]));
+    const candidates = [
+      ...trackedTabIds.map((tabId) => byId.get(tabId)).filter(Boolean),
+      ...(tabs || []).filter((tab) => {
+        try { return new URL(String(tab?.url || '')).hostname === 'chatgpt.com'; } catch (_) { return false; }
+      })
+    ];
+    const seenTabIds = new Set();
+    for (const tab of candidates) {
+      const tabId = Number(tab?.id || 0);
+      if (!Number.isInteger(tabId) || tabId <= 0 || seenTabIds.has(tabId)) continue;
+      seenTabIds.add(tabId);
+      if (seenTabIds.size > 12) break;
+      try {
+        const response = await sendTabMessage(tabId, { type: 'CAPTURE_DIAGNOSTICS', reason: 'manual' });
+        if (response?.ok && response.value) domSnapshots.push({ tabId, ...response.value });
+      } catch (_) {
+        // A closed, loading, or non-extension-instrumented page is simply omitted.
+      }
+    }
+  } catch (_) {
+    // DOM collection is best-effort and must never suppress the run archive.
+  }
+  const memoryItems = Object.values(value.generationMemory?.items || {});
+  return {
+    schemaVersion: 2,
+    exportedAt: new Date().toISOString(),
+    extensionVersion: chrome.runtime.getManifest?.().version || null,
+    runtime: value.runtime || null,
+    run: value.run || null,
+    runArchive,
+    runArchiveError,
+    domSnapshots,
+    logs: Array.isArray(value.logs) ? value.logs : [],
+    lastPreflight: value.lastPreflight || null,
+    domDiagnosticsMode: value.domDiagnosticsMode || null,
+    lastDiagnostic: value.lastDiagnostic || null,
+    job: value.job || null,
+    generationMemorySummary: {
+      total: memoryItems.length,
+      ready: memoryItems.filter((item) => item.status === 'ready').length,
+      running: memoryItems.filter((item) => item.status === 'running').length,
+      notReady: memoryItems.filter((item) => item.status === 'not_ready').length
+    },
+    activeMemoryItems: memoryItems
+      .filter((item) => item.status === 'running' || item.lastError)
+      .slice(-500)
+  };
+}
+
+async function ensureCanonicalIdentityMigration({ force = false } = {}) {
+  if (accountingIdentityMigrationInFlight) return accountingIdentityMigrationInFlight;
+  const cacheAge = Date.now() - accountingIdentityMigrationCheckedAt;
+  const pendingCacheTtl = accountingIdentityMigrationLastOutcome?.pending ? 5000 : 60000;
+  if (!force && accountingIdentityMigrationCheckedAt && cacheAge < pendingCacheTtl) {
+    return { ...accountingIdentityMigrationLastOutcome, cached: true };
+  }
+  accountingIdentityMigrationInFlight = withStateLock(async () => {
+    const local = await chrome.storage.local.get(['run', 'sessionRestartIntent']);
+    const safeToMutate = isIdentityMigrationSafeWhileIdle(local.run, local.sessionRestartIntent);
+    if (!safeToMutate && accountingIdentityMigrationLastOutcome?.checked === true
+      && accountingIdentityMigrationLastOutcome?.pending !== true) {
+      return { ...accountingIdentityMigrationLastOutcome, cached: true, deferredForActiveRun: true };
+    }
+    if (!safeToMutate) return { checked: false, pending: true, reason: 'active_run' };
+    const records = await getAccountingRecords();
+    if (!records.catalog.length) {
+      return { checked: true, pending: true, reason: 'legacy_catalog_missing' };
+    }
+    const plan = buildIdentityMigrationPlan({
+      catalogRows: records.catalog,
+      revisions: records.revisions,
+      factsRows: records.facts
+    });
+    const revisionMoves = Array.isArray(plan.revisionMoves) ? plan.revisionMoves : [];
+    const catalogAssignments = Array.isArray(plan.catalogAssignments) ? plan.catalogAssignments : [];
+    const quarantined = Array.isArray(plan.quarantined) ? plan.quarantined : [];
+    if (!safeToMutate) return { checked: false, pending: true, reason: 'active_run' };
+    if (!revisionMoves.length && !catalogAssignments.length && !quarantined.length) {
+      return { checked: true, pending: false, applied: false, quarantined: 0 };
+    }
+    const backupKey = `canonical-identity-v${Number(plan.version || 1)}-${stableHash({ revisionMoves, catalogAssignments, quarantined })}`;
+    const result = await applyExplicitIdentityMigration(plan, { backupId: backupKey });
+    const catalog = await getAllModelCatalog({ includeRemoved: true });
+    const currentStorage = await chrome.storage.local.get('queue');
+    if (currentStorage.queue?.groups && catalog.length) {
+      await chrome.storage.local.set({ queue: {
+        ...currentStorage.queue,
+        groups: queueGroupsFromCatalog(catalog, currentStorage.queue.groups || {})
+      } });
+    }
+    accountingSnapshotCache = null;
+    return { checked: true, pending: false, applied: true, backupId: backupKey, result };
+  }).then((outcome) => {
+    accountingIdentityMigrationLastOutcome = outcome;
+    accountingIdentityMigrationCheckedAt = Date.now();
+    return outcome;
+  }).finally(() => { accountingIdentityMigrationInFlight = null; });
+  return accountingIdentityMigrationInFlight;
+}
+
+function accountingRevisionArtifacts(records) {
+  const byGeneration = new Map((records.revisions || []).map((revision) => [String(revision.generationId || ''), revision]));
+  const bySource = new Map((records.catalog || []).map((model) => [String(model.sourceId || model.skuKey || ''), model]));
+  const fileVerifiedJournals = new Map((records.outputRecovery || [])
+    .filter((row) => ['attempt_started', 'file_verified'].includes(row.state) && row.outputPath && row.outputHash)
+    .map((row) => [String(row.generationId), row]));
+  const selectedIds = new Set();
+  for (const model of records.catalog || []) {
+    for (const id of [model.latestReadyGenerationId, model.currentGenerationId]) {
+      if (id) selectedIds.add(String(id));
+    }
+  }
+  for (const [generationId, journal] of fileVerifiedJournals) {
+    const model = bySource.get(String(journal.sourceId));
+    if (String(model?.currentGenerationId || '') === generationId) selectedIds.add(generationId);
+  }
+  return [...selectedIds].flatMap((generationId) => {
+    const revision = byGeneration.get(generationId);
+    const journal = fileVerifiedJournals.get(generationId);
+    const sourceId = String(revision?.sourceId || journal?.sourceId || '');
+    const model = bySource.get(sourceId);
+    if (revision && (revision.reviewStatus === 'rejected' || revision.identityQuarantined
+      || revision.supersededBySessionRestartId)) return [];
+    if (journal && (String(journal.sourceId) !== sourceId
+      || String(model?.currentGenerationId || '') !== generationId
+      || (revision?.outputPath && String(revision.outputPath).replaceAll('\\', '/') !== String(journal.outputPath).replaceAll('\\', '/'))
+      || (revision?.outputHash && String(revision.outputHash).toLowerCase() !== String(journal.outputHash).toLowerCase()))) return [];
+    const outputPath = revision?.outputPath || journal?.outputPath;
+    const outputHash = revision?.outputHash || journal?.outputHash;
+    if (!revision && !journal) return [];
+    if (!outputPath || !/^[a-f0-9]{64}$/i.test(String(outputHash || ''))) return [];
+    return [{ ...(revision || {}), generationId, sourceId, outputPath, outputHash,
+      _accountingJournal: journal || null, _accountingCatalog: model || null }];
+  });
+}
+
+async function recoverFileVerifiedAccountingArtifacts(records, checks = {}) {
+  const revisions = new Map((records.revisions || []).map((row) => [String(row.generationId || ''), row]));
+  const models = new Map((records.catalog || []).map((row) => [String(row.sourceId || row.skuKey || ''), row]));
+  let recovered = 0;
+  for (const journal of records.outputRecovery || []) {
+    if (!['attempt_started', 'file_verified'].includes(journal.state)
+      || !journal.outputPath || !journal.outputHash) continue;
+    const generationId = String(journal.generationId || '');
+    const sourceId = String(journal.sourceId || '');
+    const model = models.get(sourceId);
+    if (!generationId || !sourceId || String(model?.currentGenerationId || '') !== generationId
+      || model?.identityQuarantined) continue;
+    const previous = revisions.get(generationId) || null;
+    if (previous && (String(previous.sourceId || '') !== sourceId || previous.reviewStatus === 'rejected'
+      || previous.identityQuarantined || previous.supersededBySessionRestartId
+      || (previous.outputPath && String(previous.outputPath).replaceAll('\\', '/') !== String(journal.outputPath || '').replaceAll('\\', '/'))
+      || (previous.outputHash && String(previous.outputHash).toLowerCase() !== String(journal.outputHash || '').toLowerCase()))) continue;
+    const candidate = { ...(previous || {}), generationId, sourceId,
+      outputPath: journal.outputPath, outputHash: journal.outputHash };
+    const proof = verifiedJournalProofForRevision(candidate, checks[generationId]);
+    if (!proof) continue;
+    const sourceVariantId = previous?.sourceVariantId || (model.variants || [])
+      .find((variant) => String(variant.generationId || '') === generationId)?.sourceVariantId || null;
+    const fileName = previous?.fileName || previous?.outputFileName || String(journal.outputPath).split('/').at(-1);
+    const recoveredRevision = await persistGenerationImageRevision({
+      ...previous,
+      generationId,
+      sourceId,
+      skuKey: sourceId,
+      sourceVariantId,
+      modelName: previous?.modelName || model.modelName || model.title || null,
+      fileName,
+      outputFileName: previous?.outputFileName || fileName,
+      outputPath: journal.outputPath,
+      outputHash: journal.outputHash,
+      factsJobId: previous?.factsJobId || stableHash({ generationId, extractorVersion: FACTS_EXTRACTOR_VERSION }),
+      factsExtractorVersion: previous?.factsExtractorVersion || FACTS_EXTRACTOR_VERSION,
+      factsStatus: previous?.factsStatus || 'pending',
+      facts: previous?.facts || null,
+      chatUrl: previous?.chatUrl || null,
+      createdAt: previous?.createdAt || journal.startedAt,
+      recoveredFromOutputJournal: true,
+      fileVerification: proof
+    }).catch((error) => ({ registered: false, reason: error?.message || String(error) }));
+    if (recoveredRevision?.registered) recovered += 1;
+  }
+  return recovered;
+}
+
+async function hashFileForAccounting(file) {
+  if (!file || !crypto?.subtle || typeof file.arrayBuffer !== 'function') throw new Error('file_hash_unavailable');
+  const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', await file.arrayBuffer()));
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function verifyCustomAccountingArtifact(revision, outputHandle) {
+  const rawPath = String(revision.outputPath || '');
+  const pathParts = rawPath.replace(/^custom:\/\//i, '').split('/').filter(Boolean);
+  if (pathParts.length < 3 || !outputHandle || String(pathParts[0]) !== String(outputHandle.name || '')) {
+    return { path: rawPath, exists: null, verified: false, error: 'custom_output_permission_or_path_unavailable' };
+  }
+  const permission = await permissionForDirectoryHandle(outputHandle, 'read');
+  if (permission !== 'granted') return { path: rawPath, exists: null, verified: false, error: 'custom_output_permission_unavailable' };
+  try {
+    let directory = outputHandle;
+    for (const name of pathParts.slice(1, -1)) directory = await directory.getDirectoryHandle(name, { create: false });
+    const fileHandle = await directory.getFileHandle(pathParts.at(-1), { create: false });
+    const file = await fileHandle.getFile();
+    const signature = `${Number(file.size || 0)}:${Number(file.lastModified || 0)}`;
+    const cached = customArtifactVerificationCache.get(rawPath);
+    let verification = cached?.signature === signature && cached.expectedHash === String(revision.outputHash).toLowerCase()
+      && Date.now() - Number(cached.checkedAt || 0) < 30000
+      ? cached.value
+      : null;
+    if (!verification) {
+      const inspected = await verifyPngBlob(file);
+      const sha256 = inspected.sha256 || null;
+      verification = {
+        path: rawPath,
+        exists: true,
+        verified: inspected.verified === true,
+        valid: inspected.valid === true,
+        sha256,
+        hashMatches: Boolean(sha256 && sha256.toLowerCase() === String(revision.outputHash).toLowerCase()),
+        size: Number(file.size || 0),
+        checkedAt: new Date().toISOString(),
+        error: inspected.valid === false ? inspected.reason || 'invalid_png' : undefined
+      };
+      customArtifactVerificationCache.set(rawPath, {
+        signature,
+        expectedHash: String(revision.outputHash).toLowerCase(),
+        checkedAt: Date.now(),
+        value: verification
+      });
+    }
+    return verification;
+  } catch (error) {
+    if (error?.name === 'NotFoundError') {
+      return { path: rawPath, exists: false, verified: true, valid: false, hashMatches: false,
+        size: 0, checkedAt: new Date().toISOString(), error: 'file_missing' };
+    }
+    return { path: rawPath, exists: null, verified: false, error: error?.message || String(error) };
+  }
+}
+
+async function verifyCanonicalArtifacts(revisions = []) {
+  const checks = {};
+  const downloads = [];
+  const custom = revisions.filter((revision) => String(revision.outputPath || '').startsWith('custom://'));
+  for (const revision of revisions) {
+    if (!String(revision.outputPath || '').startsWith('custom://')) downloads.push(revision);
+  }
+  let verificationAvailable = true;
+  let failureReason = null;
+  if (downloads.length) {
+    for (let offset = 0; offset < downloads.length; offset += 250) {
+      const batch = downloads.slice(offset, offset + 250);
+      try {
+        // MV3 fetch can omit Origin. Reuse the installation-scoped loopback
+        // identity already used by updates and result transfers.
+        const identity = await getDevControlClientIdentity();
+        const endpoint = `${OUTPUT_ACCOUNTING_VERIFY_ENDPOINT}?${new URLSearchParams(identity)}`;
+        const response = await fetchWithTimeout(endpoint, {
+          method: 'POST',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ artifacts: batch.map((revision) => ({
+            generationId: String(revision.generationId),
+            path: String(revision.outputPath),
+            outputHash: String(revision.outputHash).toLowerCase()
+          })) })
+        }, 45000);
+        if (!response.ok) throw new Error(`output_verifier_http_${response.status}`);
+        const payload = await response.json();
+        if (payload?.ok !== true || !payload.checks || typeof payload.checks !== 'object') {
+          throw new Error('output_verifier_response_invalid');
+        }
+        for (const revision of batch) {
+          const check = payload.checks[String(revision.generationId)];
+          if (!check || typeof check !== 'object') {
+            checks[String(revision.generationId)] = {
+              path: revision.outputPath, exists: null, verified: false,
+              error: 'artifact_check_missing_from_verifier'
+            };
+            continue;
+          }
+          checks[String(revision.generationId)] = { ...check,
+            path: check.path || revision.outputPath,
+            sha256: check.sha256 || null,
+            hashMatches: check.hashMatches === true
+              && String(check.sha256 || '').toLowerCase() === String(revision.outputHash).toLowerCase()
+          };
+        }
+        const unknownCheck = batch.map((revision) => checks[String(revision.generationId)])
+          .find((check) => check?.verified !== true
+            && !(check?.exists === false && check?.verified === true));
+        if (unknownCheck) {
+          verificationAvailable = false;
+          failureReason = unknownCheck.error || 'artifact_check_unavailable';
+          break;
+        }
+      } catch (error) {
+        verificationAvailable = false;
+        failureReason = error?.message || String(error);
+        break;
+      }
+    }
+  }
+  if (custom.length) {
+    const outputHandle = await getOutputDirectoryHandle().catch(() => null);
+    if (!outputHandle) {
+      verificationAvailable = false;
+      failureReason ||= 'custom_output_handle_missing';
+    } else {
+      for (let offset = 0; offset < custom.length; offset += 4) {
+        const batch = custom.slice(offset, offset + 4);
+        const results = await Promise.all(batch.map(async (revision) => [
+          String(revision.generationId), await verifyCustomAccountingArtifact(revision, outputHandle)
+        ]));
+        for (const [id, check] of results) {
+          checks[id] = check;
+          if (check.verified !== true) {
+            verificationAvailable = false;
+            failureReason ||= check.error || 'custom_output_verification_unavailable';
+          }
+        }
+      }
+    }
+  }
+  return { checks, verificationAvailable, failureReason };
+}
+
+function verifiedJournalProofForRevision(revision, check) {
+  const sha256 = String(check?.sha256 || check?.actualHash || '').toLowerCase();
+  const sizeBytes = Number(check?.size ?? check?.sizeBytes ?? 0);
+  if (check?.verified !== true || check?.exists !== true || check?.valid !== true
+    || check?.hashMatches !== true || !/^[a-f0-9]{64}$/.test(sha256)
+    || sha256 !== String(revision.outputHash || '').toLowerCase()
+    || String(check.path || '').replaceAll('\\', '/') !== String(revision.outputPath || '').replaceAll('\\', '/')
+    || !Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) return null;
+  return {
+    verified: true, exists: true, isFile: true,
+    generationId: String(revision.generationId), sourceId: String(revision.sourceId),
+    outputPath: String(revision.outputPath), outputHash: String(revision.outputHash).toLowerCase(),
+    sizeBytes, verifiedAt: check.checkedAt || new Date().toISOString()
+  };
+}
+
+async function refreshCanonicalAccountingSnapshot({ force = false } = {}) {
+  if (!force && accountingSnapshotCache && Date.now() - accountingSnapshotCheckedAt < 5000) return accountingSnapshotCache;
+  if (accountingSnapshotInFlight) {
+    if (!force) return accountingSnapshotInFlight;
+    await accountingSnapshotInFlight.catch(() => null);
+  }
+  if (accountingSnapshotInFlight) return accountingSnapshotInFlight;
+  accountingSnapshotInFlight = (async () => {
+    const migration = await ensureCanonicalIdentityMigration({ force });
+    let records = await getAccountingRecords();
+    let revisionsToVerify = accountingRevisionArtifacts(records);
+    let verification = await verifyCanonicalArtifacts(revisionsToVerify);
+    if (verification.verificationAvailable) {
+      const recoveredFromJournal = await recoverFileVerifiedAccountingArtifacts(records, verification.checks);
+      if (recoveredFromJournal) {
+        records = await getAccountingRecords();
+        revisionsToVerify = accountingRevisionArtifacts(records);
+        verification = await verifyCanonicalArtifacts(revisionsToVerify);
+      }
+    }
+    if (verification.verificationAvailable) {
+      const existingJournalIds = new Set((records.outputRecovery || [])
+        .filter((row) => row.state === 'revision_registered')
+        .map((row) => String(row.generationId)));
+      const toRegister = revisionsToVerify.flatMap((revision) => {
+        if (existingJournalIds.has(String(revision.generationId))) return [];
+        const fileVerification = verifiedJournalProofForRevision(revision, verification.checks[String(revision.generationId)]);
+        return fileVerification ? [{ revision, fileVerification }] : [];
+      });
+      if (toRegister.length) {
+        await recordExistingVerifiedRevisions(toRegister);
+        records = await getAccountingRecords();
+      }
+    }
+    const local = await chrome.storage.local.get(['run', 'accountingSnapshot']);
+    const run = local.run || null;
+    const liveGenerationIds = [];
+    if (run && ['RUNNING', 'STARTING', 'DRAINING', 'PAUSED'].includes(String(run.state || '').toUpperCase())) {
+      for (const slot of Object.values(run.slots || {})) {
+        if (slot.entryId && slot.generationId) liveGenerationIds.push(String(slot.generationId));
+      }
+      for (const owner of Object.values(run.postprocessTabs || {})) {
+        if (owner.entryId && owner.generationId) liveGenerationIds.push(String(owner.generationId));
+      }
+    }
+    const verificationRevisions = new Map(revisionsToVerify.map((revision) => [String(revision.generationId), revision]));
+    const artifactChecks = Object.fromEntries(Object.entries(verification.checks || {}).map(([id, check]) => {
+      const revision = verificationRevisions.get(id);
+      const verified = verifiedJournalProofForRevision(revision || {}, check);
+      return [id, verified ? { ...check, verified: true, exists: true, valid: true,
+        sha256: verified.outputHash, hashMatches: true, path: verified.outputPath } : check];
+    }));
+    const projected = projectCanonicalAccounting({
+      catalog: records.catalog,
+      revisions: records.revisions,
+      facts: records.facts,
+      outputRecovery: records.outputRecovery,
+      artifactChecks,
+      liveGenerationIds
+    });
+    const entries = canonicalSnapshotEntriesFromProjection(projected);
+    const migrationPending = migration.pending === true;
+    const reconciliationState = !records.catalog.length
+      ? 'legacy_catalog_missing'
+      : migrationPending ? (migration.reason || 'identity_migration_pending')
+      : verification.verificationAvailable ? 'ready' : 'artifact_verification_unavailable';
+    const base = {
+      version: 1,
+      scopeKey: 'all',
+      generatedAt: new Date().toISOString(),
+      stale: !verification.verificationAvailable,
+      staleReason: verification.failureReason || null,
+      verificationAvailable: verification.verificationAvailable,
+      reconciliationComplete: Boolean(records.catalog.length && !migrationPending && verification.verificationAvailable),
+      reconciliationState,
+      migrationPending,
+      entries,
+      counts: projected.counts,
+      eligibleCounts: projected.eligibleCounts,
+      quarantinedCount: projected.quarantinedCount,
+      quarantinedEntries: projected.quarantinedEntries,
+      outputRecoveryRequiredCount: projected.outputRecoveryRequiredCount,
+      outputRecoveryRequiredEntries: projected.outputRecoveryRequiredEntries,
+      candidates: projected.candidates,
+      candidateCounts: projected.candidateCounts,
+      queueSummary: {
+        catalogRows: records.catalog.length,
+        revisionRows: records.revisions.length,
+        factsRows: records.facts.length,
+        acceptedReady: projected.eligibleCounts.ready,
+        candidates: projected.candidateCounts.total
+      }
+    };
+    if (!verification.verificationAvailable) {
+      const previous = local.accountingSnapshot || accountingSnapshotCache;
+      const semantic = previous?.semanticFingerprint || stableHash(base);
+      const snapshot = previous
+        ? { ...previous, generatedAt: base.generatedAt, stale: true,
+          staleReason: verification.failureReason || 'verification_unavailable',
+          verificationAvailable: false,
+          revision: Math.max(Number(previous.revision || 0), Number(local.accountingSnapshot?.revision || 0)) + (previous.stale ? 0 : 1),
+          snapshotSequence: Math.max(Number(previous.snapshotSequence || previous.revision || 0), Number(local.accountingSnapshot?.snapshotSequence || 0)) + (previous.stale ? 0 : 1),
+          semanticFingerprint: semantic }
+        : { ...base, entries: [], candidates: [], stale: true,
+          staleReason: verification.failureReason || 'verification_unavailable',
+          reconciliationComplete: false, revision: 1, snapshotSequence: 1,
+          semanticFingerprint: semantic };
+      accountingSnapshotCache = snapshot;
+      accountingSnapshotCheckedAt = Date.now();
+      if (!local.accountingSnapshot?.stale) await chrome.storage.local.set({ accountingSnapshot: snapshot });
+      return snapshot;
+    }
+    const semanticFingerprint = stableHash({
+      entries: entries.map((entry) => ({
+        skuKey: entry.skuKey, status: entry.status, identityStatus: entry.identityStatus,
+        acceptedGenerationId: entry.acceptedGenerationId, nextTask: entry.nextTask,
+        replacementRequired: entry.replacementRequired, sourcePresent: entry.sourcePresent,
+        outputRecoveryRequired: entry.outputRecoveryRequired,
+        outputRecoveryReason: entry.outputRecoveryReason,
+        outputRecoveryGenerationId: entry.outputRecoveryGenerationId,
+        acceptedRevision: entry.acceptedRevision ? {
+          generationId: entry.acceptedRevision.generationId,
+          factsJobId: entry.acceptedRevision.factsJobId,
+          factsStatus: entry.acceptedRevision.factsStatus,
+          status: entry.acceptedRevision.status,
+          outputPath: entry.acceptedRevision.outputPath,
+          outputHash: entry.acceptedRevision.outputHash,
+          chatUrl: entry.acceptedRevision.chatUrl,
+          recipeHash: entry.acceptedRevision.recipeHash
+        } : null,
+        activeAttempt: entry.activeAttempt ? {
+          generationId: entry.activeAttempt.generationId,
+          status: entry.activeAttempt.status,
+          active: entry.activeAttempt.active,
+          stale: entry.activeAttempt.stale,
+          outputPath: entry.activeAttempt.outputPath,
+          outputHash: entry.activeAttempt.outputHash,
+          factsJobId: entry.activeAttempt.factsJobId
+        } : null,
+        artifactVerification: entry.artifactVerification ? {
+          status: entry.artifactVerification.status,
+          verified: entry.artifactVerification.verified,
+          exists: entry.artifactVerification.exists,
+          hashMatches: entry.artifactVerification.hashMatches,
+          reason: entry.artifactVerification.reason
+        } : null,
+        variants: (entry.model?.variants || []).map((variant) => [
+          variant.sourceVariantId || variant.variantId || variant.assetKey,
+          variant.groupId, variant.status, variant.partitionOrderKey
+        ])
+      })),
+      counts: projected.counts,
+      candidates: projected.candidates,
+      reconciliationState
+    });
+    const previous = local.accountingSnapshot || accountingSnapshotCache;
+    const changed = !previous || previous.semanticFingerprint !== semanticFingerprint || previous.stale === true;
+    const revision = Number(previous?.revision || previous?.snapshotSequence || 0) + (changed ? 1 : 0);
+    const snapshot = {
+      ...base,
+      revision,
+      snapshotSequence: revision,
+      semanticFingerprint
+    };
+    accountingSnapshotCache = snapshot;
+    accountingSnapshotCheckedAt = Date.now();
+    if (changed || !local.accountingSnapshot) await chrome.storage.local.set({ accountingSnapshot: snapshot });
+    return snapshot;
+  })().finally(() => { accountingSnapshotInFlight = null; });
+  return accountingSnapshotInFlight;
+}
+
 async function fastRuntimeState() {
   // Status polling must never run syncQueueWithHistory, read the multi-thousand
   // item queue, or enter stateChain. publishRun already stores compact slot and
@@ -8606,8 +10300,22 @@ async function ensureGenerationMemoryState() {
         generationMemory: synced.memory
       });
     }
+    let runtime = stored.runtime;
+    if (stored.run && Array.isArray(stored.run.plannedIds)) {
+      // Heal an already-open legacy run even if it is paused and receives no
+      // further page events. This read is queue-backed and holds the state lock.
+      const beforeProgress = JSON.stringify(stored.run.progress || null);
+      const progress = syncRunProgress(stored.run, groupEntries(synced.queue, stored.run.groupId));
+      if (beforeProgress !== JSON.stringify(stored.run.progress)) {
+        await chrome.storage.local.set({ run: stored.run });
+      }
+      if (Object.entries(progress).some(([key, value]) => runtime?.[key] !== value)) {
+        runtime = await updateRuntime(runSummary(stored.run, synced.queue));
+      }
+    }
     return {
       ...stored,
+      runtime,
       queue: synced.queue,
       history: synced.history,
       generationMemory: synced.memory
@@ -8664,11 +10372,14 @@ async function resumeInterruptedSessionReset(intent = {}) {
   return resetRunAndRescan({
     reason: `Завершаю прерванный сброс: ${String(intent.reason || 'Сброс сессии')}`,
     automatic: intent.automatic === true,
+    sessionRestart: intent.sessionRestart === true,
     salvageReady: intent.salvageReady !== false,
     preserveLogs: intent.preserveLogs === true,
+    preserveRunProgress: intent.preserveRunProgress === true,
     cleanupTabIds: Array.isArray(intent.cleanupTabIds) ? intent.cleanupTabIds : [],
     cleanupWindowId: Number(intent.cleanupWindowId || 0),
-    cleanupWindowOwned: intent.cleanupWindowOwned === true
+    cleanupWindowOwned: intent.cleanupWindowOwned === true,
+    plannedOnly: intent.plannedOnly || null
   });
 }
 
@@ -8676,12 +10387,16 @@ async function performResetRunAndRescan(options = {}) {
   const {
     reason = 'Сессия генерации сброшена пользователем',
     automatic = false,
+    sessionRestart = false,
     salvageReady = true,
     preserveLogs = false,
+    preserveRunProgress = false,
     cleanupTabIds = [],
     cleanupWindowId = 0,
-    cleanupWindowOwned = false
+    cleanupWindowOwned = false,
+    plannedOnly = null
   } = options;
+  if (!automatic) await cancelSessionRestartForUserAction('reset');
 
   // Store the reset request before page probing or state-lock waits. If Chrome
   // reloads the extension mid-reset, startup must finish clearing this run
@@ -8691,19 +10406,22 @@ async function performResetRunAndRescan(options = {}) {
       requestedAt: new Date().toISOString(),
       reason,
       automatic,
+      sessionRestart,
       salvageReady,
       preserveLogs,
+      preserveRunProgress,
       cleanupTabIds: [...new Set(cleanupTabIds.map((value) => Number(value || 0)).filter((value) => value > 0))],
       cleanupWindowId: Number(cleanupWindowId || 0),
-      cleanupWindowOwned
+      cleanupWindowOwned,
+      plannedOnly
     }
   });
 
   stopAuditMonitor();
   await updateRuntime({
     state: 'RECONCILING',
-    status: automatic ? 'MIGRATING' : 'RESETTING',
-    currentAction: automatic
+    status: sessionRestart ? 'SESSION_RESTARTING' : (automatic ? 'MIGRATING' : 'RESETTING'),
+    currentAction: sessionRestart ? 'Восстанавливаю сессию и продолжаю исходный список…' : automatic
       ? 'Обновляю состояние расширения и сверяю сохранённые ревизии…'
       : 'Сбрасываю временную сессию и сверяю сохранённые ревизии…',
     stopBlocked: null,
@@ -8831,6 +10549,7 @@ async function performResetRunAndRescan(options = {}) {
     }
 
     for (const sourceId of resetSourceIds) {
+      if (plannedOnly && !plannedOnly.includes(sourceId)) continue;
       const rows = rowsBySource.get(String(sourceId)) || [];
       if (!rows.length) continue;
       const memoryRecord = generationMemory.items[sourceId] || null;
@@ -8856,6 +10575,7 @@ async function performResetRunAndRescan(options = {}) {
     // Older builds could leave memory rows marked RUNNING even after the run
     // object was lost. A session reset must never keep those phantom jobs.
     for (const record of Object.values(generationMemory.items || {})) {
+      if (plannedOnly && !plannedOnly.includes(record.sourceId)) continue;
       if (normalizeGenerationMemoryStatus(record.status) !== GENERATION_MEMORY_STATUSES.RUNNING) continue;
       const rows = record.sourceId ? (rowsBySource.get(String(record.sourceId)) || []) : [];
       const matchingEntry = rows.find((entry) => generationMemoryMatchesQueueEntry(record, entry))
@@ -8909,7 +10629,9 @@ async function performResetRunAndRescan(options = {}) {
 
     if (run?.operationId) {
       const planned = new Set(Array.isArray(run.plannedIds) ? run.plannedIds : []);
-      const completedCount = allQueueEntries(queue).filter((entry) => planned.has(entry.sourceId) && entry.status === 'done').length;
+      const completedCount = run.progressCompletionMode === 'ready'
+        ? new Set((run.completedTaskIds || []).map(String)).size
+        : allQueueEntries(queue).filter((entry) => planned.has(entry.sourceId) && entry.status === 'done').length;
       const previousState = run.state;
       run.state = 'RESET';
       run.status = automatic ? 'RESET_AUTOMATICALLY' : 'RESET_BY_USER';
@@ -8927,6 +10649,7 @@ async function performResetRunAndRescan(options = {}) {
         downloadsStartedBeforeReset: probe.downloadsStarted
       });
       await flushRunDiagnosticsSafely(run, queue);
+      await persistRunDiagnosticDecision(run, queue, true);
     }
 
     await chrome.storage.local.set({
@@ -8947,27 +10670,45 @@ async function performResetRunAndRescan(options = {}) {
   if (chrome.alarms?.clear) await chrome.alarms.clear(STALLED_BATCH_RECOVERY_ALARM_NAME).catch(() => {});
   if (automationWindowOwned && automationWindowId) await chrome.windows.remove(automationWindowId).catch(() => {});
 
+  let resetSnapshot = null;
+  try {
+    accountingSnapshotCache = null;
+    resetSnapshot = await refreshCanonicalAccountingSnapshot({ force: true });
+  } catch (error) {
+    await appendLog('После сброса не удалось обновить канонический счётчик готовых результатов', {
+      error: error?.message || String(error)
+    });
+  }
+  const canonicalReadyCount = resetSnapshot?.reconciliationComplete === true
+    && resetSnapshot?.stale !== true
+    ? Number(resetSnapshot.eligibleCounts?.ready || 0)
+    : null;
+  const resetAction = canonicalReadyCount == null
+    ? 'Сессия сброшена. Проверка результатов недоступна; количество готовых результатов не подтверждено.'
+    : `Сессия сброшена. Подтверждено готовых результатов: ${canonicalReadyCount}.`;
   await updateRuntime({
-    operationId: null,
-    state: 'IDLE',
-    status: 'IDLE',
+    operationId: sessionRestart ? initialRunId : null,
+    state: sessionRestart ? 'RECONCILING' : preserveRunProgress ? 'STOPPED' : 'IDLE',
+    status: sessionRestart ? 'RECONCILING' : preserveRunProgress ? 'STOPPED' : 'IDLE',
     queueGroup: null,
     activeSlots: 0,
     completed: 0,
     pending: 0,
     rateLimitPauseUntil: null,
-    currentAction: `Сессия сброшена. Состояние восстановлено по сохранённым ревизиям: ${restoredFromRevisions}.`,
+    currentAction: resetAction,
     stopBlocked: null,
     conversationRecovery: null,
     error: null,
     buildId: EXTENSION_BUILD_ID
   });
   await chrome.storage.local.remove('sessionResetIntent');
-  await appendLog(automatic ? 'Автосброс состояния после обновления расширения' : 'Сессия сброшена и ревизии сверены с памятью приложения', {
+  await appendLog(sessionRestart ? 'Полный автосброс зависшей сессии' : automatic ? 'Автосброс состояния после обновления расширения' : 'Сессия сброшена и ревизии сверены с памятью приложения', {
     reason,
     oldRunId: initialRunId,
     resetRecords,
     restoredFromRevisions,
+    canonicalReadyCount,
+    canonicalReconciliationComplete: resetSnapshot?.reconciliationComplete === true,
     closedTabs: ownedTabIds.length,
     probedTabs: probe.checked,
     downloadsStartedBeforeReset: probe.downloadsStarted,
@@ -8979,6 +10720,8 @@ async function performResetRunAndRescan(options = {}) {
     oldRunId: initialRunId,
     resetRecords,
     restoredFromRevisions,
+    canonicalReadyCount,
+    canonicalReconciliationComplete: resetSnapshot?.reconciliationComplete === true,
     closedTabs: ownedTabIds.length,
     probedTabs: probe.checked,
     downloadsStartedBeforeReset: probe.downloadsStarted
@@ -9082,6 +10825,43 @@ function errorContextMatchesSlot(run, context = {}) {
 async function pauseRunOnError(runId, error, context = {}) {
   const owner = (await getStored()).run;
   if (!owner || owner.operationId !== runId || !errorContextMatchesSlot(owner, context)) return;
+  const physicalSendAtMs = Number(context.physicalSendAtMs || 0);
+  if (Number.isFinite(physicalSendAtMs) && physicalSendAtMs > 0 && context.leaseId && !context.rateLimitBeforeAssistant) {
+    // ERROR can be the first telemetry delivered after a physical click. Keep
+    // that fact before quotas and deduplication decide how to recover the slot.
+    await withStateLock(async () => {
+      const { run, queue } = await getStored();
+      if (!run || run.operationId !== runId || ['STOPPED', 'DONE'].includes(run.state)
+        || !errorContextMatchesSlot(run, context)) return;
+      const slot = run.slots?.[context.slotId];
+      if (!slot || slot.leaseId !== context.leaseId || currentLeasePhysicalSend(slot)
+        || physicalSendAtMs <= Number(slot.rejectedSendAtMs || 0)) return;
+      slot.physicalSendAtMs = physicalSendAtMs;
+      slot.physicalSendLeaseId = context.leaseId;
+      slot.lastSendClickedAt = new Date(physicalSendAtMs).toISOString();
+      slot.preparedForSubmit = false;
+      slot.pageSubmissionLeaseId = context.leaseId;
+      slot.pageGenerationSubmitted = true;
+      slot.generationSubmittedAt ||= slot.lastSendClickedAt;
+      slot.submissionObservationDeadlineAt ||= physicalSendAtMs + FINAL_CHECK_TIMEOUT_MS;
+      recordRunEvent(run, 'send_evidence_recovered_from_error', {
+        slotId: slot.slotId, entryId: slot.entryId, leaseId: slot.leaseId,
+        clickedAt: slot.lastSendClickedAt, source: context.source || null
+      });
+      await saveRunAndQueue(run, queue);
+    });
+  }
+  if (error?.code === 'UPLOAD_LIMIT' || context.errorClass === 'UPLOAD_LIMIT'
+    || classifyAutomationError(error, context) === AUTOMATION_ERROR_CLASSES.UPLOAD_LIMIT) {
+    // Reply to the page before cancelling its draft. Waiting for the sweep
+    // from the upload error callback would keep PREPARE's reply outstanding.
+    void pauseForUploadLimit(runId, {
+      slotId: context.slotId, text: error?.message || context.message || '',
+      resumeAtMs: context.resumeAtMs || error?.resumeAtMs,
+      autoResume: context.autoResume ?? error?.autoResume
+    }).catch((failure) => appendLog('Не удалось восстановить загрузку фотографий', { error: failure.message }));
+    return;
+  }
   const rateLimitFailure = context.rateLimit === true
     || context.errorClass === AUTOMATION_ERROR_CLASSES.RATE_LIMIT
     || classifyAutomationError(error, context) === AUTOMATION_ERROR_CLASSES.RATE_LIMIT;
@@ -9104,6 +10884,29 @@ async function pauseRunOnError(runId, error, context = {}) {
   // submitted yet. This prevents a modal in one tab from consuming the item
   // and replacing it with a different queue entry.
   if (rateLimitFailure) {
+    if (context.rateLimitBeforeAssistant === true) {
+      await withStateLock(async () => {
+        const { run, queue } = await getStored();
+        if (!run || run.operationId !== runId || ['STOPPED', 'DONE'].includes(run.state)
+          || !errorContextMatchesSlot(run, context)) return;
+        const slot = run.slots?.[context.slotId];
+        if (!slot || slot.downloadId) return;
+        slot.rejectedSendAtMs = Math.max(Number(slot.rejectedSendAtMs || 0), physicalSendAtMs,
+          Number(slot.physicalSendAtMs || 0), Date.parse(slot.lastSendClickedAt || '') || 0);
+        slot.generationSubmittedAt = null;
+        slot.pageSubmissionLeaseId = slot.leaseId;
+        slot.pageGenerationSubmitted = false;
+        slot.preparedForSubmit = true;
+        slot.rateLimitRetryNeeded = true;
+        slot.finalCheckPending = false;
+        slot.finalCheckDeadlineAt = null;
+        recordRunEvent(run, 'send_rejected_before_assistant', {
+          slotId: slot.slotId, entryId: slot.entryId, leaseId: slot.leaseId,
+          clickedAtMs: slot.rejectedSendAtMs || null
+        });
+        await saveRunAndQueue(run, queue);
+      });
+    }
     const imageResumeAt = imageLimitResumeAt(error?.message || context.message);
     if (imageResumeAt) {
       void pauseForImageLimit(runId, {
@@ -9125,7 +10928,8 @@ async function pauseRunOnError(runId, error, context = {}) {
         const slot = run?.operationId === runId ? run.slots?.[context.slotId] : null;
         if (!run || run.state !== 'RUNNING' || !slot?.entryId
           || (context.entryId && slot.entryId !== context.entryId)) return;
-        const submitted = slotGenerationSubmitted(slot) || context.generationSubmitted === true;
+        const submitted = context.rateLimitBeforeAssistant !== true
+          && (slotGenerationSubmitted(slot) || context.generationSubmitted === true);
         slot.lastRateLimitIgnoredAt = new Date().toISOString();
         if (submitted) {
           slot.status = 'OBSERVING';
@@ -9188,7 +10992,7 @@ async function pauseRunOnError(runId, error, context = {}) {
         || Object.values(run.slots || {}).find((item) => context.entryId && item.entryId === context.entryId)
         || Object.values(run.slots || {}).find((item) => context.tabId && item.tabId === context.tabId && item.entryId);
       if (!slot) return null;
-      const submitted = Boolean(
+      const submitted = context.rateLimitBeforeAssistant !== true && Boolean(
         context.generationSubmitted === true
         || slot.generationSubmittedAt
         || slot.finalCheckPending
@@ -9264,17 +11068,6 @@ async function pauseRunOnError(runId, error, context = {}) {
       AUTOMATION_ERROR_CLASSES.TOOL_UNAVAILABLE
     ]);
     const terminalResponse = context.terminalResponse === true || terminalResponseClasses.has(failure.errorClass);
-    run.errors = [...(run.errors || []), failure].slice(-20);
-    const attachmentFailureCircuitBreaker = shouldTripAttachmentFailureCircuitBreaker(run, failure);
-    const pauseForError = context.globalNoProgress === true || attachmentFailureCircuitBreaker;
-    run.error = pauseForError ? failure : (run.error || failure);
-    const preservePause = run.state === 'PAUSED'
-      && ['USER', 'RESTART', 'IMAGE_LIMIT', 'ERROR'].includes(String(run.pauseReason || '').toUpperCase());
-    run.state = (pauseForError || preservePause) ? 'PAUSED' : 'RUNNING';
-    run.status = pauseForError
-      ? 'PAUSED_ON_ERROR'
-      : (preservePause ? 'PAUSED_WITH_ERRORS' : 'RUNNING_WITH_ERRORS');
-    if (pauseForError) run.pauseReason = 'ERROR';
     const directSlot = run.slots?.[context.slotId];
     const failedSlot = (directSlot && (!context.entryId || directSlot.entryId === context.entryId) && directSlot.entryId
       ? directSlot
@@ -9283,8 +11076,6 @@ async function pauseRunOnError(runId, error, context = {}) {
       || Object.values(run.slots || {}).find((slot) => context.tabId && slot.tabId === context.tabId && slot.entryId);
     const contextEntry = groupEntries(queue, run.groupId).find((item) => item.sourceId === context.entryId);
     if (!failedSlot && contextEntry?.status === 'done') return { tabIds: [] };
-    if (!failedSlot) run.unresolvedError = true;
-    const tabIds = [];
     const generationWasStarted = Boolean(
       !terminalResponse && !context.tabClosed && !context.rateLimitBeforeAssistant && failedSlot && (
         (context.generationSubmitted === true && !failedSlot.preparedForSubmit) ||
@@ -9294,9 +11085,40 @@ async function pauseRunOnError(runId, error, context = {}) {
         context.downloadId != null
       )
     );
-    const duplicateFailure = failedSlot
-      && failedSlot.finalCheckPending
-      && failedSlot.lastCheckError === failure.message;
+    const handled = failedSlot?.lastHandledFailure;
+    const failurePhysicalSendAtMs = Number(failedSlot?.physicalSendAtMs || 0)
+      || Date.parse(failedSlot?.lastSendClickedAt || '') || 0;
+    // The page ERROR event and PREPARE command rejection describe one attempt.
+    // Deduplicate inside the state lock before changing retries or global pause
+    // state. A new lease, or newly confirmed physical Send, is a new attempt.
+    const duplicateFailure = Boolean(failedSlot && (
+      (handled && handled.leaseId === failedSlot.leaseId
+        && handled.generationSubmitted === generationWasStarted
+        && Number(handled.physicalSendAtMs || 0) === failurePhysicalSendAtMs
+        && ((!generationWasStarted && failedSlot.phase === SLOT_PHASES.RETRY_BACKOFF)
+          || (handled.message === failure.message && handled.errorClass === failure.errorClass)))
+      || (!handled && failedSlot.finalCheckPending && failedSlot.lastCheckError === failure.message)
+    ));
+    if (duplicateFailure) return { tabIds: [] };
+    const failurePhase = context.phase || failedSlot?.phase || failedSlot?.status || null;
+    run.errors = [...(run.errors || []), failure].slice(-20);
+    const attachmentFailureCircuitBreaker = shouldTripAttachmentFailureCircuitBreaker(run, failure);
+    const pauseForError = context.globalNoProgress === true || attachmentFailureCircuitBreaker;
+    run.error = pauseForError ? failure : (run.error || failure);
+    const protectedPause = (run.state === 'PAUSED' && Boolean(run.pauseReason) && run.pauseReason !== 'ERROR')
+      || run.uploadManualPause || run.uploadCooldownActive || run.imageLimitDetected || run.clockStopped || Boolean(run.stopBlocked);
+    const preservePause = run.state === 'PAUSED' || protectedPause;
+    run.state = (pauseForError || preservePause) ? 'PAUSED' : 'RUNNING';
+    if (!protectedPause) {
+      run.status = pauseForError
+        ? 'PAUSED_ON_ERROR'
+        : (preservePause ? 'PAUSED_WITH_ERRORS' : 'RUNNING_WITH_ERRORS');
+      if (pauseForError) run.pauseReason = 'ERROR';
+    } else if (!run.pauseReason && (run.uploadManualPause || run.uploadCooldownActive || run.imageLimitDetected)) {
+      run.pauseReason = run.imageLimitDetected ? 'IMAGE_LIMIT' : 'UPLOAD_LIMIT';
+    }
+    if (!failedSlot) run.unresolvedError = true;
+    const tabIds = [];
     if (failedSlot) {
       const failedEntry = groupEntries(queue, run.groupId).find((item) => item.sourceId === failedSlot.entryId);
       if (!duplicateFailure) {
@@ -9338,6 +11160,13 @@ async function pauseRunOnError(runId, error, context = {}) {
         failedSlot.lastCheckState = 'ERROR';
         failedSlot.lastCheckError = failure.message;
         failedSlot.lastCheckAt = failure.at;
+        failedSlot.lastHandledFailure = {
+          leaseId: failedSlot.leaseId,
+          message: failure.message,
+          errorClass: failure.errorClass,
+          physicalSendAtMs: failurePhysicalSendAtMs,
+          generationSubmitted: generationWasStarted
+        };
         failedSlot.errorClass = failure.errorClass;
         failedSlot.nextRetryAt = failedEntry?.nextRetryAt
           || new Date(Date.now() + retryDelayMs(failure.errorClass, failedEntry?.retryCount || 1, randomInt(0, 1000) / 1000)).toISOString();
@@ -9354,6 +11183,11 @@ async function pauseRunOnError(runId, error, context = {}) {
           slotId: failedSlot.slotId,
           entryId: failedSlot.entryId,
           errorClass: failure.errorClass,
+          message: String(failure.message).slice(0, 1600),
+          leaseId: failedSlot.leaseId || null,
+          generationId: failedSlot.generationId || null,
+          phase: failurePhase,
+          source: context.source || null,
           generationSubmitted: generationWasStarted,
           retryAt: failedSlot.nextRetryAt
         });
@@ -9363,7 +11197,7 @@ async function pauseRunOnError(runId, error, context = {}) {
     const failedName = failedSlot
       ? entryDisplayName(groupEntries(queue, run.groupId).find((item) => item.sourceId === failedSlot.entryId), failedSlot)
       : 'одной из вкладок';
-    run.currentAction = `Ошибка в ${failedName}. Остальные вкладки продолжают очередь.`;
+    if (!protectedPause) run.currentAction = `Ошибка в ${failedName}. Остальные вкладки продолжают очередь.`;
     run.lastActivityAt = failure.at;
     // A setup/upload failure has no generation to protect. Leave the slot
     // available for the next queue item; claimNext() will replace it after
@@ -9371,24 +11205,24 @@ async function pauseRunOnError(runId, error, context = {}) {
     // observation pass below.
     if (context.globalNoProgress) {
       run.unresolvedError = true;
-      run.currentAction = 'Пауза: ни одна рабочая вкладка не показала прогресс за 5 минут.';
+      if (!protectedPause) run.currentAction = 'Пауза: ни одна рабочая вкладка не показала прогресс за 5 минут.';
     } else if (attachmentFailureCircuitBreaker) {
       run.unresolvedError = true;
-      run.currentAction = 'Пауза: 3 разные модели подряд не загрузили пакет вложений. Очередь сохранена.';
+      if (!protectedPause) run.currentAction = 'Пауза: 3 разные модели подряд не загрузили пакет вложений. Очередь сохранена.';
       recordRunEvent(run, 'attachment_failure_circuit_opened', {
         windowMs: 10 * 60 * 1000,
         threshold: 3,
         slotId: failedSlot?.slotId ?? context.slotId ?? null,
         entryId: failedSlot?.entryId ?? context.entryId ?? null
       });
-    } else if ((generationWasStarted && failedSlot?.tabId != null) || !(run.pendingIds || []).length) finalizeDrainingRun(run, queue);
+    } else if (!protectedPause && ((generationWasStarted && failedSlot?.tabId != null) || !(run.pendingIds || []).length)) finalizeDrainingRun(run, queue);
     await saveRunAndQueue(run, queue, history, generationMemory);
     await appendLog('ОШИБКА: проблемный слот исключён, остальные продолжают очередь', { error: failure.message, ...context });
     await publishRun(run, queue);
     return {
       tabIds: [...new Set(tabIds)],
       failure,
-      pauseRunForAttachmentStorm: attachmentFailureCircuitBreaker,
+      pauseRunForAttachmentStorm: attachmentFailureCircuitBreaker && !protectedPause,
       closeUnsubmittedTabId: !duplicateFailure && !generationWasStarted && failedSlot?.tabId != null
         ? Number(failedSlot.tabId)
         : null,
@@ -9398,7 +11232,7 @@ async function pauseRunOnError(runId, error, context = {}) {
       finalCheck: !duplicateFailure && generationWasStarted && failedSlot?.tabId != null
         ? { tabId: failedSlot.tabId, slotId: failedSlot.slotId, entryId: failedSlot.entryId }
         : null,
-      replaceSlot: (!generationWasStarted || failedSlot?.tabId == null) && failedSlot?.slotId != null
+      replaceSlot: run.state === 'RUNNING' && (!generationWasStarted || failedSlot?.tabId == null) && failedSlot?.slotId != null
         ? { slotId: failedSlot.slotId, entryId: failedSlot.entryId }
         : null
     };
@@ -9636,11 +11470,17 @@ async function resumeRun(options = {}) {
   await assertManualExtensionUpdateNotApplying();
   const internalRecoveryResume = options?.conversationRecoveryInternal === true
     || options?.stalledBatchRecoveryInternal === true
-    || options?.preparationStallRecoveryInternal === true;
+    || options?.preparationStallRecoveryInternal === true
+    || options?.rateLimitRecoveryInternal === true
+    || options?.sessionRestartInternal === true;
   if (!internalRecoveryResume) {
     await waitForStartupReconciliation();
   }
   const preferredWindowId = Number(options?.preferredWindowId || 0);
+  const restartState = await chrome.storage.local.get('sessionRestartIntent');
+  if (restartState.sessionRestartIntent && !options?.sessionRestartInternal) {
+    throw new Error('Восстановление сессии уже выполняется. Дождись его завершения или нажми «Пауза».');
+  }
   if (preferredWindowId) {
     const host = await chrome.windows.get(preferredWindowId).catch(() => null);
     if (!host || host.type !== 'normal') throw new Error('Окно панели для продолжения запуска недоступно');
@@ -9658,7 +11498,9 @@ async function resumeRun(options = {}) {
         stateBefore: stored.run.state,
         source: options?.conversationRecoveryInternal === true ? 'conversation_recovery'
           : options?.preparationStallRecoveryInternal === true ? 'preparation_stall_recovery'
-            : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery' : 'user_or_ui'
+            : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery'
+              : options?.sessionRestartInternal === true ? 'session_restart'
+                : options?.rateLimitRecoveryInternal === true ? 'rate_limit_recovery' : 'user_or_ui'
       });
       await saveRunAndQueue(stored.run, stored.queue);
     }
@@ -9690,20 +11532,82 @@ async function resumeRun(options = {}) {
     await saveRunAndQueue(current.run, current.queue);
     throw new Error('Идёт безопасное восстановление разговоров ChatGPT. Дождись его завершения.');
   }
-  if (current.run.imageLimitDetected === true && Number(current.run.rateLimitPauseUntil || 0) > Date.now()) {
+  if ((current.run.imageLimitDetected || current.run.uploadCooldownActive) && Number(current.run.rateLimitPauseUntil || 0) > Date.now()) {
     recordRunEvent(current.run, 'run_resume_blocked', {
       reason: 'image_limit_cooldown',
       resumeAt: current.run.rateLimitPauseUntil
     });
     await saveRunAndQueue(current.run, current.queue);
-    throw new Error(`Лимит создания изображений действует до ${clockTime(current.run.rateLimitPauseUntil)}. Очередь продолжится автоматически.`);
+    throw new Error(`${current.run.uploadCooldownActive ? 'Пауза загрузки фотографий' : 'Лимит создания изображений'} действует до ${clockTime(current.run.rateLimitPauseUntil)}. Очередь продолжится автоматически.`);
   }
-  const resumePreflight = await runPreflight({
-    selectedIds: Array.isArray(current.run.plannedIds) ? current.run.plannedIds : [],
+  let resumeAccountingSnapshot = null;
+  let resumePreflightIds = Array.isArray(current.run.plannedIds) ? [...current.run.plannedIds] : [];
+  if (current.run.progressCompletionMode === 'ready') {
+    resumeAccountingSnapshot = await refreshCanonicalAccountingSnapshot({ force: true });
+    const deferredMigrationForCurrentRun = resumeAccountingSnapshot?.migrationPending === true
+      && resumeAccountingSnapshot?.reconciliationState === 'active_run';
+    if (!resumeAccountingSnapshot || resumeAccountingSnapshot.stale
+      || !resumeAccountingSnapshot.verificationAvailable
+      || (!resumeAccountingSnapshot.reconciliationComplete && !deferredMigrationForCurrentRun)) {
+      throw new Error(`Продолжение заблокировано: каноническая проверка результатов недоступна (${resumeAccountingSnapshot?.staleReason || resumeAccountingSnapshot?.reconciliationState || 'нет снимка'}).`);
+    }
+    const syncResult = await withStateLock(async () => {
+      const latest = await getStored();
+      if (latest.run?.operationId !== current.run.operationId || !['PAUSED', 'STOPPED'].includes(latest.run.state)) {
+        throw new Error('Состояние запуска изменилось во время сверки. Обнови панель и повтори продолжение.');
+      }
+      const result = reconcileReadyRunTaskPlan(latest.run, latest.queue, resumeAccountingSnapshot);
+      if (result.changed) {
+        recordRunEvent(latest.run, 'ready_task_plan_reconciled', {
+          completedCount: (latest.run.completedTaskIds || []).length,
+          plannedCount: (latest.run.plannedIds || []).length,
+          factsTaskCount: (latest.run.plannedTasks || []).filter((task) => task.kind === 'facts').length,
+          imageTaskCount: (latest.run.imagePlannedIds || []).length,
+          snapshotRevision: resumeAccountingSnapshot.revision
+        });
+      }
+      const occupied = new Set([
+        ...Object.values(latest.run.slots || {}).filter((slot) => slot?.entryId && (
+          slot.downloadId || slot.finalCheckPending || (slot.status && !['IDLE', 'DONE', 'PAUSED', 'STOPPED'].includes(slot.status))
+        )).map((slot) => String(slot.entryId)),
+        ...Object.values(latest.run.postprocessTabs || {}).filter((owner) => owner?.entryId && owner?.generationId)
+          .map((owner) => String(owner.entryId))
+      ]);
+      latest.run.pendingIds = pendingPlannedIds(latest.run, groupEntries(latest.queue, latest.run.groupId), occupied);
+      await saveRunAndQueue(latest.run, latest.queue);
+      return { ...result, run: latest.run, queue: latest.queue };
+    });
+    if (!syncResult.ok) {
+      await appendLog('Продолжение прогона заблокировано канонической сверкой', {
+        operationId: current.run.operationId,
+        blocked: syncResult.blocked,
+        snapshotRevision: resumeAccountingSnapshot.revision
+      });
+      throw new Error(`Продолжение заблокировано: ${syncResult.blocked.slice(0, 3).join('; ')}`);
+    }
+    current.run = syncResult.run;
+    current.queue = syncResult.queue;
+    const occupied = new Set([
+      ...Object.values(current.run.slots || {}).filter((slot) => slot?.entryId && (
+        slot.downloadId || slot.finalCheckPending || (slot.status && !['IDLE', 'DONE', 'PAUSED', 'STOPPED'].includes(slot.status))
+      )).map((slot) => String(slot.entryId)),
+      ...Object.values(current.run.postprocessTabs || {}).filter((owner) => owner?.entryId && owner?.generationId)
+        .map((owner) => String(owner.entryId))
+    ]);
+    resumePreflightIds = pendingPlannedIds(current.run, groupEntries(current.queue, current.run.groupId), occupied);
+  }
+  const resumePreflight = current.run.progressCompletionMode === 'ready' && resumePreflightIds.length === 0
+    ? { ok: true, checks: [], selectedEntries: [] }
+    : await runPreflight({
+    selectedIds: resumePreflightIds,
     queueMode: current.run.groupId === REGENERATION_QUEUE_ID ? REGENERATION_QUEUE_ID : 'regular',
-    partNumber: current.run.runPart || null,
-    validateLaunchSelection: false
-  });
+    partNumber: options?.sessionRestartInternal ? null : (current.run.runPart || null),
+    validateLaunchSelection: false,
+    jobSnapshot: current.run.jobSnapshot || null,
+    exactPlannedScope: true,
+    accountingSnapshot: resumeAccountingSnapshot,
+    requireCanonicalAccounting: current.run.progressCompletionMode === 'ready'
+    });
   if (!resumePreflight.ok) {
     const failed = (resumePreflight.checks || [])
       .filter((check) => check.blocking && !check.ok)
@@ -9716,6 +11620,17 @@ async function resumeRun(options = {}) {
     });
     await saveRunAndQueue(current.run, current.queue);
     throw new Error(`Продолжение невозможно: ${failed || 'проверь входные данные'}`);
+  }
+  if (current.run.progressCompletionMode === 'ready') {
+    const commitSnapshot = await refreshCanonicalAccountingSnapshot({ force: true });
+    const deferredMigrationForCurrentRun = commitSnapshot?.migrationPending === true
+      && commitSnapshot?.reconciliationState === 'active_run';
+    if (!commitSnapshot || commitSnapshot.stale
+      || (!commitSnapshot.reconciliationComplete && !deferredMigrationForCurrentRun)
+      || !commitSnapshot.verificationAvailable
+      || Number(commitSnapshot.revision) !== Number(resumeAccountingSnapshot?.revision)) {
+      throw new Error('Канонический учёт изменился во время проверки продолжения. Повтори продолжение после обновления очереди.');
+    }
   }
   await ensureAutomationWindow(current.run.operationId);
   await moveRunTabsToAutomationWindow(current.run.operationId);
@@ -9746,8 +11661,17 @@ async function resumeRun(options = {}) {
       throw new Error('Автопродолжение отменено пользователем');
     }
     if (!internalRecoveryResume) {
+      const watchdog = ensureSessionWatchdog(run);
+      watchdog.armedAt = Date.now();
+      watchdog.blockedReason = null;
+      watchdog.blockedUntil = null;
       run.preparationRecoveryAttempts = 0;
       run.attachmentFailureBaselineAt = new Date().toISOString();
+      run.uploadCooldownActive = false;
+      run.uploadPauseSettled = false;
+      run.uploadLimitDetected = false;
+      run.uploadManualPause = false;
+      run.imageLimitDetected = false;
     }
     ({ queue, history, memory: generationMemory } = syncQueueWithHistory(
       queue,
@@ -9774,6 +11698,9 @@ async function resumeRun(options = {}) {
       : pendingEntryIdsForFilter(entries, normalizeRunLimit(run.runLimit, 0), run.coverageMode);
     run.plannedIds = plannedIds;
     const plannedIdSet = new Set(plannedIds);
+    const savedFactsOwnerEntryIds = new Set(Object.values(run.postprocessTabs || {})
+      .filter((owner) => owner?.entryId && owner?.generationId)
+      .map((owner) => String(owner.entryId)));
     for (const slot of Object.values(run.slots || {})) {
       const slotEntry = entries.find((entry) => entry.sourceId === slot.entryId);
       if (slot.entryId && observedEntryIds.has(slot.entryId) && !slot.downloadId && slotEntry?.status !== 'done') {
@@ -9859,9 +11786,13 @@ async function resumeRun(options = {}) {
         }
       }
     }
+    const completedTaskIds = new Set((run.completedTaskIds || []).map(String));
     run.pendingIds = plannedIds.filter((entryId) => {
       const entry = entries.find((item) => item.sourceId === entryId);
-      return entry && entry.status !== 'done' && !activeDownloadEntryIds.has(entryId) && !observedIds.has(entryId);
+      if (!entry || activeDownloadEntryIds.has(entryId) || observedIds.has(entryId)
+        || savedFactsOwnerEntryIds.has(String(entryId))) return false;
+      if (run.progressCompletionMode === 'ready') return !completedTaskIds.has(String(entryId));
+      return entry.status !== 'done';
     });
     const preservedRateLimitUntil = Number(run.rateLimitPauseUntil || 0);
     const recoveredRateLimit = recovered.some((item) => item.state === 'RATE_LIMIT_PAUSE');
@@ -9885,7 +11816,9 @@ async function resumeRun(options = {}) {
     recordRunEvent(run, 'run_resumed', {
       source: options?.conversationRecoveryInternal === true ? 'conversation_recovery'
         : options?.preparationStallRecoveryInternal === true ? 'preparation_stall_recovery'
-          : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery' : 'user_or_ui',
+          : options?.stalledBatchRecoveryInternal === true ? 'stalled_batch_recovery'
+            : options?.sessionRestartInternal === true ? 'session_restart'
+              : options?.rateLimitRecoveryInternal === true ? 'rate_limit_recovery' : 'user_or_ui',
       pendingCount: run.pendingIds.length,
       activeObservedSlots: Object.values(run.slots || {}).filter((slot) => slot.entryId && slotGenerationSubmitted(slot)).length,
       rateLimitPausePreserved: recoveredRateLimit || preservedRateLimitUntil > Date.now()
@@ -9928,6 +11861,12 @@ async function resumeRun(options = {}) {
         run.slots[slotId] = oldSlot;
         continue;
       }
+      if (oldSlot.savedFactsTask && oldSlot.entryId && savedFactsOwnerEntryIds.has(String(oldSlot.entryId))) {
+        oldSlot.status = 'FACTS_EXTRACTING';
+        oldSlot.phase = SLOT_PHASES.OBSERVING;
+        run.slots[slotId] = oldSlot;
+        continue;
+      }
       const entryId = run.pendingIds.shift();
       if (!entryId) {
         oldSlot.entryId = null;
@@ -9943,20 +11882,23 @@ async function resumeRun(options = {}) {
         continue;
       }
       const entry = entries.find((item) => item.sourceId === entryId);
-      entry.status = 'running';
-      entry.errorClass = null;
-      entry.nextRetryAt = null;
-      setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.RUNNING, {
-        statusSource: 'automatic',
-        generationStartedAt: new Date().toISOString(),
+      const task = plannedTaskForRun(run, entryId);
+      if (task.kind !== 'facts') {
+        entry.status = 'running';
+        entry.errorClass = null;
+        entry.nextRetryAt = null;
+        setGenerationMemoryStatus(generationMemory, entry, GENERATION_MEMORY_STATUSES.RUNNING, {
+          statusSource: 'automatic',
+          generationStartedAt: new Date().toISOString(),
           lastError: null,
           lastRunId: run.operationId,
           retryCount: Number(entry.retryCount || 0),
           errorClass: null,
           nextRetryAt: null,
-      });
-      delete history.items[entry.sourceId];
-      history.ignored[entry.sourceId] = true;
+        });
+        delete history.items[entry.sourceId];
+        history.ignored[entry.sourceId] = true;
+      }
       const slot = {
         ...oldSlot,
         ...freshSlotRevisionFields(),
@@ -9995,11 +11937,13 @@ async function resumeRun(options = {}) {
         failed: false,
         rateLimitRetryNeeded: false
       };
+      applyPlannedTaskToSlot(slot, run, entryId);
       run.slots[slotId] = slot;
       recordRunEvent(run, 'slot_claimed', { slotId, entryId, leaseId: slot.leaseId, attempt: slot.attempt });
       assignments.push({ entry, slot });
     }
-    if (!run.pendingIds.length && !activeDownloadEntryIds.size && !observedIds.size && !assignments.length) {
+    if (!run.pendingIds.length && !activeDownloadEntryIds.size && !observedIds.size
+      && !savedFactsOwnerEntryIds.size && !assignments.length) {
       run.state = 'DONE';
       run.status = 'DONE';
     }
@@ -10222,6 +12166,60 @@ async function cleanupPostprocessTab(runId, tabId) {
   await closeAutomationWindowIfEmpty(runId).catch(() => {});
 }
 
+async function finishSavedFactsTaskOwner(runId, owner, { completed = false, error = null } = {}) {
+  const tabId = Number(owner?.tabId || 0);
+  const slotId = Number(owner?.slotId);
+  const entryId = String(owner?.entryId || '');
+  let shouldClaimNext = false;
+  await withStateLock(async () => {
+    const stored = await getStored();
+    const run = stored.run;
+    if (!run || run.operationId !== runId) return;
+    const liveOwner = run.postprocessTabs?.[String(tabId)];
+    if (liveOwner && (liveOwner.entryId !== entryId
+      || String(liveOwner.generationId || '') !== String(owner.generationId || ''))) return;
+    if (liveOwner) delete run.postprocessTabs[String(tabId)];
+    if (completed) markReadyTaskCompleted(run, entryId);
+    if (error) {
+      run.factsProgress ||= {};
+      run.factsProgress[String(owner.factsJobId || owner.generationId)] = {
+        ...(run.factsProgress[String(owner.factsJobId || owner.generationId)] || {}),
+        stage: 'ERROR', error: String(error), generationId: owner.generationId || null,
+        factsJobId: owner.factsJobId || null, entryId, updatedAt: new Date().toISOString()
+      };
+    }
+    const slot = run.slots?.[slotId];
+    if (slot && slot.entryId === entryId && slot.savedFactsTask
+      && String(slot.generationId || '') === String(owner.generationId || '')) {
+      slot.entryId = null;
+      slot.tabId = null;
+      slot.status = error ? 'ERROR' : 'DONE';
+      slot.phase = error ? SLOT_PHASES.NEEDS_ATTENTION : SLOT_PHASES.DONE;
+      slot.failed = false;
+      slot.finalCheckPending = false;
+      slot.finalCheckDeadlineAt = null;
+      slot.leaseId = null;
+    }
+    shouldClaimNext = run.state === 'RUNNING';
+    run.currentAction = error
+      ? `Спецификация требует повторной проверки: ${entryId}`
+      : `Спецификация сохранена: ${entryId}`;
+    await saveRunAndQueue(run, stored.queue, stored.history, stored.generationMemory);
+    await publishRun(run, stored.queue);
+  });
+  if (tabId) await chrome.tabs.remove(tabId).catch(() => {});
+  await closeAutomationWindowIfEmpty(runId).catch(() => {});
+  if (shouldClaimNext && Number.isSafeInteger(slotId) && slotId >= 0) {
+    const next = await claimNext(runId, slotId).catch((claimError) => {
+      void appendLog('Не удалось выдать следующий элемент после чтения спецификации', {
+        runId, slotId, error: claimError?.message || String(claimError)
+      });
+      return null;
+    });
+    if (next?.entry && next?.slot) void executeSlot(runId, slotId, next.entry.sourceId);
+  }
+}
+
 async function reservePostprocessCapacity(runId, slotId, downloadId) {
   const key = String(Number(downloadId));
   if (postprocessCapacityReservations.has(key)) return { allowed: false, reserved: false };
@@ -10253,7 +12251,7 @@ function startFactsPulseMonitor(delay = FACTS_FAST_PULSE_INTERVAL_MS) {
       await pulsePostprocessTabs(run);
       return true;
     })().catch((error) => {
-      void appendLog('Ошибка быстрой проверки OCR-ответа', { error: error?.message || String(error) });
+      void recordRecoveryFailure('facts_monitor_failed', error);
       return false;
     }).finally(() => {
       factsPulseInFlight = null;
@@ -10286,8 +12284,14 @@ async function pulsePostprocessTabs(runSnapshot) {
     try {
       await protectAutomationTab(Number(owner.tabId));
       if (tabState?.frozen === true || tabState?.discarded === true) {
+        await recordSafetyEvent(runSnapshot.operationId, 'facts_tab_recovery_started', {
+          tabId: owner.tabId, factsJobId: owner.factsJobId, entryId: owner.entryId, reason: 'discarded_or_frozen'
+        });
         await chrome.tabs.reload(Number(owner.tabId));
         await waitTabReady(Number(owner.tabId), 60000);
+        await recordSafetyEvent(runSnapshot.operationId, 'facts_tab_recovery_completed', {
+          tabId: owner.tabId, factsJobId: owner.factsJobId, entryId: owner.entryId
+        });
         tabState = await chrome.tabs.get(Number(owner.tabId)).catch(() => tabState);
       }
       const response = await sendTabMessage(Number(owner.tabId), {
@@ -10306,6 +12310,9 @@ async function pulsePostprocessTabs(runSnapshot) {
       }, 2500);
       return { owner, tabState, response, error: null };
     } catch (error) {
+      await recordSafetyEvent(runSnapshot.operationId, 'facts_pulse_failed', {
+        tabId: owner.tabId, factsJobId: owner.factsJobId, entryId: owner.entryId, error: String(error?.message || error)
+      }).catch(() => {});
       return { owner, tabState, response: null, error };
     }
   }));
@@ -10557,6 +12564,11 @@ async function handleFactsExtractionResult(message, sender) {
     || generationId(sourceId, `${runId || 'legacy'}-${message?.factsJobId || 'facts'}`);
   const revision = await getGenerationRevision(resultGenerationId).catch(() => null);
   if (revision?.reviewStatus === 'rejected') {
+    if (postprocessOwner?.savedImageFacts) {
+      await finishSavedFactsTaskOwner(runId, postprocessOwner, { error: 'Целевая ревизия уже помечена браком' });
+      accountingSnapshotCache = null;
+      return { stale: true, reason: 'revision_rejected' };
+    }
     await appendLog('Игнорирую ответ OCR для ревизии, уже помеченной браком', {
       sourceId, generationId: resultGenerationId, factsJobId: message?.factsJobId || null, tabId
     });
@@ -10564,19 +12576,114 @@ async function handleFactsExtractionResult(message, sender) {
     return { stale: true, reason: 'revision_rejected' };
   }
   const revisionEntry = revision ? { ...entry, ...revision, sourceId } : entry;
+  const savedFactsTuple = postprocessOwner?.savedImageFacts ? {
+    generationId: String(postprocessOwner.generationId || ''),
+    factsJobId: String(postprocessOwner.factsJobId || ''),
+    outputPath: String(postprocessOwner.outputPath || ''),
+    outputHash: String(postprocessOwner.outputHash || '').toLowerCase(),
+    chatUrl: normalizeChatConversationUrl(postprocessOwner.chatUrl || '')
+  } : null;
+  const savedFactsTupleMismatch = Boolean(savedFactsTuple && (
+    savedFactsTuple.generationId !== String(resultGenerationId)
+    || savedFactsTuple.factsJobId !== String(revision?.factsJobId || '')
+    || normalizedDownloadPath(savedFactsTuple.outputPath) !== normalizedDownloadPath(revision?.outputPath || '')
+    || savedFactsTuple.outputHash !== String(revision?.outputHash || '').toLowerCase()
+    || savedFactsTuple.chatUrl !== normalizeChatConversationUrl(revision?.chatUrl || revision?.facts?.chatUrl || '')
+    || (message?.outputPath && normalizedDownloadPath(message.outputPath) !== normalizedDownloadPath(savedFactsTuple.outputPath))
+    || (message?.outputHash && String(message.outputHash).toLowerCase() !== savedFactsTuple.outputHash)
+    || (message?.chatUrl && normalizeChatConversationUrl(message.chatUrl) !== savedFactsTuple.chatUrl)
+  ));
+  if (savedFactsTupleMismatch) {
+    const at = new Date().toISOString();
+    await upsertGenerationRevision({
+      ...revision,
+      generationId: resultGenerationId,
+      sourceId,
+      factsStatus: 'manual_review',
+      factsManualReviewRequired: true,
+      factsManualReviewReason: 'SAVED_IMAGE_BINDING_MISMATCH',
+      factsManualReviewAt: at
+    }, { rejectIfReviewed: true });
+    await finishSavedFactsTaskOwner(runId, postprocessOwner, {
+      error: 'Изменились идентификатор задачи, PNG, его путь или чат; автоматическая привязка остановлена'
+    });
+    accountingSnapshotCache = null;
+    return { stale: true, manualReviewRequired: true, reason: 'saved_facts_tuple_mismatch' };
+  }
   if (revision?.factsStatus === 'ok'
     && revision?.factsJobId
     && revision.factsJobId === String(message?.factsJobId || '')) {
     if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
     return { ok: true, duplicate: true, warnings: revision?.facts?.warnings || [] };
   }
-  const expectedHash = String(message?.outputHash || revision?.outputHash || '');
+  const expectedHash = String(message?.outputHash || savedFactsTuple?.outputHash || revision?.outputHash || '');
   const currentHash = String(revision?.outputHash || entry.outputHash || '');
   if (expectedHash && currentHash && expectedHash !== currentHash) {
     // A regenerated image must never receive facts from the previous PNG.
+    if (postprocessOwner?.savedImageFacts) {
+      const targetCatalog = await getModelCatalog(sourceId).catch(() => null);
+      if (targetCatalog && [targetCatalog.currentGenerationId, targetCatalog.latestReadyGenerationId]
+        .some((id) => String(id || '') === String(resultGenerationId))) {
+        const at = new Date().toISOString();
+        await upsertGenerationRevision({
+          ...revision,
+          generationId: resultGenerationId,
+          sourceId,
+          factsStatus: 'manual_review',
+          factsManualReviewRequired: true,
+          factsManualReviewReason: 'SAVED_IMAGE_BINDING_MISMATCH',
+          factsManualReviewAt: at
+        }, { rejectIfReviewed: true });
+      }
+      await finishSavedFactsTaskOwner(runId, postprocessOwner, { error: 'Сохранённый PNG изменился после планирования OCR' });
+      accountingSnapshotCache = null;
+      return { stale: true, reason: 'saved_image_hash_changed' };
+    }
     if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
     await appendLog('Игнорирую устаревший ответ постобработки', { sourceId, expectedHash, currentHash });
     return { stale: true };
+  }
+
+  const manualSavedBindingError = postprocessOwner?.savedImageFacts
+    && ['SAVED_IMAGE_BINDING_MISMATCH', 'SAVED_IMAGE_BINDING_UNVERIFIABLE'].includes(String(message?.error?.code || ''));
+  if (manualSavedBindingError) {
+    const at = new Date().toISOString();
+    await upsertGenerationRevision({
+      ...revision,
+      generationId: resultGenerationId,
+      sourceId,
+      factsJobId: postprocessOwner.factsJobId,
+      factsStatus: 'manual_review',
+      factsManualReviewRequired: true,
+      factsManualReviewReason: String(message.error.code),
+      factsManualReviewAt: at,
+      facts: {
+        ...(revision?.facts || {}),
+        sourceId, generationId: resultGenerationId,
+        factsJobId: postprocessOwner.factsJobId,
+        status: 'manual_review',
+        error: message.error.message || String(message.error.code),
+        errorCode: String(message.error.code),
+        promptSubmitted: message.error.promptSubmitted === true,
+        outputHash: postprocessOwner.outputHash,
+        outputPath: postprocessOwner.outputPath,
+        chatUrl: postprocessOwner.chatUrl,
+        extractedAt: at
+      }
+    }, { rejectIfReviewed: true });
+    await updateFactsStage(message, sender, {
+      stage: 'ERROR',
+      error: 'Не удалось доказать, что открытый чат содержит именно сохранённое изображение. Автогенерация этого элемента отключена до ручной проверки.'
+    });
+    await finishSavedFactsTaskOwner(runId, postprocessOwner, {
+      error: 'Сверка чата и сохранённого PNG требует ручной проверки'
+    });
+    accountingSnapshotCache = null;
+    await appendLog('Повторное чтение спецификации остановлено: привязка сохранённого изображения не доказана', {
+      sourceId, generationId: resultGenerationId, factsJobId: postprocessOwner.factsJobId,
+      errorCode: message.error.code
+    });
+    return { ok: false, manualReviewRequired: true };
   }
 
   if (message?.error) {
@@ -10671,6 +12778,9 @@ async function handleFactsExtractionResult(message, sender) {
         error: null
       });
       startFactsPulseMonitor(0);
+    } else if (postprocessOwner?.savedImageFacts) {
+      await finishSavedFactsTaskOwner(runId, postprocessOwner, { error: errorRecord.error });
+      accountingSnapshotCache = null;
     } else if (canCleanupFactsTab) {
       void cleanupPostprocessTab(runId, tabId);
     }
@@ -10682,9 +12792,9 @@ async function handleFactsExtractionResult(message, sender) {
     await updateFactsStage(message, sender, { stage: 'PERSISTING', chatUrl: message?.chatUrl });
     const facts = normalizeExtractedFacts(revisionEntry, message?.text || '', {
       generationId: resultGenerationId,
-      outputPath: message?.outputPath || entry.outputPath || null,
-      outputHash: message?.outputHash || entry.outputHash || null,
-      chatUrl: message?.chatUrl || entry.chatUrl || null
+      outputPath: savedFactsTuple?.outputPath || message?.outputPath || revision?.outputPath || entry.outputPath || null,
+      outputHash: savedFactsTuple?.outputHash || message?.outputHash || revision?.outputHash || entry.outputHash || null,
+      chatUrl: savedFactsTuple?.chatUrl || message?.chatUrl || revision?.chatUrl || entry.chatUrl || null
     });
     facts.factsJobId = message?.factsJobId || null;
     facts.pageDurationMs = Number(message?.durationMs || 0) || null;
@@ -10699,10 +12809,17 @@ async function handleFactsExtractionResult(message, sender) {
       factsSavedAt: facts.extractedAt,
       chatUrl: facts.chatUrl || revision?.chatUrl || null,
       responseFingerprint: facts.responseFingerprint || null,
+      authorizedAcceptedGenerationId: postprocessOwner?.savedImageFacts
+        ? postprocessOwner.authorizedAcceptedGenerationId || null
+        : null,
       status: 'READY'
     });
     if (!persistedRevision?.matched || persistedRevision?.latest !== true) {
-      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+      if (postprocessOwner?.savedImageFacts) {
+        await finishSavedFactsTaskOwner(runId, postprocessOwner, {
+          error: persistedRevision?.matched ? 'Ревизия уже сменилась' : 'Спецификация не совпала с актуальной ревизией'
+        });
+      } else if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
       return { stale: true, reason: persistedRevision?.matched ? 'generation_superseded' : 'revision_rejected_or_mismatch' };
     }
     revisionFactsCommitted = true;
@@ -10725,7 +12842,20 @@ async function handleFactsExtractionResult(message, sender) {
       durationMs: facts.pageDurationMs,
       completion: facts.completion
     });
-    if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+    accountingSnapshotCache = null;
+    if (postprocessOwner?.savedImageFacts) {
+      await finishSavedFactsTaskOwner(runId, postprocessOwner, { completed: true });
+    } else {
+      await withStateLock(async () => {
+        const current = await getStored();
+        const activeRun = current.run;
+        if (!activeRun || activeRun.operationId !== runId) return;
+        markReadyTaskCompleted(activeRun, sourceId);
+        await saveRunAndQueue(activeRun, current.queue, current.history, current.generationMemory);
+        await publishRun(activeRun, current.queue);
+      });
+      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+    }
     return { ok: true, warnings: facts.warnings };
   } catch (error) {
     if (revisionFactsCommitted) {
@@ -10733,7 +12863,10 @@ async function handleFactsExtractionResult(message, sender) {
       void appendLog('Характеристики записаны в ревизию; не удалось обновить вторичную проекцию', {
         sourceId, generationId: resultGenerationId, error: error?.message || String(error)
       });
-      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+      if (postprocessOwner?.savedImageFacts) {
+        accountingSnapshotCache = null;
+        await finishSavedFactsTaskOwner(runId, postprocessOwner, { completed: true });
+      } else if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
       return { ok: true, projectionWarning: true };
     }
     if (isIndexedDbPersistenceError(error)) {
@@ -10743,7 +12876,9 @@ async function handleFactsExtractionResult(message, sender) {
         sourceId, generationId: resultGenerationId, factsJobId: message?.factsJobId || null,
         error: error?.message || String(error)
       });
-      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+      if (postprocessOwner?.savedImageFacts) {
+        await finishSavedFactsTaskOwner(runId, postprocessOwner, { error: persistenceMessage });
+      } else if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
       return { ok: false, persistenceError: true };
     }
     const parseWarning = error?.code === 'FACTS_JSON_INCOMPLETE'
@@ -10786,11 +12921,15 @@ async function handleFactsExtractionResult(message, sender) {
         sourceId, generationId: resultGenerationId, factsJobId: message?.factsJobId || null,
         error: persistError?.message || String(persistError)
       });
-      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+      if (postprocessOwner?.savedImageFacts) {
+        await finishSavedFactsTaskOwner(runId, postprocessOwner, { error: persistenceMessage });
+      } else if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
       return { ok: false, persistenceError: true };
     }
     if (persistedRevision?.reviewStatus === 'rejected') {
-      if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+      if (postprocessOwner?.savedImageFacts) {
+        await finishSavedFactsTaskOwner(runId, postprocessOwner, { error: 'Целевая ревизия помечена браком' });
+      } else if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
       return { stale: true, reason: 'revision_rejected' };
     }
     await updateFactsStage(message, sender, { stage: 'ERROR', error: errorRecord.error, chatUrl: errorRecord.chatUrl });
@@ -10808,7 +12947,10 @@ async function handleFactsExtractionResult(message, sender) {
       completion: errorRecord.completion,
       missingKeys: errorRecord.missingKeys
     });
-    if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
+    if (postprocessOwner?.savedImageFacts) {
+      accountingSnapshotCache = null;
+      await finishSavedFactsTaskOwner(runId, postprocessOwner, { error: errorRecord.error });
+    } else if (canCleanupFactsTab) void cleanupPostprocessTab(runId, tabId);
     return { ok: false, parseError: true };
   }
 }
@@ -10837,6 +12979,36 @@ async function finalizeCompletedArtifact(runId, slotId, entryId, outputPath, ver
     const entry = groupEntries(queue, run.groupId).find((item) => item.sourceId === entryId);
     if (!entry) return;
     const revisionId = ensureSlotGenerationIdentity(run, slot, entry, generationMemory);
+    const fileVerification = fileVerificationForCompletedArtifact({
+      verification, generationId: revisionId, sourceId: entry.sourceId, outputPath,
+      downloadItem: options.downloadItem || null
+    });
+    if (!fileVerification.verified) {
+      const candidateHash = String(verification?.sha256 || '').toLowerCase();
+      if (verification?.valid === true && verification?.verified === true
+        && /^[a-f0-9]{64}$/.test(candidateHash) && outputPath) {
+        const pendingArtifact = await recordUnverifiedOutputCandidate({
+          generationId: revisionId,
+          sourceId: entry.sourceId,
+          sourceVariantId: entry.inputSourceId || entry.sourceVariantId || null,
+          skuKey: entry.skuKey || entry.sourceId,
+          modelName: entry.modelName || entry.fileName || null,
+          fileName: entry.fileName || null,
+          outputFileName: entry.outputFileName || String(outputPath).replaceAll('\\', '/').split('/').at(-1) || null,
+          outputPath,
+          outputHash: candidateHash,
+          operationId: runId,
+          leaseId: slot.leaseId || null,
+          slotId: Number(slotId),
+          chatUrl: normalizeChatConversationUrl(slot.chatUrl || entry.chatUrl) || null,
+          factsJobId: String(slot.factsJobId || stableHash({ generationId: revisionId, extractorVersion: FACTS_EXTRACTOR_VERSION })),
+          recipeHash: slot.recipeHash || null,
+          verificationMode: verification.verificationMode || sourceMode
+        }).catch(() => ({ recorded: false }));
+        if (pendingArtifact?.recorded) accountingSnapshotCache = null;
+      }
+      throw new Error('Невозможно зарегистрировать PNG без проверки точного файла на диске и SHA-256');
+    }
     completedGenerationId = revisionId;
     const previousRevision = await getGenerationRevision(revisionId).catch(() => null);
     const revisionFacts = previousRevision?.facts || null;
@@ -10894,6 +13066,7 @@ async function finalizeCompletedArtifact(runId, slotId, entryId, outputPath, ver
       imageUrlFingerprint: slot.resultFingerprint || null,
       outputPath: outputPath || null,
       outputHash: verification.sha256 || null,
+      fileVerification,
       outputWidth: Number(verification.width || 0) || null,
       outputHeight: Number(verification.height || 0) || null,
       verificationMode: verification.verificationMode || sourceMode,
@@ -10908,6 +13081,7 @@ async function finalizeCompletedArtifact(runId, slotId, entryId, outputPath, ver
       status: factsAlreadyComplete ? 'READY' : 'FACTS_PENDING'
     });
     imagePersistedCurrent = imagePersistence?.current === true && imagePersistence?.matched === true;
+    if (factsAlreadyComplete && imagePersistedCurrent) markReadyTaskCompleted(run, entry.sourceId);
     recordCompletedEntry(history, entry, outputPath, generationMemory, runId, factsAlreadyComplete);
     if (factsAlreadyComplete && run.groupId === REGENERATION_QUEUE_ID) {
       const claimedAt = run.repairQueueClaims?.[entry.sourceId];
@@ -11075,6 +13249,7 @@ async function finalizeCompletedArtifact(runId, slotId, entryId, outputPath, ver
     await saveRunAndQueue(run, queue, history, generationMemory);
     await publishRun(run, queue);
   });
+  accountingSnapshotCache = null;
   if (factsAlreadyComplete && imagePersistedCurrent && completedFactsJobId) {
     await updateFactsStage({ operationId: runId, entryId, factsJobId: completedFactsJobId, slotId }, null, {
       stage: 'SAVED', slotId, tabId: completedTabId, chatUrl: existingFacts?.chatUrl || null
@@ -11144,6 +13319,7 @@ async function finishDownload(runId, slotId, downloadId, outputPath, knownVerifi
   try {
     await finalizeCompletedArtifact(runId, slotId, expectedEntry.sourceId, resolvedOutputPath, verification, {
       expectedDownloadId: downloadId,
+      downloadItem,
       sourceMode: 'downloads'
     });
   } catch (error) {
@@ -11486,6 +13662,8 @@ async function handleStateEvent(message, sender) {
       entryId: message.entryId,
       tabId: sender?.tab?.id || null,
       leaseId: message.leaseId,
+      phase: patch.phase || initialSlot.phase || null,
+      source: 'page_error_callback',
       physicalSendAtMs: Number(patch.physicalSendAtMs || message.physicalSendAtMs || 0),
       rateLimit: patch.rateLimit === true,
       rateLimitBeforeAssistant: patch.rateLimitBeforeAssistant === true,
@@ -11495,6 +13673,8 @@ async function handleStateEvent(message, sender) {
         rateLimit: patch.rateLimit === true,
         tabClosed: patch.tabClosed === true
       }),
+      resumeAtMs: Number(patch.resumeAtMs || 0) || null,
+      autoResume: patch.autoResume,
       terminalResponse: ['TEXT_ONLY', 'CLARIFICATION_REQUIRED', 'MODEL_REFUSAL', 'TOOL_UNAVAILABLE'].includes(String(patch.errorClass || '').toUpperCase())
     });
     return;
@@ -11513,6 +13693,11 @@ async function handleStateEvent(message, sender) {
       || (sender?.tab?.id != null && Number(slot.tabId || 0) !== Number(sender.tab.id))) return;
 
     const pageState = String(patch.state || '').toUpperCase();
+    const pagePhysicalSendAt = Number(message.physicalSendAtMs || patch.physicalSendAtMs || 0);
+    if (pageState === 'SENDING' && patch.generationSubmitted !== true
+      && Number(slot.rejectedSendAtMs || 0) > 0 && pagePhysicalSendAt > 0
+      && pagePhysicalSendAt <= Number(slot.rejectedSendAtMs)) return;
+    if (patch.generationSubmitted === true) slot.rejectedSendAtMs = null;
     slot.status = patch.state || slot.status;
     const now = new Date().toISOString();
     slot.lastHeartbeatAt = now;
@@ -11660,6 +13845,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'GET_ACCOUNTING_SNAPSHOT') {
+    refreshCanonicalAccountingSnapshot({ force: message.force === true })
+      .then((value) => sendResponse({ ok: true, value }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
   if (['GET_RESULTS_TRANSFER_INFO', 'EXPORT_RESULTS_PACKAGE', 'PREVIEW_RESULTS_IMPORT', 'CLAIM_RESULTS_IMPORT',
     'COMMIT_RESULTS_IMPORT', 'RESUME_RESULTS_IMPORT'].includes(message?.type)) {
     if (sender?.tab?.url && !sender.tab.url.startsWith(chrome.runtime.getURL(''))) {
@@ -11717,7 +13908,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'RUN_PREFLIGHT') {
-    runPreflight({ selectedIds: message.selectedIds }).then((value) => sendResponse({ ok: true, value })).catch((error) => sendResponse({ ok: false, error: error.message }));
+    (async () => {
+      const accountingSnapshot = await refreshCanonicalAccountingSnapshot({ force: true });
+      return runPreflight({
+        selectedIds: message.selectedIds,
+        accountingSnapshot,
+        requireCanonicalAccounting: true
+      });
+    })().then((value) => sendResponse({ ok: true, value })).catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   if (message?.type === 'START_RUN') {

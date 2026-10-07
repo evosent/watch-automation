@@ -385,15 +385,15 @@ test('image limit pauses the whole run, salvages ready images, and requeues unfi
   const resolver = await readFile(path.join(extensionDir, 'selector-resolver.js'), 'utf8');
   const panel = await readFile(path.join(extensionDir, 'sidepanel.js'), 'utf8');
   const cleanup = worker.slice(worker.indexOf('function pauseForImageLimit('), worker.indexOf('function armRateLimitIgnoreWindow('));
-  assert.match(resolver, /лимит\\s\+\(\?:создания\|генерации\)/);
+  assert.match(resolver, /WatchQuotaUtils\?\.isImageLimitText/);
   assert.match(cleanup, /run\.state = 'PAUSED'/);
   assert.match(cleanup, /quickProbeReadyResultsBeforeReset\(snapshot\.run\)/);
   assert.match(cleanup, /await reconcileActiveDownloads\(\)/);
   assert.match(cleanup, /entry\.status = 'pending'/);
   assert.match(cleanup, /setGenerationMemoryStatus\(memory, entry, GENERATION_MEMORY_STATUSES\.NOT_READY/);
-  assert.match(cleanup, /run\.pendingIds = entries\.filter/);
+  assert.match(cleanup, /run\.pendingIds = pendingPlannedIds\(run, entries/);
   assert.match(cleanup, /chrome\.tabs\.remove\(tabId\)/);
-  assert.match(worker, /if \(imageLimitTasks\.has\(initialRun\.operationId\)\)/);
+  assert.match(worker, /if \(imageLimitTasks\.has\(initialRun\.operationId\) \|\| uploadLimitTasks\.has\(initialRun\.operationId\)\)/);
   assert.match(panel, /ОЖИДАНИЕ ЛИМИТА/);
 });
 
@@ -652,7 +652,8 @@ test('interrupted prepared slots return to the saved plan without a Send click',
     saveRunAndQueue: async () => {}, publishRun: async () => {},
     cancelUnsubmittedGenerationRevision: async (generationId) => { cancelled.push(generationId); }
   };
-  runInNewContext(`${worker.slice(start, end)}\nglobalThis.recoverDrafts = pauseStalledPreparedSlots;`, context);
+  const taskHelpers = worker.slice(worker.indexOf('function plannedTaskIsCompleted('), worker.indexOf('function activeSlots('));
+  runInNewContext(`${taskHelpers}\n${worker.slice(start, end)}\nglobalThis.recoverDrafts = pauseStalledPreparedSlots;`, context);
   await context.recoverDrafts('run-a');
   assert.equal(run.state, 'PAUSED');
   assert.deepEqual([...run.pendingIds], ['draft-a', 'draft-b']);
@@ -962,7 +963,10 @@ test('custom output directory uses persisted File System Access handle with Down
   const panel = await readFile(path.join(extensionDir, 'sidepanel.js'), 'utf8');
   const html = await readFile(path.join(extensionDir, 'sidepanel.html'), 'utf8');
 
-  assert.match(idb, /DB_VERSION = 7/);
+  assert.match(idb, /DB_VERSION = 9/);
+  assert.match(idb, /ACCOUNTING_BACKUP_STORE/);
+  assert.match(idb, /OUTPUT_RECOVERY_STORE/);
+  assert.match(idb, /IDENTITY_QUARANTINE_STORE/);
   assert.match(idb, /RUN_DIAGNOSTIC_EVENTS_STORE/);
   assert.match(idb, /HANDLE_STORE = 'handles'/);
   assert.match(idb, /REVISION_STORE = 'generationRevisions'/);
@@ -1818,11 +1822,13 @@ test('package integrity: static DOM id references exist in gallery and side pane
   }
 });
 
-test('0.3.18 completed generations persist recipe identity and missing legacy hashes do not requeue forever', async () => {
+test('completed generations persist recipe identity and canonical READY prevents recipe-based requeue', async () => {
   const worker = await readFile(path.join(extensionDir, 'service-worker.js'), 'utf8');
   const queueUtils = await readFile(path.join(extensionDir, 'queue-utils.js'), 'utf8');
   assert.match(worker, /entry\.recipeHash = slot\.recipeHash \|\| entry\.recipeHash \|\| null/);
-  assert.match(worker, /if \(!entry\.recipeHash\) \{[\s\S]*entry\.recipeHash = expectedRecipeHash/);
+  const start = worker.slice(worker.indexOf('async function startRun('), worker.indexOf('async function resumeRun('));
+  assert.match(start, /if \(canonical\.status === 'READY'\) continue/);
+  assert.doesNotMatch(start, /entry\.recipeHash = expectedRecipeHash/);
   assert.match(worker, /return Boolean\(expected && entry\.recipeHash && entry\.recipeHash !== expected\)/);
   assert.match(queueUtils, /recipeHash: overrides\.recipeHash \?\? entry\?\.recipeHash \?\? null/);
   assert.match(queueUtils, /recipeHash: record\.recipeHash \|\| null/);
@@ -1900,7 +1906,7 @@ test('unsubmitted attachment failures close their worker tab and stop a repeated
   assert.match(errorHandler, /closeUnsubmittedTabId/);
   assert.match(errorHandler, /if \(result\.pauseRunForAttachmentStorm\)\s*\{\s*await schedulePreparationStallRecovery\(runId/);
   assert.match(errorHandler, /chrome\.tabs\.remove\(result\.closeUnsubmittedTabId\)/);
-  assert.match(pauseHandler, /const pauseReason = \['ERROR', 'RESTART', 'IMAGE_LIMIT'\]/);
+  assert.match(pauseHandler, /const pauseReason = \['ERROR', 'RESTART', 'IMAGE_LIMIT', 'UPLOAD_LIMIT'\]/);
   assert.match(pauseHandler, /run\.status = observing \? 'PAUSED_RECOVERING' : \(pauseReason === 'ERROR' \? 'PAUSED_ON_ERROR' : 'PAUSED'\)/);
 });
 
@@ -1961,7 +1967,7 @@ test('generation revisions atomically bind exact PNG, facts and chat while prese
   assert.match(idb, /persistGenerationFactsRevision/);
   assert.match(worker, /ensureSlotGenerationIdentity/);
   assert.match(worker, /await persistGenerationImageRevision\(/);
-  assert.match(gallery, /galleryRecordsFromCatalog\(catalog, currentRevisionRecords\)/);
+  assert.match(gallery, /galleryRecordsFromCatalog\(catalog, currentRevisionRecords, accountingView\)/);
   assert.match(gallery, /generationId: record\.generationId \|\| null/);
   const revisionUtils = await readFile(path.join(extensionDir, 'gallery-revision-utils.js'), 'utf8');
   assert.match(revisionUtils, /facts,/);
@@ -2186,8 +2192,8 @@ test('gallery physical file counter includes archived PNGs while SKU cards remai
   const gallery = await readFile(path.join(extensionDir, 'gallery.js'), 'utf8');
   const html = await readFile(path.join(extensionDir, 'gallery.html'), 'utf8');
   const watcher = await readFile(path.join(root, 'dev', 'watch-extension.mjs'), 'utf8');
-  assert.match(gallery, /Карточек из памяти:/);
-  assert.match(gallery, /galleryRecordsFromCatalog\(catalog, currentRevisionRecords\)/);
+  assert.match(gallery, /Готовые модели в каталоге:/);
+  assert.match(gallery, /galleryRecordsFromCatalog\(catalog, currentRevisionRecords, accountingView\)/);
   assert.match(gallery, /в архиве:/);
   assert.match(html, /PNG на диске, включая архив/);
   assert.match(watcher, /countArchivedOutputPngFiles/);

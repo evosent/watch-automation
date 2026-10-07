@@ -1,6 +1,7 @@
 (() => {
   if (window.__WATCH_AUTOMATION_ENABLED__ !== true) return;
   let controller = null;
+  let factsController = null;
   let runCache = null;
   const A = () => window.WatchChatGPTAdapter;
   const R = () => window.WatchSelectorResolver;
@@ -15,6 +16,17 @@
   const FACTS_ACCEPTANCE_TIMEOUT_MS = 12000;
   const FACTS_ACCEPTANCE_RETRY_TIMEOUT_MS = 15000;
   const FACTS_RESPONSE_TIMEOUT_MS = 900000;
+
+  function normalizedChatConversationUrl(value) {
+    try {
+      const url = new URL(String(value || ''), location.href);
+      if (url.origin !== 'https://chatgpt.com') return null;
+      const match = url.pathname.match(/^\/c\/([^/?#]+)/);
+      return match ? `${url.origin}/c/${match[1]}` : null;
+    } catch (_) {
+      return null;
+    }
+  }
 
   function context(owner = runCache) {
     return {
@@ -101,14 +113,7 @@
   }
 
   function currentConversationUrl() {
-    try {
-      const url = new URL(location.href);
-      if (url.origin !== 'https://chatgpt.com') return null;
-      if (!/^\/c\/[^/?#]+/.test(url.pathname)) return null;
-      return `${url.origin}${url.pathname}`;
-    } catch (_) {
-      return null;
-    }
+    return normalizedChatConversationUrl(location.href);
   }
 
   function emitFactsStage(stage, meta = {}, extra = {}) {
@@ -331,6 +336,95 @@
       bytes: bytes.length,
       sha256: [...new Uint8Array(hash)].map((value) => value.toString(16).padStart(2, '0')).join(''),
       qualityWarnings: Math.abs(ratio - 0.75) > 0.035 ? [`aspect_ratio:${ratio.toFixed(4)} (ожидается около 3:4)`] : []
+    };
+  }
+
+  async function assertSavedFactsImageBinding(meta = {}) {
+    const expectedHash = String(meta.outputHash || meta.expectedImageHash || '').trim().toLowerCase();
+    const expectedChatUrl = normalizedChatConversationUrl(meta.chatUrl);
+    const actualChatUrl = currentConversationUrl();
+    const fail = (code, message, extra = {}) => {
+      const error = new Error(message);
+      error.code = code;
+      error.factsStage = 'IMAGE_BINDING';
+      error.promptSubmitted = false;
+      error.promptAccepted = false;
+      error.responseDiagnostics = { ...(error.responseDiagnostics || {}), ...extra };
+      throw error;
+    };
+
+    if (!/^[a-f0-9]{64}$/.test(expectedHash)) {
+      fail('SAVED_IMAGE_BINDING_UNVERIFIABLE', 'Для сохранённого изображения отсутствует корректная контрольная сумма.', {
+        reason: 'missing_expected_hash'
+      });
+    }
+    if (!expectedChatUrl || !actualChatUrl) {
+      fail('SAVED_IMAGE_BINDING_UNVERIFIABLE', 'Не удалось подтвердить ссылку исходного разговора ChatGPT.', {
+        reason: 'conversation_url_unavailable', expectedChatUrl, actualChatUrl
+      });
+    }
+    if (expectedChatUrl !== actualChatUrl) {
+      fail('SAVED_IMAGE_BINDING_MISMATCH', 'Открыт другой разговор ChatGPT; спецификация не отправлена.', {
+        reason: 'conversation_url_mismatch', expectedChatUrl, actualChatUrl
+      });
+    }
+
+    let loadError = null;
+    try { loadError = R()?.visibleConversationLoadError?.() || null; } catch (_) {}
+    if (loadError) {
+      fail('SAVED_IMAGE_BINDING_UNVERIFIABLE', 'ChatGPT не загрузил этот разговор, поэтому привязку изображения подтвердить нельзя.', {
+        reason: 'conversation_load_error'
+      });
+    }
+
+    let inspection = null;
+    try { inspection = A()?.inspectGeneratedImage?.({ baselineAssistantCount: 0 }) || null; } catch (_) {}
+    const inspectedSource = String(inspection?.src || '').trim();
+    if (!inspectedSource || !['READY', 'WAITING_IMAGE'].includes(String(inspection?.state || '').toUpperCase())) {
+      fail('SAVED_IMAGE_BINDING_UNVERIFIABLE', 'Проверка ChatGPT не подтвердила готовое изображение в последнем ответе ассистента.', {
+        reason: inspection?.state === 'CONVERSATION_LOAD_ERROR' ? 'conversation_load_error' : 'adapter_image_not_ready',
+        inspectionState: inspection?.state || null,
+        inspectionError: inspection?.error || null
+      });
+    }
+
+    let turn = null;
+    let image = null;
+    try {
+      turn = R()?.latestAssistantTurn?.() || null;
+      image = turn ? R()?.generatedImage?.(turn) || null : null;
+    } catch (_) {}
+    const sourceUrl = String(image?.currentSrc || image?.src || inspectedSource).trim();
+    if (!sourceUrl || sourceUrl !== inspectedSource) {
+      fail('SAVED_IMAGE_BINDING_UNVERIFIABLE', 'В последнем ответе ассистента не найдено изображение для безопасной постпроверки.', {
+        reason: sourceUrl ? 'adapter_image_source_mismatch' : 'latest_assistant_image_missing'
+      });
+    }
+
+    let verification;
+    try {
+      verification = await verifyGeneratedPngSource(sourceUrl);
+    } catch (error) {
+      fail('SAVED_IMAGE_BINDING_UNVERIFIABLE', `Не удалось проверить изображение в разговоре: ${error?.message || String(error)}`, {
+        reason: 'image_fetch_failed'
+      });
+    }
+    if (!verification?.valid || String(verification?.sha256 || '').toLowerCase() !== expectedHash) {
+      fail('SAVED_IMAGE_BINDING_MISMATCH', 'Изображение в разговоре не совпадает с сохранённым PNG этой генерации. Постпроверка заблокирована.', {
+        reason: verification?.valid ? 'output_hash_mismatch' : (verification?.reason || 'invalid_image'),
+        expectedHash,
+        observedHash: verification?.sha256 || null,
+        width: verification?.width || null,
+        height: verification?.height || null
+      });
+    }
+    return {
+      verified: true,
+      generationId: meta.generationId || null,
+      outputHash: expectedHash,
+      chatUrl: actualChatUrl,
+      assistantTurnId: turn?.getAttribute?.('data-testid') || turn?.id || null,
+      imageUrlFingerprint: meta.imageUrlFingerprint || null
     };
   }
 
@@ -584,6 +678,8 @@
       generationSubmitted: confirmedSend || ambiguousPhysicalSend,
       preparedForSubmit: Boolean(owner.preparedForSubmit),
       errorClass: error.code || null,
+      resumeAtMs: Number(error.resumeAtMs || 0) || null,
+      autoResume: error.autoResume,
       rateLimit: error.code === 'RATE_LIMIT',
       rateLimitBeforeAssistant: error.rateLimitBeforeAssistant === true
     }, owner);
@@ -604,6 +700,7 @@
     const debugOverlay = job.debugOverlay === true;
     try {
       const prepStartedAt = Date.now();
+      void emitState({ state: 'CREATING_NEW_CHAT', step: '1/9', progress: true }, owner);
       const prep = await A().ensureNewChat({ debugOverlay, signal });
       if (runCache !== owner) throw new DOMException('Aborted', 'AbortError');
       void emitLog('New chat ready', { ...(prep || {}), durationMs: Date.now() - prepStartedAt }, owner);
@@ -618,6 +715,7 @@
       // The upload promise may spend seconds waiting for ChatGPT thumbnails;
       // that must not block the text from appearing in the composer.
       const uploadStartedAt = Date.now();
+      void emitState({ state: 'UPLOADING_ATTACHMENTS', step: '2/9', progress: true }, owner);
       const uploadPromise = A().uploadFiles({
         files: order.map((key) => files[key]),
         debugOverlay,
@@ -816,6 +914,7 @@
     const text = String(prompt || '').trim();
     if (!text) throw new Error('Postprocess prompt is empty');
     const postController = new AbortController();
+    factsController = postController;
     const signal = postController.signal;
     const startedAt = Date.now();
     let promptSubmitted = false;
@@ -826,6 +925,10 @@
       emitFactsStage(name, meta, extra);
     };
     try {
+      if (meta.savedImageBindingRequired === true) {
+        stage('VERIFYING_SAVED_IMAGE');
+        await assertSavedFactsImageBinding(meta);
+      }
       stage('WAITING_COMPOSER');
       void emitLog('Postprocess facts: жду завершения текущего assistant-turn', {
         entryId: runCache.entryId,
@@ -853,6 +956,20 @@
       stage('WAITING_SEND_GATE');
       let permit = await requestFactsSendPermit(meta);
 
+      if (meta.savedImageBindingRequired === true) {
+        stage('REVALIDATING_SAVED_IMAGE');
+        try {
+          await assertSavedFactsImageBinding(meta);
+        } catch (error) {
+          // The composer may already contain the facts prompt while waiting on
+          // the shared send gate. Remove it when the image binding changes so
+          // a later manual click cannot accidentally send an unbound request.
+          try {
+            if (A().composerHasText?.(text)) await A().setComposerText('', { signal });
+          } catch (_) {}
+          throw error;
+        }
+      }
       stage('SENDING');
       let click = await A().clickSendPrompt({ debugOverlay: false, signal, timeout: 5000 });
       promptSubmitted = true;
@@ -968,6 +1085,8 @@
       error.factsStage = error.factsStage || currentStage;
       if (!error.code) error.code = `FACTS_${currentStage}_FAILED`;
       throw error;
+    } finally {
+      if (factsController === postController) factsController = null;
     }
   }
 
@@ -981,7 +1100,11 @@
       outputHash: message.outputHash || null,
       extractorVersion: message.extractorVersion || null,
       fastPath: message.fastPath === true,
-      chatUrl: currentConversationUrl() || message.chatUrl || null
+      savedImageBindingRequired: message.savedImageBindingRequired === true,
+      imageUrlFingerprint: message.imageUrlFingerprint || null,
+      chatUrl: message.savedImageBindingRequired === true
+        ? normalizedChatConversationUrl(message.chatUrl)
+        : (currentConversationUrl() || message.chatUrl || null)
     };
     try {
       const value = await extractFactsFromLastImage(message.prompt, base);
@@ -1015,6 +1138,10 @@
         }
       }
       runCache.factsExtraction = { ...(runCache.factsExtraction || {}), state: 'error', finishedAt: Date.now(), error: error.message };
+      if (String(error?.code || '').startsWith('SAVED_IMAGE_BINDING_') && runCache?.savedFactsBootstrap) {
+        runCache.savedFactsBootstrap.state = 'blocked';
+        runCache.savedFactsBootstrap.blockCode = error.code;
+      }
       const visibleError = error?.factsStage ? `[${error.factsStage}] ${error.message}` : error.message;
       emitFactsStage(error?.code === 'RATE_LIMIT' ? 'RATE_LIMIT' : 'ERROR', base, { error: visibleError });
       await sendFactsResultWithRetry({
@@ -1027,7 +1154,7 @@
           promptSubmitted: error.promptSubmitted === true,
           promptAccepted: error.promptAccepted === true,
           factsStage: error.factsStage || null,
-          responseDiagnostics: responseProbe ? {
+          responseDiagnostics: error.responseDiagnostics || (responseProbe ? {
             state: responseProbe.state || null,
             complete: responseProbe.complete === true,
             characters: Number(responseProbe.characters || 0),
@@ -1039,7 +1166,7 @@
             visibilityState: responseProbe.visibilityState || document.visibilityState || null,
             lastDomInspectionAt: responseProbe.lastDomInspectionAt || null,
             deliveryError: responseProbe.deliveryError || null
-          } : null
+          } : null)
         }
       }).catch(() => {});
     }
@@ -1054,7 +1181,7 @@
       }
       verifyGeneratedPngSource(message.url)
         .then((value) => sendResponse({ ok: true, value }))
-        .catch((error) => sendResponse({ ok: false, error: { message: error?.message || String(error) } }));
+        .catch((error) => sendResponse({ ok: false, error: { message: error?.message || String(error), code: error?.code || null } }));
       return true;
     }
     if (message.type === 'PING') {
@@ -1063,14 +1190,17 @@
     }
     if (message.type === 'BOOTSTRAP_AUTOMATION_TAB') {
       const startedAt = Date.now();
-      A().waitForComposerReadyForInput({ timeout: Number(message.timeoutMs || 60000) })
+      A().waitForComposerReadyForInput({ timeout: Number(message.timeoutMs || 60000), preparationPage: true })
         .then(() => sendResponse({ ok: true, value: {
           composerReady: true,
           visibilityState: document.visibilityState || null,
           href: publicPageUrl(),
           durationMs: Date.now() - startedAt
         } }))
-        .catch((error) => sendResponse({ ok: false, error: { message: error?.message || String(error) } }));
+        .catch((error) => sendResponse({ ok: false, error: {
+          message: error?.message || String(error), code: error?.code || null,
+          autoResume: error?.autoResume, resumeAtMs: error?.resumeAtMs
+        } }));
       return true;
     }
     if (message.type === 'STOP') {
@@ -1080,6 +1210,8 @@
       }
       controller?.abort();
       controller = null;
+      factsController?.abort();
+      factsController = null;
       sendResponse({ ok: true });
       return;
     }
@@ -1098,6 +1230,87 @@
         .then((value) => sendResponse({ ok: true, value }))
         .catch((error) => sendResponse({ ok: false, error: { message: error.message } }));
       return true;
+    }
+    if (message.type === 'BOOTSTRAP_SAVED_FACTS') {
+      const operationId = String(message.operationId || '').trim();
+      const entryId = String(message.entryId || '').trim();
+      const generationId = String(message.generationId || '').trim();
+      const factsJobId = String(message.factsJobId || '').trim();
+      const prompt = String(message.factsPrompt || message.prompt || '').trim();
+      const outputHash = String(message.outputHash || '').trim().toLowerCase();
+      const chatUrl = normalizedChatConversationUrl(message.chatUrl);
+      if (!operationId || !entryId || !generationId || !factsJobId || !prompt
+        || !/^[a-f0-9]{64}$/.test(outputHash) || !chatUrl) {
+        sendResponse({ ok: false, error: {
+          code: 'SAVED_FACTS_TASK_INVALID',
+          message: 'Задание извлечения спецификации не содержит точной ссылки, хэша PNG или обязательных идентификаторов.'
+        } });
+        return;
+      }
+      const taskKey = `${operationId}:${entryId}:${generationId}:${factsJobId}`;
+      if (runCache?.savedFactsBootstrap?.taskKey === taskKey) {
+        sendResponse({ ok: true, value: {
+          accepted: true, duplicate: true,
+          state: runCache.savedFactsBootstrap.state || runCache.factsExtraction?.state || 'running',
+          factsJobId
+        } });
+        return;
+      }
+      if (runCache) {
+        sendResponse({ ok: false, error: {
+          code: 'SAVED_FACTS_TAB_BUSY',
+          message: 'Вкладка уже принадлежит другой операции; безопасное извлечение спецификации не запущено.'
+        } });
+        return;
+      }
+      runCache = {
+        operationId,
+        slotId: Number.isFinite(Number(message.slotId)) ? Number(message.slotId) : null,
+        leaseId: String(message.leaseId || ''),
+        entryId,
+        job: {
+          generationId,
+          factsJobId,
+          factsPrompt: prompt,
+          factsExtractorVersion: message.factsExtractorVersion || message.extractorVersion || null,
+          modelName: message.modelName || null,
+          outputFileName: message.outputFileName || null,
+          outputPath: message.outputPath || null,
+          outputHash
+        },
+        promptSent: false,
+        recovery: true,
+        buildId: message.buildId || null,
+        baselineAssistantCount: Number(R()?.assistantTurns?.()?.length || 0),
+        baselineUserCount: Number(R()?.userTurns?.()?.length || 0),
+        lastProgressAt: Date.now(),
+        factsStageSeq: 0,
+        factsExtraction: {
+          generationId,
+          factsJobId,
+          state: 'running',
+          startedAt: Date.now(),
+          baselineAssistantCount: Number(R()?.assistantTurns?.()?.length || 0),
+          baselineUserCount: Number(R()?.userTurns?.()?.length || 0),
+          userTurnId: null
+        },
+        savedFactsBootstrap: { taskKey, state: 'running', startedAt: Date.now() }
+      };
+      window.WatchDomRecorder?.setContext?.(context());
+      sendResponse({ ok: true, value: { accepted: true, detached: true, bindingPending: true, factsJobId } });
+      emitFactsStage('VERIFYING_SAVED_IMAGE', message, {
+        outputPath: message.outputPath || null,
+        outputHash,
+        bindingRequired: true
+      });
+      void runFactsExtractionDetached({
+        ...message,
+        prompt,
+        outputHash,
+        chatUrl,
+        savedImageBindingRequired: true
+      });
+      return;
     }
     if (message.type === 'PREPARE_PAGE_RUN') {
       controller?.abort();
@@ -1163,7 +1376,7 @@
       recordAutomationEvent({ type: 'prepare-page-content', state: 'PREPARING', details: { operationId: message.operationId } });
       prepareRunForSubmit()
         .then((value) => sendResponse({ ok: true, value }))
-        .catch((error) => sendResponse({ ok: false, error: { message: error.message, code: error.code || null, responseText: error.responseText || null } }));
+        .catch((error) => sendResponse({ ok: false, error: { message: error.message, code: error.code || null, responseText: error.responseText || null, resumeAtMs: error.resumeAtMs || null, autoResume: error.autoResume } }));
       return true;
     }
     if (message.type === 'SUBMIT_PAGE_RUN') {

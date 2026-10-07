@@ -43,7 +43,7 @@ export function sanitizeRunDiagnosticEvent(event, { operationId = null, sequence
 export function diagnosticCategoryForType(type) {
   const value = String(type || '').toLowerCase();
   if (/error|failed|mismatch|timeout|blocked|gap/.test(value)) return 'error';
-  if (/pause|stop|reset|resume|retry|recover|limit|ignore|decision|scheduled/.test(value)) return 'decision';
+  if (/pause|stop|reset|restart|watchdog|resume|retry|recover|limit|ignore|decision|scheduled|facts_stage/.test(value)) return 'decision';
   if (/download|output|facts|revision|completed|verified/.test(value)) return 'result';
   return 'step';
 }
@@ -113,11 +113,22 @@ export function runDiagnosticHeader(run, queue = null, extensionVersion = null) 
     eventCount: Number(run.eventSequence || run.eventCount || 0),
     lastEventAt: lastEvent?.at || null,
     lastActivityAt: run.lastActivityAt || null,
+    lastProgressAt: run.lastProgressAt || null,
+    sessionWatchdog: run.sessionWatchdog || null,
+    sessionRestartId: run.sessionRestartId || null,
+    sessionRestartCount: Number(run.sessionRestartCount || 0),
+    previousOperationId: run.previousOperationId || null,
+    originOperationId: run.originOperationId || null,
     currentAction: run.currentAction || null,
     error: run.error?.message || run.error || null,
     stopBlocked: run.stopBlocked || null,
     rateLimitPauseUntil: run.rateLimitPauseUntil || null,
     rateLimitReason: run.rateLimitReason || null,
+    uploadCooldownActive: run.uploadCooldownActive === true,
+    uploadLimitDetected: run.uploadLimitDetected === true,
+    uploadManualPause: run.uploadManualPause === true,
+    uploadPauseSettled: run.uploadPauseSettled === true,
+    uploadLimitAutoResume: run.uploadLimitAutoResume !== false,
     stalledBatchRecovery: run.stalledBatchRecovery || null,
     conversationRecovery: run.conversationRecovery || null,
     factsErrorCount: Object.values(run.factsProgress || {}).filter((job) => String(job?.stage || '').toUpperCase() === 'ERROR').length,

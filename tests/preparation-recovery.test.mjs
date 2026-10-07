@@ -31,12 +31,14 @@ function harness({ now = time, snapshot = null } = {}) {
       }, postprocessTabs: {}, recoveryTabs: {}, eventJournal: [] },
     queue: { groups: { good: entries } }, history: { items: {}, ignored: {} }, generationMemory: { items: {} }
   };
-  const removed = [], cancelled = [], alarms = [], resumed = [], events = [];
+  const removed = [], cancelled = [], alarms = [], resumed = [], events = [], uploadPauses = [];
   const context = {
     Date: Clock, SLOT_PHASES, currentLeasePhysicalSend, freshSlotRevisionFields,
     MAX_AUTOMATIC_PREPARATION_RECOVERIES: 2, STALLED_BATCH_RECOVERY_DELAY_MS: 300_000,
+    UPLOAD_BACKOFF_MS: 3 * 60 * 60_000 + 60_000,
     stalledBatchRecoveryRuns: new Set(), GENERATION_MEMORY_STATUSES: { NOT_READY: 'not_ready', RUNNING: 'running' },
     withStateLock: async (fn) => fn(), getStored: async () => stored,
+    pauseForUploadLimit: async (id, details) => { uploadPauses.push({ id, details }); },
     groupEntries: (q, id) => q.groups[id], normalizeHistory: (h) => h, normalizeGenerationMemory: (m) => m,
     setGenerationMemoryStatus: (m, e, status) => { m.items[e.sourceId] = { status }; },
     saveRunAndQueue: async (r) => syncRunClock(r, instant), publishRun: async () => {}, appendLog: async () => {},
@@ -50,12 +52,14 @@ function harness({ now = time, snapshot = null } = {}) {
     failStalledBatchRecovery: async (_id, error) => assert.fail(error.stack)
   };
   runInNewContext(`
+    ${section('function plannedTaskIsCompleted(', 'function reconcileReadyRunTaskPlan(')}
     ${section('function slotGenerationSubmitted(', 'async function pauseStalledPreparedSlots(')}
     ${section('async function pauseRun(', 'async function stopRun(')}
     ${section('async function schedulePreparationStallRecovery(', 'async function restoreStalledBatchRecovery(')}
     globalThis.api = { schedulePreparationStallRecovery, resumePreparationStallRecovery, pauseRun, slotGenerationSubmitted };
   `, context);
-  return { stored, context, api: context.api, removed, cancelled, alarms, resumed, events, advance: (n) => { instant += n; } };
+  return { stored, context, api: context.api, removed, cancelled, alarms, resumed, events, uploadPauses,
+    advance: (n) => { instant += n; } };
 }
 
 test('draft upload stall enters durable cooldown while real Send and completed PNG stay protected', async () => {
@@ -95,8 +99,11 @@ test('automatic preparation recovery stops after two rounds and user Stop or Pau
   const h = harness();
   h.stored.run.preparationRecoveryAttempts = 2;
   const result = await h.api.schedulePreparationStallRecovery('run', ['draft']);
-  assert.equal(result.terminal, true);
-  assert.equal(h.stored.run.stalledBatchRecovery.stage, 'FAILED');
+  assert.equal(result.cooldown, true);
+  assert.equal(h.stored.run.stalledBatchRecovery.stage, 'UPLOAD_COOLDOWN');
+  assert.equal(h.uploadPauses.length, 1);
+  assert.equal(h.uploadPauses[0].id, 'run');
+  assert.equal(h.uploadPauses[0].details.inferred, true);
   assert.equal(h.stored.queue.groups.good[0].status, 'done');
   assert.equal(h.resumed.length, 0);
   for (const modifier of [{ clockStopped: true }, { stopBlocked: { at: iso(time) } }, { pauseReason: 'USER' }]) {

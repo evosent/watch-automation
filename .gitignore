@@ -14,3 +14,7 @@ desktop.ini
 .watch-automation-update-state.json
 .watch-automation-update-stage-*/
 .watch-automation-update-backup-*/
+.watch-automation-restart-*/
+output/
+.playwright-cli/
+WatchAutomation-results-*.zip

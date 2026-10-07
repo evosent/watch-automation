@@ -60,7 +60,7 @@ test('reliability fixes serialize OCR telemetry, ship updater dependencies, and 
   const installer = await readFile(path.join(root, 'Install_WatchAutomation.ps1'), 'utf8');
 
   const pulseStart = worker.indexOf('async function pulsePostprocessTabs');
-  const pulseEnd = worker.indexOf('async function clearLegacyRevisionFactsRecoveryAlarm', pulseStart);
+  const pulseEnd = worker.indexOf('async function persistRecoveredRevisionFacts', pulseStart);
   const pulse = worker.slice(pulseStart, pulseEnd);
   const telemetryStart = pulse.indexOf('if (telemetry.length)');
   const telemetry = pulse.slice(telemetryStart);

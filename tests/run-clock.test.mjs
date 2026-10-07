@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { runInNewContext } from 'node:vm';
+import { syncRunProgress } from '../extension/run-progress-utils.js';
 import {
   elapsedRunClock,
   pauseRunClock,
@@ -157,11 +158,17 @@ test('worker persistence and event functions apply the active clock to the saved
     RUN_CLOCK_PAUSE_EVENTS: new Set([
       'run_pause_requested', 'run_pause_applied', 'run_paused_on_error',
       'rate_limit_pause', 'image_limit_pause', 'run_retry_backoff_scheduled',
+      'upload_limit_pause', 'upload_backoff_pause',
       'stalled_batch_recovery_started', 'stalled_batch_recovery_waiting',
       'conversation_load_recovery_started', 'run_stop_accepted', 'run_completed'
     ]),
     queueRunDiagnostics() {},
+    ensureSessionWatchdog() {},
+    noteSessionUsefulProgress() {},
+    recordRecoveryTransitions() {},
+    persistRunDiagnosticDecision: async () => {},
     groupEntries: () => [],
+    syncRunProgress,
     syncRunClock,
     elapsedRunClock,
     pauseRunClock,

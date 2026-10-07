@@ -3,6 +3,8 @@ import {
   generationMemoryRecordFromEntry, historyRecordFromEntry,
   applyGenerationHistory, applyGenerationMemory
 } from './queue-utils.js';
+import { canonicalBrandIdentityId, modelCodeFromName } from './sku-utils.js';
+import { legacySkuKeyForArchiveModelName } from './identity-migration-utils.js';
 
 export const RESULTS_PACKAGE_FORMAT = 'watch-automation-results';
 export const RESULTS_PACKAGE_VERSION = 1;
@@ -11,7 +13,8 @@ const HASH = /^[a-f0-9]{64}$/i;
 const REVISION_FIELDS = [
   'generationId', 'sourceId', 'modelName', 'fileName', 'groupId', 'sourceVariantId',
   'relativePath', 'sourceHash', 'recipeHash', 'profileId', 'profileVersion', 'attempt',
-  'generatedAt', 'completedAt', 'downloadedAt', 'outputHash', 'outputWidth', 'outputHeight', 'factsJobId', 'operationId'
+  'generatedAt', 'completedAt', 'downloadedAt', 'outputHash', 'outputWidth', 'outputHeight', 'factsJobId', 'operationId',
+  'originSourceId'
 ];
 const FACTS_FIELDS = [
   'titleBrand', 'titleSeries', 'titleModel', 'utp1', 'utp2', 'waterResistance',
@@ -20,6 +23,45 @@ const FACTS_FIELDS = [
 ];
 const pick = (object, keys) => Object.fromEntries(keys.filter((key) => object?.[key] != null)
   .map((key) => [key, object[key]]));
+
+function canonicalPortableSourceId(record) {
+  const canonicalId = sourceIdFor(record.groupId, record.relativePath, record.modelName);
+  const currentCode = modelCodeFromName(record.modelName);
+  const brandId = brandIdFromModelName(record.modelName);
+  const facts = record.facts && typeof record.facts === 'object' ? record.facts : null;
+  const explicitModelValues = [facts?.titleModel, facts?.expectedTitleModel].filter((value) => String(value || '').trim());
+  if (explicitModelValues.some((value) => modelCodeFromName(value) !== currentCode)) {
+    throw new Error('Код модели в названии и спецификации не совпадает');
+  }
+  const factsBrand = String(facts?.titleBrand || facts?.expectedTitleBrand || '').trim();
+  if (factsBrand && canonicalBrandIdentityId(factsBrand) !== canonicalBrandIdentityId(brandId)) {
+    throw new Error('Бренд в названии и спецификации не совпадает');
+  }
+  if (facts?.sourceId && facts.sourceId !== record.sourceId && facts.sourceId !== canonicalId) {
+    throw new Error('ID модели в спецификации не совпадает с результатом');
+  }
+  const suppliedOrigin = String(record.originSourceId || '').trim();
+  const legacyId = legacySkuKeyForArchiveModelName(record.modelName, brandId);
+  if (record.sourceId === canonicalId) {
+    if (suppliedOrigin && suppliedOrigin !== canonicalId && suppliedOrigin !== legacyId) {
+      throw new Error('Исторический ID модели не соответствует результату');
+    }
+    return { sourceId: canonicalId, originSourceId: suppliedOrigin || null };
+  }
+
+  if (!currentCode) throw new Error('Невозможно подтвердить код модели для исторического ID');
+
+  // Version-1 archives may contain an ID produced by the former first-match
+  // parser. Accept it only when that parser derives the supplied alias from
+  // this exact name and the current parser independently identifies a model.
+  if (legacyId !== record.sourceId || legacyId === canonicalId) {
+    throw new Error('ID модели или контрольная сумма результата некорректны');
+  }
+  if (suppliedOrigin && suppliedOrigin !== canonicalId && suppliedOrigin !== record.sourceId) {
+    throw new Error('Исторический ID модели не соответствует результату');
+  }
+  return { sourceId: canonicalId, originSourceId: suppliedOrigin || record.sourceId };
+}
 
 export function transferableRevision(record) {
   return Boolean(record?.generationId && record.sourceId && record.outputPath
@@ -34,10 +76,12 @@ export function portableResult(record) {
     if (typeof value === 'string' && (value.length > 2048 || value.includes('\0'))) throw new Error(`Некорректное поле ${key}`);
     if (!['string', 'number'].includes(typeof value)) throw new Error(`Некорректное поле ${key}`);
   }
-  if (!result.generationId || !result.modelName || !HASH.test(String(result.outputHash || ''))
-    || result.sourceId !== sourceIdFor(result.groupId, result.relativePath, result.modelName)) {
+  if (!result.generationId || !result.modelName || !HASH.test(String(result.outputHash || ''))) {
     throw new Error('ID модели или контрольная сумма результата некорректны');
   }
+  const identity = canonicalPortableSourceId({ ...record, ...result, facts: record.facts });
+  result.originSourceId = identity.originSourceId || undefined;
+  result.sourceId = identity.sourceId;
   result.outputHash = result.outputHash.toLowerCase();
   if (!QUEUE_GROUP_IDS.includes(result.groupId)) throw new Error('Неизвестная категория результата');
   const facts = record.facts;
@@ -80,19 +124,20 @@ export function validateResultsManifest(manifest) {
 }
 
 export function resultsImportPreview(items, existingRevisions = []) {
+  const normalizedItems = items.map((item) => portableResult(item));
   const saved = existingRevisions.filter((record) => record.outputHash && record.outputPath);
   let duplicates = 0;
   let conflicts = 0;
   let rejected = 0;
-  for (const item of items) {
+  for (const item of normalizedItems) {
     const sameModel = saved.filter((record) => record.sourceId === item.sourceId);
     const sameImage = sameModel.find((record) => String(record.outputHash).toLowerCase() === item.outputHash);
     if (sameImage) { duplicates += 1; if (sameImage.reviewStatus === 'rejected') rejected += 1; }
     else if (sameModel.length) conflicts += 1;
   }
-  return { total: items.length, models: new Set(items.map((item) => item.sourceId)).size,
-    newResults: items.length - duplicates, duplicates, conflicts, rejected,
-    withoutFacts: items.filter((item) => item.factsStatus !== 'ok').length };
+  return { total: normalizedItems.length, models: new Set(normalizedItems.map((item) => item.sourceId)).size,
+    newResults: normalizedItems.length - duplicates, duplicates, conflicts, rejected,
+    withoutFacts: normalizedItems.filter((item) => item.factsStatus !== 'ok').length };
 }
 
 // Import adapts portable records to this installation's input fingerprints.

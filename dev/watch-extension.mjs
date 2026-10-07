@@ -9,6 +9,7 @@ import { createUpdateManager, installedUpdateStatus, scheduleApplicationRestart,
   AUTOMATION_LAUNCHER_TEMPLATE_MARKER, prepareAutomationBrowserStartup,
   repairAutomationLauncherFromTemplate } from './update-utils.mjs';
 import { createResultsTransferManager } from '../extension/local-service/results-transfer.mjs';
+import { createArtifactAccountingVerifier } from '../extension/local-service/artifact-accounting.mjs';
 import {
   controlCommandMatchesClient,
   extensionIdFromOrigin,
@@ -21,8 +22,8 @@ const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const EXTENSION_ROOT = path.join(PROJECT_ROOT, 'extension');
 const HOST = process.env.WATCH_AUTOMATION_HOST || '127.0.0.1';
 const PORT = Number(process.env.WATCH_AUTOMATION_PORT || 17321);
-const WATCHER_API_VERSION = 11;
-const WATCHER_BUILD_ID = '2026-10-05.2';
+const WATCHER_API_VERSION = 12;
+const WATCHER_BUILD_ID = '2026-10-06.5';
 const DEBOUNCE_MS = Number(process.env.WATCH_AUTOMATION_DEBOUNCE_MS || 650);
 const POLL_MS = Number(process.env.WATCH_AUTOMATION_POLL_MS || 5000);
 const DOM_LIBRARY_ROOT = path.join(PROJECT_ROOT, 'diagnostics', 'dom-library');
@@ -97,6 +98,7 @@ const updateManager = createUpdateManager(PROJECT_ROOT, {
   }
 });
 const resultsTransfers = createResultsTransferManager({ outputRoot: defaultOutputRoot });
+const verifyAccountingArtifacts = createArtifactAccountingVerifier({ validatePath: safeOutputPath, readPngMetadata });
 
 function relativePath(filePath) {
   return path.relative(EXTENSION_ROOT, filePath).split(path.sep).join('/');
@@ -609,7 +611,10 @@ function normalizeControlCommand(value) {
     ['импорт_референсов', 'IMPORT_REFERENCES'],
     ['импорт референсов', 'IMPORT_REFERENCES'],
     ['status', 'STATUS'],
-    ['состояние', 'STATUS']
+    ['состояние', 'STATUS'],
+    ['diagnostics', 'DIAGNOSTICS'],
+    ['export_diagnostics', 'DIAGNOSTICS'],
+    ['экспорт диагностики', 'DIAGNOSTICS']
   ]);
   return aliases.get(command) || null;
 }
@@ -850,20 +855,23 @@ async function readDomObservations(url) {
   const operationId = url.searchParams.get('operationId');
   const entryId = url.searchParams.get('entryId');
   const eventType = url.searchParams.get('eventType');
-  const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 100)));
+  const all = url.searchParams.get('all') === '1';
+  const limit = Math.min(all ? 50000 : 500, Math.max(1, Number(url.searchParams.get('limit') || 100)));
   if (!session) return { ok: true, libraryRoot: DOM_LIBRARY_ROOT, files: files.slice(0, 200) };
   const wanted = safeFileStem(session);
   const file = files.find((item) => item.session === wanted);
   if (!file) return { ok: true, session: wanted, events: [], files: [] };
   const content = await fs.readFile(file.path, 'utf8').catch(() => '');
-  const events = content.split(/\r?\n/).filter(Boolean).map((line) => {
+  const allEvents = content.split(/\r?\n/).filter(Boolean).map((line) => {
     try { return JSON.parse(line); } catch (_) { return { parseError: true, raw: line.slice(0, 1000) }; }
   }).filter((event) => (
     (!operationId || event.operationId === operationId)
     && (!entryId || event.entryId === entryId)
     && (!eventType || event.type === eventType)
-  )).slice(-limit);
-  return { ok: true, session: wanted, events, file: file.path };
+  ));
+  const events = allEvents.slice(-limit);
+  return { ok: true, session: wanted, events, totalEvents: allEvents.length,
+    truncated: events.length < allEvents.length, file: file.path };
 }
 
 async function readLatestDomObservations(url) {
@@ -900,6 +908,30 @@ function stopStaleWindowsWatcherOnPort() {
 function startHttpServer() {
   server = createServer((request, response) => {
     const requestUrl = new URL(request.url || '/', `http://${HOST}:${PORT}`);
+    if (requestUrl.pathname === '/output-accounting-verify') {
+      const origin = String(request.headers.origin || '');
+      const accountingClient = normalizeExtensionUpdateClient({
+        origin,
+        extensionId: requestUrl.searchParams.get('extensionId') || '',
+        clientId: requestUrl.searchParams.get('clientId') || '',
+        version: requestUrl.searchParams.get('version') || ''
+      });
+      if (!accountingClient) {
+        jsonResponse(response, 403, { ok: false, error: 'Проверка результатов доступна из расширения' });
+        return;
+      }
+      if (request.method === 'OPTIONS') {
+        response.writeHead(204, { 'Access-Control-Allow-Origin': origin || '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Vary': 'Origin' });
+        response.end();
+      } else if (request.method === 'POST') {
+        readRequestBody(request)
+          .then(payload => verifyAccountingArtifacts(payload.artifacts))
+          .then(value => jsonResponse(response, 200, value))
+          .catch(error => jsonResponse(response, 400, { ok: false, error: error.message }));
+      } else jsonResponse(response, 405, { ok: false, error: 'Method not allowed' });
+      return;
+    }
     if (requestUrl.pathname.startsWith('/results-transfer/')) {
       const origin = String(request.headers.origin || '');
       const client = normalizeExtensionUpdateClient({ origin,

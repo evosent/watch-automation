@@ -4,15 +4,20 @@ import {
   QUEUE_GROUP_IDS,
   brandIdFromModelName,
   sanitizeFilename,
-  modelCatalogRecordsFromGroups,
-  sourceIdFor
+  modelCatalogRecordsFromGroups
 } from './queue-utils.js';
 import {
   getOutputDirectoryHandle, getAllGenerationRevisions,
-  getAllModelCatalog, replaceModelCatalog, adoptLegacyGenerationRevisions
+  getAllModelCatalog, replaceModelCatalog
 } from './idb.js';
 import { factsDisplayState, effectiveFactsWarnings, sortGalleryRecords } from './gallery-utils.js';
 import { galleryRecordsFromCatalog } from './gallery-revision-utils.js';
+import {
+  ACCOUNTING_SNAPSHOT_STORAGE_KEY,
+  acceptAccountingSnapshot,
+  accountingSnapshotFromResponse,
+  accountingSnapshotFreshness
+} from './accounting-ui-utils.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 160;
@@ -30,6 +35,8 @@ let zoom = 1;
 const thumbUrls = new Map();
 const loadingThumbs = new Map();
 let toastTimer = null;
+let accountingSnapshot = null;
+let galleryLoadSequence = 0;
 
 function thumbnailCacheKey(record) {
   return [
@@ -70,15 +77,6 @@ async function permission(handle, mode = 'read') {
   if (!handle) return 'missing';
   try { return handle.queryPermission ? await handle.queryPermission({ mode }) : 'granted'; }
   catch (_) { return 'unknown'; }
-}
-
-function flattenQueue(queue) {
-  const result = [];
-  const groups = queue?.groups || {};
-  for (const groupId of QUEUE_GROUP_IDS) {
-    for (const entry of groups[groupId] || []) result.push({ ...entry, groupId: entry.groupId || groupId });
-  }
-  return result;
 }
 
 async function scanCustomFolder(handle) {
@@ -219,26 +217,25 @@ function watcherFileUrl(record) {
 }
 
 async function loadState() {
+  const loadSequence = ++galleryLoadSequence;
   $('folderStatus').textContent = 'Читаю каталог и актуальные ревизии…';
-  const [stored, revisionRecords, storedCatalog] = await Promise.all([
-    chrome.storage.local.get(['queue', 'outputDestination']),
+  const [stored, revisionRecords, storedCatalog, accountingResponse] = await Promise.all([
+    chrome.storage.local.get(['queue', 'outputDestination', ACCOUNTING_SNAPSHOT_STORAGE_KEY]),
     getAllGenerationRevisions().catch(() => []),
-    getAllModelCatalog({ includeRemoved: true }).catch(() => [])
+    getAllModelCatalog({ includeRemoved: true }).catch(() => []),
+    chrome.runtime.sendMessage({ type: 'GET_ACCOUNTING_SNAPSHOT' }).catch(() => null)
   ]);
+  const cachedSnapshot = stored[ACCOUNTING_SNAPSHOT_STORAGE_KEY];
+  const candidate = accountingSnapshotFromResponse(accountingResponse)
+    || (cachedSnapshot ? { ...cachedSnapshot, stale: true, staleReason: cachedSnapshot.staleReason || 'сервис проверки недоступен' } : null);
+  accountingSnapshot = acceptAccountingSnapshot(accountingSnapshot, candidate);
   outputDestination = stored.outputDestination || { mode: 'downloads' };
   outputHandle = await getOutputDirectoryHandle().catch(() => null);
-  const queueEntries = flattenQueue(stored.queue);
   let catalog = storedCatalog;
   let currentRevisionRecords = revisionRecords;
   if (!catalog.length && stored.queue?.groups) {
     catalog = modelCatalogRecordsFromGroups(stored.queue.groups);
     await replaceModelCatalog(catalog);
-    const aliases = {};
-    for (const entry of queueEntries) {
-      const skuKey = sourceIdFor(entry.groupId || 'in_sale_good', entry.relativePath || entry.fileName, entry.modelName || entry.fileName);
-      if (entry.sourceId && entry.sourceId !== skuKey) aliases[String(entry.sourceId)] = skuKey;
-    }
-    await adoptLegacyGenerationRevisions(aliases).catch(() => {});
     [catalog, currentRevisionRecords] = await Promise.all([
       getAllModelCatalog({ includeRemoved: true }).catch(() => catalog),
       getAllGenerationRevisions().catch(() => revisionRecords)
@@ -268,10 +265,17 @@ async function loadState() {
         && /\.png$/i.test(String(item.filename || ''))).length;
     }
   }
-  records = galleryRecordsFromCatalog(catalog, currentRevisionRecords);
+  if (loadSequence !== galleryLoadSequence) return;
+  const accountingView = accountingSnapshot || { version: 1, entries: [], stale: true, staleReason: 'снимок готовности отсутствует' };
+  records = galleryRecordsFromCatalog(catalog, currentRevisionRecords, accountingView);
 
   const customPermission = await permission(outputHandle, 'read');
-  const pieces = [`Карточек из памяти: ${records.length}`, `PNG в папке: ${physicalPngs}`];
+  const currentCatalogCards = records.filter((record) => !record.outsideCurrentCatalog).length;
+  const outsideCatalogCards = records.length - currentCatalogCards;
+  const freshness = accountingSnapshotFreshness(accountingView);
+  const pieces = [`Готовые модели в каталоге: ${currentCatalogCards}`];
+  if (outsideCatalogCards) pieces.push(`вне текущего каталога: ${outsideCatalogCards}`);
+  pieces.push(`PNG в папке: ${physicalPngs}`, freshness.label);
   if (archivedPngs > 0) pieces.push(`в архиве: ${archivedPngs}`);
   else pieces.push('в архиве: 0');
   if (outputDestination?.mode === 'downloads') {
@@ -350,6 +354,12 @@ function render() {
   const page = filtered.slice(0, shown);
   $('visibleCount').textContent = String(filtered.length);
   $('totalCount').textContent = String(records.length);
+  const currentCatalogCount = records.filter((record) => !record.outsideCurrentCatalog).length;
+  const outsideCatalogCount = records.length - currentCatalogCount;
+  const scopeHint = $('catalogCountHint');
+  if (scopeHint) scopeHint.textContent = outsideCatalogCount
+    ? `· ${currentCatalogCount} в текущем каталоге · ${outsideCatalogCount} вне каталога`
+    : '';
   $('emptyState').hidden = filtered.length !== 0;
   $('loadMore').hidden = shown >= filtered.length;
   grid.innerHTML = page.map((record) => {
@@ -807,7 +817,7 @@ window.addEventListener('keydown', (event) => {
   if (event.key.toLowerCase() === 'b' || event.key === 'Delete') reject(filtered[viewerIndex]).catch(showError);
 });
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local' || (!changes.generationMemory && !changes.queue && !changes.outputDestination)) return;
+  if (area !== 'local' || (!changes.generationMemory && !changes.queue && !changes.outputDestination && !changes[ACCOUNTING_SNAPSHOT_STORAGE_KEY])) return;
   loadState().catch(showError);
 });
 window.addEventListener('beforeunload', () => {

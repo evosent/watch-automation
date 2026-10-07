@@ -1,5 +1,5 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-npm run watch:extension
+node "%~dp0dev\watch-extension.mjs"
 endlocal

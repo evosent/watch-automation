@@ -29,7 +29,8 @@
       ['data-testid', 'input[data-testid="upload-photos-input"][type="file"]', 0.99],
       ['id', 'input#upload-photos[type="file"]', 0.98],
       ['photo-upload', 'input#upload-files[data-photo-upload-enabled="true"][type="file"]', 0.91],
-      ['accept-image', 'input[type="file"][accept^="image/"]', 0.75]
+      ['accept-image', 'input[type="file"][accept^="image/"]', 0.75],
+      ['upload-files-id', 'input#upload-files[type="file"]', 0.90]
     ],
     send: [
       ['id', '#composer-submit-button', 1.00],
@@ -39,13 +40,127 @@
     ]
   };
 
+  const emptyResolution = () => ({ element: null, strategy: null, selector: null, confidence: 0 });
+  const attr = (element, name) => String(element?.getAttribute?.(name) || '').trim();
+  const unavailableInput = (element) => element.disabled === true || element.matches?.(':disabled')
+    || attr(element, 'aria-disabled') === 'true';
+  const inputSurface = (composer) => composer?.closest('[data-composer-surface="true"]')
+    || composer?.closest('form') || composer?.parentElement || null;
+  const NON_ATTACHMENT_CONTEXT = /(?:avatar|profile|account|import|restore|settings|аватар|профил|аккаунт|импорт|настройк)/i;
+  const UPLOAD_INPUT_LABEL = /^(?:(?:upload|attach|add|choose|select)\s+(?:files?|photos?|images?)(?:\s+and\s+more)?|(?:загрузить|прикрепить|добавить|выбрать)\s+(?:файл(?:ы)?|фотографи[июи]|фото|изображени[ея])(?:\s+и\s+(?:другое|ещё|еще))?)$/i;
+  const COMPOSER_PLUS_LABEL = /^(?:add\s+(?:files?|photos?|attachments?)(?:\s+(?:and\s+(?:more|photos)|or\s+photos))?|add\s+photos\s+(?:and|&)\s+files|attach\s+files?|добавить\s+(?:файлы|фото|вложения)(?:\s+и\s+(?:другое|ещё|еще|файлы|фото))?|прикрепить\s+файлы)$/i;
+
+  function imageAccept(accept) {
+    return accept.split(',').some((token) => /^(?:image\/[a-z0-9.+*-]+|\*\/\*|\.(?:png|jpe?g|jpe|gif|webp|bmp|avif|heic|heif|tiff?|ico|svg))$/i.test(token.trim()));
+  }
+
+  function fileInputCandidates(root = document) {
+    const byElement = new Map();
+    for (const [strategy, selector, confidence] of strategies.fileInput) {
+      for (const element of root.querySelectorAll(selector)) {
+        if (!byElement.has(element)) byElement.set(element, { element, strategy, selector, confidence });
+      }
+    }
+    for (const element of root.querySelectorAll('input[type="file"]')) {
+      if (!byElement.has(element)) byElement.set(element, {
+        element, strategy: 'composer-file-input', selector: 'input[type="file"]', confidence: 0.70
+      });
+    }
+    const composer = resolve('composer', { root }).element;
+    const surface = inputSurface(composer);
+    const candidates = [...byElement.values()].map((candidate) => {
+      const { element, strategy } = candidate;
+      const reasons = [];
+      const inActiveComposer = Boolean(surface?.contains?.(element));
+      const owner = element.closest?.('[data-composer-surface="true"]') || element.closest?.('form');
+      const owningForm = element.closest?.('form');
+      const activeForm = composer?.closest?.('form');
+      const accept = attr(element, 'accept');
+      const identity = ['id', 'data-testid', 'name', 'aria-label', 'title'].map((name) => attr(element, name)).join(' ');
+      const identifiedUpload = ['data-testid', 'id', 'photo-upload', 'upload-files-id'].includes(strategy)
+        || /^(?:upload|attach)-(?:photos?|images?|files?)(?:-input)?$/i.test(attr(element, 'data-testid'))
+        || UPLOAD_INPUT_LABEL.test(attr(element, 'aria-label')) || UPLOAD_INPUT_LABEL.test(attr(element, 'title'));
+      const supportsImages = imageAccept(accept) || (!accept && strategy === 'accept-image');
+      if (element.isConnected === false) reasons.push('disconnected');
+      if (unavailableInput(element)) reasons.push('disabled');
+      if (NON_ATTACHMENT_CONTEXT.test(identity)) reasons.push('unrelated-file-purpose');
+      const excludedSelector = '[data-turn], [data-message-author-role], [data-testid^="conversation-turn"], nav, aside, [role="navigation"], [data-watch-automation-overlay]';
+      const excludedOwner = element.closest?.(excludedSelector);
+      if (excludedOwner?.matches?.(excludedSelector)) reasons.push('outside-attachment-ui');
+      // Hidden inputs in the active composer or a known upload portal are
+      // expected. A matching control inside an old composer/form is stale.
+      if (owner && !inActiveComposer) reasons.push('inactive-or-unrelated-surface');
+      if (owningForm && activeForm && owningForm !== activeForm) reasons.push('inactive-composer-form');
+      for (let ancestor = element.parentElement, depth = 0; ancestor && depth < 6; ancestor = ancestor.parentElement, depth++) {
+        const contextIdentity = ['id', 'data-testid', 'aria-label'].map((name) => attr(ancestor, name)).join(' ');
+        if (NON_ATTACHMENT_CONTEXT.test(contextIdentity)) { reasons.push('unrelated-file-surface'); break; }
+      }
+      if (accept && !supportsImages) reasons.push('accept-excludes-images');
+      if (!inActiveComposer && !identifiedUpload) reasons.push('unidentified-portal');
+      return { ...candidate, inActiveComposer, identifiedUpload, supportsImages,
+        rejectionReasons: [...new Set(reasons)], eligible: reasons.length === 0 };
+    });
+    const eligible = candidates.filter((candidate) => candidate.eligible);
+    const selected = eligible.find((candidate) => candidate.inActiveComposer) || eligible[0] || null;
+    return { composer, surface, candidates, selected };
+  }
+
+  function fileInputDiagnostics({ root = document, maxCandidates = 20 } = {}) {
+    const report = fileInputCandidates(root);
+    const limit = Math.min(20, Math.max(1, Number(maxCandidates) || 20));
+    return {
+      composerFound: Boolean(report.composer), composerSurfaceFound: Boolean(report.surface),
+      totalCandidates: report.candidates.length, truncated: report.candidates.length > limit,
+      candidates: report.candidates.slice(0, limit).map((candidate, index) => {
+        const element = candidate.element;
+        // Never serialize a file value, filenames, files, markup or contents.
+        const attributes = Object.fromEntries(['id', 'type', 'accept', 'data-testid', 'data-photo-upload-enabled', 'aria-disabled']
+          .map((name) => [name, attr(element, name).slice(0, 160) || null]));
+        return { index, attributes, disabled: unavailableInput(element), multiple: element.multiple === true,
+          connected: element.isConnected !== false, visible: visible(element),
+          inActiveComposer: candidate.inActiveComposer, identifiedUpload: candidate.identifiedUpload,
+          supportsImages: candidate.supportsImages, eligible: candidate.eligible,
+          selected: candidate === report.selected, strategy: candidate.strategy,
+          rejectionReasons: candidate.rejectionReasons };
+      })
+    };
+  }
+
+  function resolveComposerPlus({ visibleOnly = true, root = document } = {}) {
+    const composer = resolve('composer', { root }).element;
+    const surface = inputSurface(composer);
+    if (!surface) return emptyResolution();
+    const activeForm = composer?.closest?.('form');
+    const usable = (node) => {
+      const owningForm = node.closest?.('form');
+      return node.isConnected !== false && !unavailableInput(node) && (!visibleOnly || visible(node))
+        && !(owningForm && activeForm && owningForm !== activeForm);
+    };
+    for (const [strategy, selector, confidence] of strategies.composerPlus) {
+      const element = [...surface.querySelectorAll(selector)]
+        .find(usable);
+      if (element) return { element, strategy, selector, confidence };
+    }
+    const element = [...surface.querySelectorAll('button, [role="button"]')].find((node) => (
+      usable(node)
+      && [attr(node, 'aria-label'), attr(node, 'title'), String(node.innerText || node.textContent || '').trim()]
+        .some((label) => COMPOSER_PLUS_LABEL.test(label))
+    ));
+    return element ? { element, strategy: 'composer-attachment-label', selector: 'button, [role="button"]', confidence: 0.87 } : emptyResolution();
+  }
+
   function resolve(name, { visibleOnly = true, root = document } = {}) {
     const list = strategies[name] || [];
+    if (name === 'fileInput') {
+      const selected = fileInputCandidates(root).selected;
+      return selected ? { element: selected.element, strategy: selected.strategy, selector: selected.selector, confidence: selected.confidence } : emptyResolution();
+    }
+    if (name === 'composerPlus') return resolveComposerPlus({ visibleOnly, root });
     for (const [strategy, selector, confidence] of list) {
       const el = visibleOnly ? firstVisible(selector, root) : root.querySelector(selector);
       if (el) return { element: el, strategy, selector, confidence };
     }
-    return { element: null, strategy: null, selector: null, confidence: 0 };
+    return emptyResolution();
   }
 
   function conversationTurns(role) {
@@ -188,19 +303,25 @@
     return null;
   }
 
-  const RATE_LIMIT_PATTERN = /(слишком\s+много\s+запросов|слишком\s+часто|временно\s+ограничен|too\s+many\s+requests|rate\s*limit|temporarily\s+restricted|лимит\s+(?:создания|генерации)\s+изображений|лимит\s+запросов\s+на\s+генерацию\s+изображений|image\s+generation\s+limit)/i;
+  const RATE_LIMIT_PATTERN = /(слишком\s+много\s+запросов|слишком\s+часто|временно\s+ограничен|too\s+many\s+requests|rate\s*limit|temporarily\s+restricted)/i;
+
+  function isRateLimitText(text) {
+    return RATE_LIMIT_PATTERN.test(text) || globalThis.WatchQuotaUtils?.isImageLimitText(text) === true;
+  }
 
   function rateLimitDialogs(root = document) {
     const scoped = root === document ? document : root;
     const primary = [...scoped.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], [data-testid*="modal" i]')];
     const fallback = [...scoped.querySelectorAll('div, section, main, aside, dialog')].filter((element) => {
       const text = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
-      return text.length >= 20 && text.length <= 500 && RATE_LIMIT_PATTERN.test(text);
+      return text.length >= 20 && text.length <= 500 && isRateLimitText(text);
     });
     const candidates = [...primary, ...fallback];
     return [...new Set(candidates)]
       .filter((element) => visible(element))
-      .filter((element) => RATE_LIMIT_PATTERN.test((element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim()))
+      .filter((element) => !element.closest('[data-turn], [data-message-author-role], [data-testid^="conversation-turn"], [contenteditable="true"], [data-watch-automation-overlay]'))
+      .filter((element) => !element.querySelector('[data-turn], [data-message-author-role], [data-testid^="conversation-turn"]'))
+      .filter((element) => isRateLimitText((element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim()))
       .sort((a, b) => {
         const hasResetTime = (element) => /(?:попробуйте\s+снова\s+в|try\s+again\s+at)\s*\d{1,2}:\d{2}/i
           .test(element.innerText || element.textContent || '');
@@ -227,6 +348,68 @@
     return { detected: true, dismissed: Boolean(button), text };
   }
 
+  const HISTORY_LOAD_PATTERN = /(?:не\s+удалось|не\s+получилось|невозможно)\s+(?:загрузить|получить)\s+(?:историю|список\s+(?:чатов|разговоров))|(?:unable|failed|could\s+not)\s+to\s+load\s+(?:(?:chat|conversation)\s+)?history/i;
+  function isHistoryLoadErrorText(text) { return HISTORY_LOAD_PATTERN.test(text); }
+
+  function visibleHistoryLoadError(root = document) {
+    const excluded = '[data-turn], [data-message-author-role], [data-testid^="conversation-turn"], [contenteditable="true"], [data-watch-automation-overlay]';
+    const uiSelector = '[role="alert"], [role="status"], [role="dialog"], [aria-live], [data-testid*="error" i]';
+    const candidates = [...root.querySelectorAll(uiSelector)];
+    for (const button of root.querySelectorAll('button, [role="button"]')) {
+      let parentHidden = false;
+      for (let node = button; node; node = node.parentElement) {
+        if (!visible(node)) { parentHidden = true; break; }
+      }
+      if (parentHidden || button.closest(excluded) || ![button.innerText || button.textContent || '', button.getAttribute('aria-label') || '']
+        .some(label => /^(?:повторить|retry|try\s+again)$/i.test(String(label).trim()))) continue;
+      let parent = button.parentElement;
+      for (let depth = 0; parent && depth < 6; depth++, parent = parent.parentElement) candidates.push(parent);
+    }
+    return [...new Set(candidates)].filter(element => visible(element))
+      .filter(element => !element.closest(excluded))
+      .filter(element => !element.querySelector(excluded))
+      .filter(element => {
+        const text = String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+        return text.length <= 2000 && isHistoryLoadErrorText(text);
+      }).sort((a, b) => (a.innerText || a.textContent || '').length - (b.innerText || b.textContent || '').length)[0] || null;
+  }
+
+  function uploadError(root = document) {
+    const quota = globalThis.WatchQuotaUtils;
+    if (!quota) return null;
+    const uiSelector = '[role="alert"], [role="status"], [role="dialog"], [role="alertdialog"], [aria-modal="true"], [aria-live], [data-testid*="toast" i], [data-testid*="error" i], [data-testid*="upload" i]';
+    const composer = resolve('composer').element;
+    const surface = composer?.closest('[data-composer-surface="true"]') || composer?.closest('form') || composer?.parentElement;
+    const nearComposer = surface ? [...surface.querySelectorAll('div, span, p')] : [];
+    const candidates = [...new Set([...root.querySelectorAll(uiSelector), ...nearComposer])];
+    const rejected = /(?:upload[^.]{0,100}(?:failed|error|reject|unable)|(?:failed|unable|could\s+not)[^.]{0,50}upload|(?:unsupported|invalid|too\s+large)[^.]{0,30}(?:file|image)|(?:file|image)[^.]{0,30}(?:too\s+large|unsupported|invalid)|(?:не\s+удалось|ошибка|отклон)[^.]{0,50}(?:загруз|файл|вложен)|(?:файл|изображен)[^.]{0,50}(?:слишком\s+больш|не\s+поддерж|недопустим))/i;
+    const results = [];
+    for (const element of candidates) {
+      if (!visible(element)) continue;
+      // Prompts, assistant prose and our debugging overlay are source text,
+      // never evidence that ChatGPT refused an upload.
+      if (element.closest('[data-turn], [data-message-author-role], [data-testid^="conversation-turn"], [contenteditable="true"], [data-watch-automation-overlay]')) continue;
+      if (element.querySelector('[data-turn], [data-message-author-role], [data-testid^="conversation-turn"]')) continue;
+      const text = String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length > 2000) continue;
+      const storageLimit = quota.isStorageLimitText(text);
+      const uploadLimit = storageLimit || quota.isUploadLimitText(text);
+      // Loading the sidebar's chat history is independent of file uploads.
+      // Russian "не удалось загрузить" alone must not abort a healthy composer.
+      const rejectionText = text.replace(new RegExp(HISTORY_LOAD_PATTERN.source, 'gi'), '')
+        .replace(/не\s+удалось\s+загрузить\s+этот\s+разговор\s+chatgpt/gi, '');
+      if (!uploadLimit && !rejected.test(rejectionText)) continue;
+      results.push({ text, uploadLimit, storageLimit, element });
+    }
+    results.sort((a, b) => Number(b.uploadLimit) - Number(a.uploadLimit) || a.text.length - b.text.length);
+    return results[0] || null;
+  }
+
+  function uploadLimitDialog(root = document) {
+    const error = uploadError(root);
+    return error?.uploadLimit ? error.element : null;
+  }
+
   function visibleErrors(root = document) {
     const retryOnlyPattern = /^(повторить|retry|try\s+again|попробовать\s+ещё\s+раз|попробовать\s+еще\s+раз)$/i;
     const errorTextPattern = /(ошиб|не\s+удал|что-то\s+пошло\s+не\s+так|сбой|failed|error|unable|could\s+not|попробуйте\s+ещё\s+раз|попробуйте\s+еще\s+раз|временно\s+недоступ|запрос\s+не\s+выполн|генерац.*не\s+удал)/i;
@@ -245,8 +428,15 @@
         if (!visible(element)) return false;
         const text = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
         if (!text || retryOnlyPattern.test(text)) return false;
+        if (isHistoryLoadErrorText(text) && !isRateLimitText(text)
+          && globalThis.WatchQuotaUtils?.isUploadLimitText(text) !== true
+          && globalThis.WatchQuotaUtils?.isStorageLimitText(text) !== true) {
+          const otherText = text.replace(new RegExp(HISTORY_LOAD_PATTERN.source, 'gi'), '')
+            .replace(/повторить|retry|try\s+again|попроб(?:овать|уйте)\s+ещ[её]\s+раз/gi, '').trim();
+          if (!errorTextPattern.test(otherText)) return false;
+        }
         const testId = element.getAttribute('data-testid') || '';
-        return RATE_LIMIT_PATTERN.test(text) || errorTextPattern.test(text) || /error|failed/i.test(testId);
+        return isRateLimitText(text) || errorTextPattern.test(text) || /error|failed/i.test(testId);
       });
   }
 
@@ -277,6 +467,7 @@
   window.WatchSelectorResolver = {
     visible,
     resolve,
+    fileInputDiagnostics,
     assistantTurns,
     userTurns,
     latestAssistantTurn,
@@ -290,8 +481,11 @@
     rateLimitDialog,
     rateLimitDialogs,
     dismissRateLimitDialog,
+    uploadError,
+    uploadLimitDialog,
     visibleErrors,
     visibleConversationLoadError,
+    visibleHistoryLoadError,
     strategies
   };
 })();

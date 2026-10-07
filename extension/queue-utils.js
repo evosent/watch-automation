@@ -603,6 +603,7 @@ export function makeQueueEntry(file, relativePath, groupId, previous = null) {
   return {
     sourceId,
     skuKey,
+    partitionOrderKey: previous?.partitionOrderKey || previous?.skuKey || sourceId,
     sourceVariantId,
     inputSourceId: sourceVariantId,
     groupId,
@@ -726,6 +727,7 @@ export function mergeScannedGroups(scannedGroups, previousGroups = {}) {
         relativePath: entry.relativePath,
         fileName: entry.fileName,
         modelName: entry.modelName,
+        partitionOrderKey: previousVariant?.partitionOrderKey || previousVariant?.skuKey || previousVariant?.sourceId || null,
         outputFileName: entry.outputFileName,
         fingerprint: entry.fingerprint,
         sourceFingerprint: entry.fingerprint,
@@ -765,6 +767,8 @@ export function mergeScannedGroups(scannedGroups, previousGroups = {}) {
     );
     representative.sourceId = skuKey;
     representative.skuKey = skuKey;
+    representative.partitionOrderKey = oldSku?.partitionOrderKey || oldSku?.skuKey || oldSku?.sourceId
+      || selected?.partitionOrderKey || skuKey;
     representative.variants = variants;
     representative.sourceVariantIds = variants.map((variant) => variant.sourceVariantId);
     representative.inputSourceId = selected?.sourceVariantId || representative.sourceVariantId;
@@ -789,11 +793,15 @@ export function modelCatalogRecordsFromGroups(groups = {}) {
       const row = bySku.get(skuKey) || {
         skuKey,
         sourceId: skuKey,
+        partitionOrderKey: entry.partitionOrderKey || skuKey,
         modelName: entry.modelName || entry.fileName || '',
         brandId: brandIdFromModelName(entry.modelName || entry.fileName),
         variants: [],
         sourcePresent: true
       };
+      if (row.partitionOrderKey === skuKey && entry.partitionOrderKey && entry.partitionOrderKey !== skuKey) {
+        row.partitionOrderKey = entry.partitionOrderKey;
+      }
       const variants = entry.variants?.length ? entry.variants : [{
         ...entry,
         sourceVariantId: entry.sourceVariantId || entry.inputSourceId || sourceVariantIdFor(entry.groupId || groupId, entry.relativePath || entry.fileName),
@@ -837,7 +845,13 @@ export function queueGroupsFromCatalog(records = [], previousGroups = {}) {
     .map((entry) => [String(entry.skuKey || entry.sourceId || ''), entry]));
   for (const record of records || []) {
     if (!record?.skuKey || record.sourcePresent === false) continue;
-    const variants = Array.isArray(record.variants) ? record.variants : [];
+    const sessionRetry = record.retryRequired && (!record.currentGenerationId
+      || record.currentGenerationId === record.sessionRetry?.previousGenerationId) ? record.sessionRetry : null;
+    const variants = (Array.isArray(record.variants) ? record.variants : []).map(variant => {
+      if (!sessionRetry || String(variant.sourceVariantId || variant.variantId) !== String(sessionRetry.inputSourceId)) return variant;
+      return { ...variant, status: 'pending', generationId: null, outputPath: null, outputHash: null,
+        factsStatus: null, generatedAt: null, lastError: null, retryCount: 0, nextRetryAt: null };
+    });
     if (!variants.length) continue;
     const old = previous.get(String(record.skuKey));
     const defaultVariant = chooseSourceVariant(variants, {});
@@ -847,6 +861,8 @@ export function queueGroupsFromCatalog(records = [], previousGroups = {}) {
       size: baseVariant.size,
       lastModified: baseVariant.lastModified
     }, baseVariant.relativePath, baseVariant.groupId || 'in_sale_good');
+    representative.partitionOrderKey = record.partitionOrderKey || record.originSourceId
+      || old?.partitionOrderKey || old?.skuKey || old?.sourceId || String(record.skuKey);
     const groupIds = [...new Set(variants.map((item) => item.groupId).filter((id) => QUEUE_GROUP_IDS.includes(id)))];
     for (const groupId of groupIds) {
       const queuedStatus = baseVariant.status || record.queueState?.status;
@@ -873,6 +889,10 @@ export function queueGroupsFromCatalog(records = [], previousGroups = {}) {
         lastError: baseVariant.lastError || record.queueState?.lastError || null,
         retryCount: Number(record.queueState?.retryCount || representative.retryCount || 0)
       });
+      if (sessionRetry && String(baseVariant.sourceVariantId || baseVariant.variantId) === String(sessionRetry.inputSourceId)) {
+        Object.assign(result[groupId].at(-1), { status: 'pending', generationId: null, outputPath: null,
+          outputHash: null, factsStatus: null, generatedAt: null, lastError: null, nextRetryAt: null, retryCount: 0 });
+      }
     }
   }
   return result;
@@ -930,7 +950,11 @@ function stableQueueEntries(entries = []) {
     if (sourceId && !bySourceId.has(sourceId)) bySourceId.set(sourceId, entry);
   }
   return [...bySourceId.entries()]
-    .sort(([left], [right]) => (left < right ? -1 : (left > right ? 1 : 0)))
+    .sort(([left, leftEntry], [right, rightEntry]) => {
+      const leftOrder = String(leftEntry?.partitionOrderKey || left);
+      const rightOrder = String(rightEntry?.partitionOrderKey || right);
+      return leftOrder < rightOrder ? -1 : (leftOrder > rightOrder ? 1 : (left < right ? -1 : (left > right ? 1 : 0)));
+    })
     .map(([, entry]) => entry);
 }
 
