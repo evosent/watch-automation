@@ -19,7 +19,9 @@ const REVISION_FIELDS = [
 const FACTS_FIELDS = [
   'titleBrand', 'titleSeries', 'titleModel', 'utp1', 'utp2', 'waterResistance',
   'waterResistanceValue', 'waterResistanceUnit', 'caseSize', 'caseSizeValueMm',
-  'warnings', 'extractedAt', 'extractorVersion', 'completion'
+  'warnings', 'extractedAt', 'extractorVersion', 'completion', 'profileId',
+  'titleLayoutVersion', 'seriesPolicy', 'brandLineCount', 'seriesRequired',
+  'expectedTitleBrand', 'expectedTitleSeries', 'expectedTitleModel'
 ];
 const pick = (object, keys) => Object.fromEntries(keys.filter((key) => object?.[key] != null)
   .map((key) => [key, object[key]]));
@@ -89,12 +91,13 @@ export function portableResult(record) {
     && facts.generationId === record.generationId && facts.factsJobId === result.factsJobId
     && String(facts.outputHash || '').toLowerCase() === result.outputHash);
   const selectedFacts = ready ? pick(facts, FACTS_FIELDS) : null;
+  if (selectedFacts && Object.hasOwn(facts, 'titleSeries')) selectedFacts.titleSeries = facts.titleSeries;
   if (selectedFacts && JSON.stringify(selectedFacts).length > 64000) throw new Error('Спецификация слишком большая');
   if (selectedFacts) {
     for (const [key, value] of Object.entries(selectedFacts)) {
       if (key === 'warnings') {
         if (!Array.isArray(value) || value.length > 100 || value.some((warning) => typeof warning !== 'string' || warning.length > 2000)) throw new Error('Некорректные замечания спецификации');
-      } else if (!['string', 'number'].includes(typeof value)) throw new Error('Некорректное поле спецификации');
+      } else if (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) throw new Error('Некорректное поле спецификации');
     }
   }
   result.factsStatus = ready ? 'ok' : 'missing';

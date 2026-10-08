@@ -87,6 +87,35 @@ test('brand identity evidence accepts reviewed aliases while rejecting unrelated
   assert.throws(() => portableResult({ ...item, facts: { ...item.facts, titleBrand: 'Casio' } }), /Бренд в названии/);
 });
 
+test('results transfer preserves versioned brand-title and series interpretation metadata', () => {
+  const item = revision(501);
+  item.modelName = 'Pagani Design PD-1759CBWWS Мужские механические наручные часы';
+  item.sourceId = sourceIdFor(item.groupId, item.relativePath, item.modelName);
+  item.facts = {
+    ...item.facts,
+    sourceId: item.sourceId,
+    profileId: 'pagani_design',
+    titleBrand: 'Pagani Design',
+    titleSeries: null,
+    titleModel: 'PD-1759CBWWS',
+    titleLayoutVersion: 1,
+    seriesPolicy: 'forbidden',
+    brandLineCount: 2,
+    seriesRequired: false,
+    expectedTitleBrand: 'Pagani Design',
+    expectedTitleSeries: null,
+    expectedTitleModel: 'PD-1759CBWWS'
+  };
+  const exported = portableResult(item).facts;
+  assert.equal(exported.profileId, 'pagani_design');
+  assert.equal(exported.titleSeries, null);
+  assert.equal(exported.titleLayoutVersion, 1);
+  assert.equal(exported.seriesPolicy, 'forbidden');
+  assert.equal(exported.brandLineCount, 2);
+  assert.equal(exported.seriesRequired, false);
+  assert.equal(exported.expectedTitleBrand, 'Pagani Design');
+});
+
 test('100 real PNGs export from Downloads and merge into a second installation without losing local results', async (t) => {
   const temp = await temporary(t);
   const senderRoot = path.join(temp, 'friend', 'Downloads', 'WatchAutomation');

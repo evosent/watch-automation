@@ -67,6 +67,7 @@ import {
   excludeRepairQueueEntries
 } from './repair-queue-utils.js';
 import { brandPromptPath, buildGenerationPrompt, detectBrandProfile, resolveTitleSpec } from './prompt-profiles.js';
+import { titleLayoutWarnings } from './title-layout-utils.js';
 import { runDiagnosticHeader, sanitizeRunDiagnosticEvent, diagnosticCategoryForType } from './run-diagnostics-utils.js';
 import { createDiagnosticOutbox } from './diagnostic-outbox-utils.js';
 import { completeRunDiagnostic, latestDiagnosticOperationId } from './diagnostic-export-utils.js';
@@ -178,7 +179,7 @@ const RUN_CLOCK_PAUSE_EVENTS = new Set([
   'conversation_load_recovery_started', 'run_stop_accepted', 'run_completed'
 ]);
 const OUTPUT_VERIFY_TIMEOUT_MS = 2000;
-const EXTENSION_BUILD_ID = '2026-10-06.5';
+const EXTENSION_BUILD_ID = '2026-10-08.1';
 const PROMPT_PIPELINE_VERSION = '6';
 const FACTS_EXTRACTOR_VERSION = 4;
 const POSTPROCESS_SEND_GAP_MS = 3000;
@@ -11968,13 +11969,6 @@ function factText(value, max = 500) {
   return text.slice(0, max);
 }
 
-function normalizedComparableText(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/[ё]/g, 'е')
-    .replace(/[^a-zа-я0-9]+/gi, '');
-}
-
 function parseExtractionJson(rawText) {
   const parser = globalThis.WatchFactsUtils?.parseExtractionJson;
   if (typeof parser !== 'function') {
@@ -12012,37 +12006,33 @@ function normalizeCaseSize(raw) {
 
 function buildFactsWarnings(facts, titleSpec) {
   const warnings = [];
-  const actualBrand = normalizedComparableText(facts.titleBrand);
-  const expectedBrand = normalizedComparableText(titleSpec?.brand);
-  const actualSeries = normalizedComparableText(facts.titleSeries);
-  const expectedSeries = normalizedComparableText(titleSpec?.explicitSeriesPrint);
-  const actualModel = normalizedComparableText(facts.titleModel);
-  const expectedModel = normalizedComparableText(titleSpec?.referenceCode);
 
   if (!facts.utp1) warnings.push('MISSING_UTP_1');
   if (!facts.utp2) warnings.push('MISSING_UTP_2');
   if (!facts.waterResistance) warnings.push('MISSING_WATER_RESISTANCE');
   if (!facts.caseSize) warnings.push('MISSING_CASE_SIZE');
 
-  if (titleSpec?.mode === 'fixed' && Array.isArray(titleSpec.fixedLines)) {
-    if (normalizedComparableText(titleSpec.fixedLines[0]) !== actualBrand) warnings.push('TITLE_BRAND_MISMATCH');
-    if (normalizedComparableText(titleSpec.fixedLines[1]) !== actualSeries) warnings.push('TITLE_SERIES_MISMATCH');
-    if (normalizedComparableText(titleSpec.fixedLines[2]) !== actualModel) warnings.push('TITLE_MODEL_MISMATCH');
-  } else {
-    if (expectedBrand && actualBrand && expectedBrand !== actualBrand) warnings.push('TITLE_BRAND_MISMATCH');
-    if (expectedBrand && !actualBrand) warnings.push('MISSING_TITLE_BRAND');
-    if (titleSpec?.seriesRequired && !actualSeries) warnings.push('MISSING_SERIES');
-    if (expectedSeries && actualSeries && expectedSeries !== actualSeries) warnings.push('TITLE_SERIES_MISMATCH');
-    if (expectedSeries && !actualSeries) warnings.push('MISSING_SERIES');
-    if (expectedModel && actualModel && expectedModel !== actualModel) warnings.push('TITLE_MODEL_MISMATCH');
-    if (expectedModel && !actualModel) warnings.push('MISSING_TITLE_MODEL');
-  }
+  warnings.push(...titleLayoutWarnings(facts, titleSpec));
 
   if (Array.isArray(facts.uncertain) && facts.uncertain.length) warnings.push('UNCERTAIN_TEXT');
   return [...new Set(warnings)];
 }
 
 function buildFactsExtractionPrompt(entry) {
+  const titleSpec = resolveTitleSpec(entry?.modelName || entry?.fileName || '');
+  const titleLayout = titleSpec?.titleLayout || { brandLineCount: 1, seriesPolicy: 'forbidden' };
+  const brandLineCount = Math.max(1, Number(titleLayout.brandLineCount || 1));
+  const seriesPolicy = ['required', 'optional', 'forbidden'].includes(titleLayout.seriesPolicy)
+    ? titleLayout.seriesPolicy : 'optional';
+  const titleRoleRules = [
+    `— titleBrand: весь видимый брендовый заголовок в исходном порядке; он занимает ${brandLineCount} ${brandLineCount === 1 ? 'строку' : 'строки'}. Если бренд разбит на несколько строк, соедини только эти строки одним пробелом.`,
+    seriesPolicy === 'required'
+      ? '— titleSeries: отдельная строка после брендового заголовка и перед кодом модели. В этом профиле серия обязательна; перепиши видимый текст дословно.'
+      : seriesPolicy === 'optional'
+        ? '— titleSeries: отдельная видимая строка серии после брендового заголовка и перед кодом модели; если такой строки нет, верни null.'
+        : '— titleSeries: любая отдельная строка между брендовым заголовком и кодом модели; если такой строки нет, верни null. В этом профиле серия запрещена, поэтому неожиданный текст нужно сохранить для проверки, не записывая его в titleBrand.',
+    '- titleModel: код модели только из строки модели после брендового заголовка и возможной серии. Не бери маркировку с циферблата, ремешка или корпуса.'
+  ];
   return [
     'Рассмотри ТОЛЬКО последнее сгенерированное изображение в этом чате.',
     'Это буквальная OCR-постпроверка готовой карточки, а не проверка характеристик модели.',
@@ -12053,9 +12043,7 @@ function buildFactsExtractionPrompt(entry) {
     'Если поле нельзя уверенно прочитать или соответствующего текста нет — верни null и добавь имя поля в uncertain.',
     '',
     'Считывай поля только из этих зон:',
-    '- titleBrand: первая строка блока названия в верхней левой части карточки.',
-    '- titleSeries: строка серии в том же блоке названия; если отдельной строки серии нет — null.',
-    '- titleModel: код модели только из блока названия. Не бери маркировку с циферблата, ремешка или корпуса.',
+    ...titleRoleRules,
     '- utp1: первый информационный тезис под блоком названия, сверху вниз.',
     '- utp2: второй информационный тезис под блоком названия, сверху вниз.',
     '- waterResistance: нижний блок с иконкой капли; перепиши весь видимый текст этого блока.',
@@ -12106,6 +12094,9 @@ function normalizeExtractedFacts(entry, rawText, context = {}) {
     expectedTitleSeries: titleSpec?.explicitSeriesPrint || null,
     expectedTitleModel: titleSpec?.referenceCode || null,
     seriesRequired: titleSpec?.seriesRequired === true,
+    seriesPolicy: titleSpec?.titleLayout?.seriesPolicy || (titleSpec?.seriesRequired ? 'required' : 'optional'),
+    brandLineCount: Math.max(1, Number(titleSpec?.titleLayout?.brandLineCount || 1)),
+    titleLayoutVersion: Number(titleSpec?.titleLayout?.version || 1),
     extractedAt: new Date().toISOString(),
     extractorVersion: FACTS_EXTRACTOR_VERSION,
     rawResponse: raw.slice(0, 16000),

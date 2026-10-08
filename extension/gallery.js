@@ -10,7 +10,9 @@ import {
   getOutputDirectoryHandle, getAllGenerationRevisions,
   getAllModelCatalog, replaceModelCatalog
 } from './idb.js';
-import { factsDisplayState, effectiveFactsWarnings, sortGalleryRecords } from './gallery-utils.js';
+import {
+  factsDisplayState, effectiveFactsWarnings, factsSeriesPolicy, displayFactsTitleBrand, sortGalleryRecords
+} from './gallery-utils.js';
 import { galleryRecordsFromCatalog } from './gallery-revision-utils.js';
 import {
   ACCOUNTING_SNAPSHOT_STORAGE_KEY,
@@ -616,12 +618,15 @@ function renderFactsPanel(record) {
     panel.innerHTML = `<div class="facts-empty"><strong>Текст не извлечён</strong><span>Запись постпроверки есть, но распознанные поля пустые.</span></div>`;
     return;
   }
-  const warnings = effectiveFactsWarnings(facts);
+  const modelName = record?.modelName || record?.fileName || '';
+  const warnings = effectiveFactsWarnings(facts, modelName);
+  const seriesRow = factsSeriesPolicy(facts, modelName) === 'forbidden'
+    ? '' : `<div><dt>Серия</dt><dd>${escapeHtml(facts.titleSeries || '—')}</dd></div>`;
   panel.innerHTML = `
     <div class="facts-title">Спецификация</div>
     <dl class="facts-grid">
-      <div><dt>Бренд</dt><dd>${escapeHtml(facts.titleBrand || '—')}</dd></div>
-      <div><dt>Серия</dt><dd>${escapeHtml(facts.titleSeries || '—')}</dd></div>
+      <div><dt>Бренд</dt><dd>${escapeHtml(displayFactsTitleBrand(facts, modelName) || '—')}</dd></div>
+      ${seriesRow}
       <div><dt>Модель</dt><dd>${escapeHtml(facts.titleModel || '—')}</dd></div>
       <div><dt>УТП 1</dt><dd>${escapeHtml(facts.utp1 || '—')}</dd></div>
       <div><dt>УТП 2</dt><dd>${escapeHtml(facts.utp2 || '—')}</dd></div>
@@ -719,13 +724,14 @@ async function openCurrentFile() {
 function exportFactsRows() {
   return records.map((record) => {
     const f = record.facts || {};
+    const modelName = record.modelName || record.fileName || '';
     return {
-      modelName: record.modelName || '',
+      modelName,
       brand: recordMeta(record).brand,
       sale: recordMeta(record).sale,
       sourceQuality: recordMeta(record).quality,
-      titleBrand: f.titleBrand || '',
-      titleSeries: f.titleSeries || '',
+      titleBrand: displayFactsTitleBrand(f, modelName),
+      titleSeries: factsSeriesPolicy(f, modelName) === 'forbidden' ? '' : (f.titleSeries || ''),
       titleModel: f.titleModel || '',
       utp1: f.utp1 || '',
       utp2: f.utp2 || '',
@@ -734,7 +740,7 @@ function exportFactsRows() {
       waterResistanceUnit: f.waterResistanceUnit || '',
       caseSize: f.caseSize || '',
       caseSizeValueMm: f.caseSizeValueMm ?? '',
-      warnings: Array.isArray(f.warnings) ? f.warnings.join('|') : '',
+      warnings: effectiveFactsWarnings(f, modelName).join('|'),
       factsStatus: record.factsStatus || f.status || 'missing',
       chatUrl: record.chatUrl || f.chatUrl || '',
       outputFileName: record.outputFileName || '',

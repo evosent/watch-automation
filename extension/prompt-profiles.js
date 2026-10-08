@@ -53,6 +53,19 @@ function alias(name, pattern) {
   return Object.freeze({ name, pattern });
 }
 
+function titleLayoutFor(profile, brandLines, seriesPolicy = null) {
+  const metadata = BRAND_PROFILE_META[profile] || BRAND_PROFILE_META.generic;
+  const policy = seriesPolicy || (metadata.seriesRequired === true
+    ? 'required'
+    : (metadata.series || []).length ? 'optional' : 'forbidden');
+  return Object.freeze({
+    version: 1,
+    brandLines: Object.freeze([...brandLines]),
+    brandLineCount: brandLines.length,
+    seriesPolicy: policy
+  });
+}
+
 // This is a controlled vocabulary. The filename resolver below only handles
 // literal hints already present in the source filename. During generation the
 // model may discover a series online, but it must map that result to this
@@ -95,87 +108,17 @@ const BRAND_PROFILE_META = Object.freeze({
     displayName: 'Orient',
     promptPath: 'prompts/brands/orient.txt',
     fallbackSeries: null,
-    series: Object.freeze([
-      'Classic', 'Sports', 'Contemporary', 'Bambino', 'Mako', 'Mako 40', 'Kamasu',
-      'Orient Star', 'Orient Star Classic', 'Orient Star Contemporary', 'Orient Star Sports',
-      'Sun & Moon', 'Stretto', 'iO', 'Defender', 'Symphony', 'TriStar', 'Open Heart',
-      'Revival', 'Neo Classic'
-    ]),
-    aliases: Object.freeze([
-      alias('Orient Star', /\borient\s+star\b/i),
-      alias('Sun & Moon', /\bsun\s*(?:&|and)\s*moon\b/i),
-      alias('Mako 40', /\bmako\s+40\b/i),
-      alias('Bambino', /\bbambino\b/i),
-      alias('Kamasu', /\bkamasu\b/i),
-      alias('Stretto', /\bstretto\b/i),
-      alias('Mako', /\bmako\b/i),
-      alias('Sports', /\bsports?\b/i),
-      alias('Classic', /\bclassic\b/i),
-      alias('Contemporary', /\bcontemporary\b/i),
-      alias('Defender', /\bdefender\b/i),
-      alias('Symphony', /\bsymphony\b/i),
-      alias('TriStar', /\btristar\b|\btri[-\s]?star\b/i),
-      alias('Open Heart', /\bopen\s+heart\b/i),
-      alias('iO', /\bio\b/i),
-      alias('Revival', /\brev[ií]val\b/i),
-      alias('Neo Classic', /\bneo\s+classic\b/i)
-    ])
+    seriesRequired: false,
+    series: Object.freeze([]),
+    aliases: Object.freeze([])
   }),
   tissot: Object.freeze({
     displayName: 'Tissot',
     promptPath: 'prompts/brands/tissot.txt',
     fallbackSeries: null,
-    series: Object.freeze([
-      'Ballade', 'Bellissima', 'Carson', 'Chemin des Tourelles', 'Chrono L',
-      'Classic Dream', 'Desir', 'Everytime', 'Flamingo', 'Gentleman', 'Goldrun',
-      'Heritage 1938', 'Le Locle', 'Lepine', 'Lovely', 'Nordic', 'Pinarello',
-      'PR 100', 'PR 100 Jungfraubahn', 'PR 516', 'PRC 100 Solar', 'PRC 200', 'PRS 516',
-      'PRX', 'PRX Digital', 'Rockwatch', 'Savonnette', 'Seastar', 'SRV', 'Supersport',
-      'Supersport Chrono', 'T-Complication', 'T-Race', 'T-Race MotoGP', 'T-Wave',
-      'Tradition', 'T-Touch', 'T-Touch Connect Solar', 'T-My Lady', 'Visodate', 'XL'
-    ]),
-    aliases: Object.freeze([
-      alias('Chemin des Tourelles', /\bchemin\s+des\s+tourelles\b/i),
-      alias('Classic Dream', /\bclassic\s+dream\b/i),
-      alias('PRX Digital', /\bprx\s+digital\b/i),
-      alias('Everytime', /\beverytime\b/i),
-      alias('Bellissima', /\bbellissima\b/i),
-      alias('T-Wave', /\bt[-\s]?wave\b/i),
-      alias('PRS 516', /\bprs\s*516\b/i),
-      alias('PR 100', /\bpr\s*100\b/i),
-      alias('T-Race', /\bt[-\s]?race\b/i),
-      alias('T-Touch', /\bt[-\s]?touch\b/i),
-      alias('Le Locle', /\ble\s+locle\b/i),
-      alias('Lovely', /\blovely\b/i),
-      alias('Seastar', /\bseastar\b/i),
-      alias('Tradition', /\btradition\b/i),
-      alias('Carson', /\bcarson\b/i),
-      alias('Gentleman', /\bgentleman\b/i),
-      alias('PRX', /\bprx\b/i),
-      alias('Ballade', /\bballade\b/i),
-      alias('Chrono L', /\bchrono\s+l\b/i),
-      alias('Desir', /\bdesir\b|\bd[eé]sir\b/i),
-      alias('Flamingo', /\bflamingo\b/i),
-      alias('Goldrun', /\bgoldrun\b/i),
-      alias('Heritage 1938', /\bheritage\s+1938\b/i),
-      alias('Lepine', /\blepine\b/i),
-      alias('Nordic', /\bnordic\b/i),
-      alias('Pinarello', /\bpinarello\b/i),
-      alias('PR 516', /\bpr\s*516\b/i),
-      alias('PRC 100 Solar', /\bprc\s*100\s*solar\b/i),
-      alias('PRC 200', /\bprc\s*200\b/i),
-      alias('Rockwatch', /\brockwatch\b/i),
-      alias('Savonnette', /\bsavonnette\b/i),
-      alias('SRV', /\bsrv\b/i),
-      alias('Supersport Chrono', /\bsupersport\s+chrono\b/i),
-      alias('Supersport', /\bsupersport\b/i),
-      alias('T-Complication', /\bt[-\s]?complication\b/i),
-      alias('T-Race MotoGP', /\bt[-\s]?race\s+motogp\b/i),
-      alias('T-Touch Connect Solar', /\bt[-\s]?touch\s+connect\s+solar\b/i),
-      alias('T-My Lady', /\bt[-\s]?my\s+lady\b/i),
-      alias('Visodate', /\bvisodate\b/i),
-      alias('XL', /\bxl\b/i)
-    ])
+    seriesRequired: false,
+    series: Object.freeze([]),
+    aliases: Object.freeze([])
   }),
   pagani_design: Object.freeze({
     displayName: 'Pagani Design',
@@ -191,190 +134,41 @@ const BRAND_PROFILE_META = Object.freeze({
     displayName: 'Benyar',
     promptPath: 'prompts/brands/benyar.txt',
     fallbackSeries: null,
-    series: Object.freeze([
-      'Casual Date', 'Moonphase', 'Grand Master', 'Strom', 'Skeleton', 'SportX',
-      'Fusion', 'Alpha Date', 'Zenith Jubilee', 'Kiko', 'Insider', 'Corporate', 'Exclusive',
-      'Chrono Master', 'Ultrachron', 'Royal Auto'
-    ]),
-    aliases: Object.freeze([
-      alias('Casual Date', /\bcasual\s+date\b/i),
-      alias('Grand Master', /\bgrand\s+master\b/i),
-      alias('Alpha Date', /\balpha\s+date\b/i),
-      alias('Zenith Jubilee', /\bzenith\s+jubilee\b/i),
-      alias('SportX', /\bsportx\b/i),
-      alias('Moonphase', /\bmoonphase\b/i),
-      alias('Skeleton', /\bskeleton\b/i),
-      alias('Strom', /\bstrom\b/i),
-      alias('Fusion', /\bfusion\b/i),
-      alias('Kiko', /\bkiko\b/i),
-      alias('Insider', /\binsider\b/i),
-      alias('Corporate', /\bcorporate\b/i),
-      alias('Exclusive', /\bexclusive\b/i),
-      alias('Chrono Master', /\bchrono\s+master\b/i),
-      alias('Ultrachron', /\bultrachron\b/i),
-      alias('Royal Auto', /\broyal\s+auto\b/i)
-    ])
+    seriesRequired: false,
+    series: Object.freeze([]),
+    aliases: Object.freeze([])
   }),
   q_and_q: Object.freeze({
     displayName: 'Q&Q',
     promptPath: 'prompts/brands/q-and-q.txt',
     fallbackSeries: null,
-    series: Object.freeze([
-      'SmileSolar', 'Superior', 'Sports', 'Fashion', 'Digital', 'Elegant', 'Ladies',
-      'Series 003', 'Series 004', 'Matching Style Series 002', 'Mini Series', '20BAR Series',
-      'STAR WARS Collection', 'Peanuts Collection', 'Disney Collection', 'Champion Collection',
-      'CAPTAIN STAG Collaboration', 'PAPIER TIGRE Collaboration',
-      'Q&Q SmileSolar BY groovisions', 'THE PARK SHOP Collaboration', 'OSAMU GOODS Collaboration',
-      'kaoyorinakami Collaboration', 'Suzuki Masaru Collaboration'
-    ]),
-    aliases: Object.freeze([
-      alias('SmileSolar', /\bsmilesolar\b/i),
-      alias('Superior', /\bsuperior\b/i),
-      alias('SmileSolar', /\bsmile\s+solar\b/i),
-      alias('Sports', /\bsports?\b/i),
-      alias('Fashion', /\bfashion\b/i),
-      alias('Digital', /\bdigital\b/i),
-      alias('Elegant', /\belegant\b/i),
-      alias('Ladies', /\bladies\b/i),
-      alias('Series 003', /\bseries\s*003\b/i),
-      alias('Series 004', /\bseries\s*004\b/i),
-      alias('Matching Style Series 002', /\bmatching\s+style\s+series\s*002\b/i),
-      alias('Mini Series', /\bmini\s+series\b/i),
-      alias('20BAR Series', /\b20\s*bar\s+series\b/i),
-      alias('STAR WARS Collection', /\bstar\s+wars\s+collection\b/i),
-      alias('Peanuts Collection', /\bpeanuts\s+collection\b/i),
-      alias('Disney Collection', /\bdisney\s+collection\b/i),
-      alias('Champion Collection', /\bchampion\s+collection\b/i),
-      alias('CAPTAIN STAG Collaboration', /\bcaptain\s+stag\s+collaboration\b/i),
-      alias('PAPIER TIGRE Collaboration', /\bpapier\s+tigre\s+collaboration\b/i),
-      alias('Q&Q SmileSolar BY groovisions', /\bq\s*&\s*q\s+smilesolar\s+by\s+groovisions\b/i),
-      alias('THE PARK SHOP Collaboration', /\bthe\s+park\s+shop\s+collaboration\b/i),
-      alias('OSAMU GOODS Collaboration', /\bosamu\s+goods\s+collaboration\b/i),
-      alias('kaoyorinakami Collaboration', /\bkaoyorinakami\s+collaboration\b/i),
-      alias('Suzuki Masaru Collaboration', /\bsuzuki\s+masaru\s+collaboration\b/i)
-    ])
+    seriesRequired: false,
+    series: Object.freeze([]),
+    aliases: Object.freeze([])
   }),
   seiko: Object.freeze({
     displayName: 'Seiko',
     promptPath: 'prompts/brands/seiko.txt',
     fallbackSeries: null,
-    series: Object.freeze([
-      'Prospex', 'Prospex Alpinist', 'Prospex Speedtimer', 'Prospex Diver Scuba',
-      'Prospex Marinemaster', 'Presage', 'Presage Classic Series', 'Presage Cocktail Time',
-      "Presage Style60's", 'Presage Inspired by Japanese Gardens', 'Presage Sharp Edged Series',
-      'Astron', 'Astron GPS Solar', '5 Sports', '5 Sports SKX', '5 Sports Field', '5 Sports SNXS',
-      'King Seiko', 'King Seiko KSK', 'King Seiko VANAC', 'King Seiko KS1969', 'Premier',
-      'Coutura', 'Lukia', 'Alpinist', 'Recraft', 'Selection', 'Spirit'
-    ]),
-    aliases: Object.freeze([
-      alias('King Seiko', /\bking\s+seiko\b/i),
-      alias('5 Sports', /\b5\s+sports\b/i),
-      alias('Prospex', /\bprospex\b/i),
-      alias('Presage', /\bpresage\b/i),
-      alias('Astron', /\bastron\b/i),
-      alias('Premier', /\bpremier\b/i),
-      alias('Coutura', /\bcoutura\b/i),
-      alias('Lukia', /\blukia\b/i),
-      alias('Alpinist', /\balpinist\b/i),
-      alias('Prospex Speedtimer', /\bspeedtimer\b/i),
-      alias('Prospex Marinemaster', /\bmarinemaster\b/i),
-      alias('Prospex Diver Scuba', /\bdiver\s+scuba\b/i),
-      alias('Presage Cocktail Time', /\bcocktail\s+time\b/i),
-      alias("Presage Style60's", /\bstyle\s*60(?:'s|s)?\b/i),
-      alias('Presage Sharp Edged Series', /\bsharp\s+edged\s+series\b/i),
-      alias('5 Sports SKX', /\b5\s+sports\s+skx\b/i),
-      alias('5 Sports Field', /\b5\s+sports\s+field\b/i),
-      alias('5 Sports SNXS', /\b5\s+sports\s+snxs\b/i),
-      alias('King Seiko KSK', /\bking\s+seiko\s+ksk\b/i),
-      alias('King Seiko VANAC', /\bking\s+seiko\s+vanac\b/i),
-      alias('King Seiko KS1969', /\bking\s+seiko\s+ks\s*1969\b/i),
-      alias('Recraft', /\brecraft\b/i),
-      alias('Selection', /\bselection\b/i),
-      alias('Spirit', /\bspirit\b/i)
-    ])
+    seriesRequired: false,
+    series: Object.freeze([]),
+    aliases: Object.freeze([])
   }),
   citizen: Object.freeze({
     displayName: 'Citizen',
     promptPath: 'prompts/brands/citizen.txt',
     fallbackSeries: null,
-    series: Object.freeze([
-      'Eco-Drive', 'Eco-Drive One', 'Promaster', 'Promaster Marine', 'Promaster Sky',
-      'Promaster Land', 'Tsuyosa', 'Series8', 'Series8 831', 'Series8 870', 'Series8 880 GMT',
-      'Series8 890', 'The Citizen', 'Attesa', 'Satellite Wave', 'Super Titanium', 'Citizen L',
-      'Corso', 'Calendrier', 'PCAT', 'Silhouette Crystal'
-    ]),
-    aliases: Object.freeze([
-      alias('Satellite Wave', /\bsatellite\s+wave\b/i),
-      alias('Eco-Drive', /\beco[-\s]?drive\b/i),
-      alias('Promaster', /\bpromaster\b/i),
-      alias('Tsuyosa', /\btsuyosa\b/i),
-      alias('Series8', /\bseries\s*8\b/i),
-      alias('The Citizen', /\bthe\s+citizen\b/i),
-      alias('Attesa', /\battesa\b/i),
-      alias('Eco-Drive One', /\beco[-\s]?drive\s+one\b/i),
-      alias('Promaster Marine', /\bpromaster\s+marine\b/i),
-      alias('Promaster Sky', /\bpromaster\s+sky\b/i),
-      alias('Promaster Land', /\bpromaster\s+land\b/i),
-      alias('Series8 831', /\bseries\s*8\s+831\b/i),
-      alias('Series8 870', /\bseries\s*8\s+870\b/i),
-      alias('Series8 880 GMT', /\bseries\s*8\s+880\s+gmt\b/i),
-      alias('Series8 890', /\bseries\s*8\s+890\b/i),
-      alias('Super Titanium', /\bsuper\s+titanium\b/i),
-      alias('Citizen L', /\bcitizen\s+l\b/i),
-      alias('Corso', /\bcorso\b/i),
-      alias('Calendrier', /\bcalendrier\b/i),
-      alias('PCAT', /\bpcat\b/i),
-      alias('Silhouette Crystal', /\bsilhouette\s+crystal\b/i)
-    ])
+    seriesRequired: false,
+    series: Object.freeze([]),
+    aliases: Object.freeze([])
   }),
   longines: Object.freeze({
     displayName: 'Longines',
     promptPath: 'prompts/brands/longines.txt',
     fallbackSeries: null,
-    series: Object.freeze([
-      'Master Collection', 'Master Collection GMT', 'Master Collection Chronograph',
-      'Master Collection Moonphase', 'HydroConquest', 'HydroConquest GMT', 'Spirit',
-      'Spirit Zulu Time', 'Spirit Flyback', 'Spirit Chronograph', 'Conquest', 'Conquest Classic',
-      'Conquest Chronograph', 'Conquest Heritage', 'Flagship', 'Flagship Classic',
-      'Flagship Heritage', 'DolceVita', 'Mini DolceVita', 'La Grande Classique', 'Présence',
-      'Record', 'Legend Diver', 'Ultra-Chron', 'Pilot Majetek', 'Heritage Classic',
-      'Heritage Military', 'Evidenza', 'PrimaLuna', 'Elegant Collection', 'Avigation',
-      'Lindbergh Hour Angle'
-    ]),
-    aliases: Object.freeze([
-      alias('La Grande Classique', /\bla\s+grande\s+classique\b/i),
-      alias('Master Collection', /\bmaster\s+collection\b/i),
-      alias('HydroConquest', /\bhydro[-\s]?conquest\b/i),
-      alias('DolceVita', /\bdolce[-\s]?vita\b/i),
-      alias('Legend Diver', /\blegend\s+diver\b/i),
-      alias('PrimaLuna', /\bprimaluna\b/i),
-      alias('Evidenza', /\bevidenza\b/i),
-      alias('Flagship', /\bflagship\b/i),
-      alias('Conquest', /\bconquest\b/i),
-      alias('Spirit', /\bspirit\b/i),
-      alias('Présence', /\bpresence\b/i),
-      alias('Record', /\brecord\b/i),
-      alias('Master Collection GMT', /\bmaster\s+collection\s+gmt\b/i),
-      alias('Master Collection Chronograph', /\bmaster\s+collection\s+chronograph\b/i),
-      alias('Master Collection Moonphase', /\bmaster\s+collection\s+moonphase\b/i),
-      alias('HydroConquest GMT', /\bhydro[-\s]?conquest\s+gmt\b/i),
-      alias('Spirit Zulu Time', /\bspirit\s+zulu\s+time\b/i),
-      alias('Spirit Flyback', /\bspirit\s+flyback\b/i),
-      alias('Spirit Chronograph', /\bspirit\s+chronograph\b/i),
-      alias('Conquest Heritage', /\bconquest\s+heritage\b/i),
-      alias('Conquest Classic', /\bconquest\s+classic\b/i),
-      alias('Conquest Chronograph', /\bconquest\s+chronograph\b/i),
-      alias('Flagship Classic', /\bflagship\s+classic\b/i),
-      alias('Flagship Heritage', /\bflagship\s+heritage\b/i),
-      alias('Mini DolceVita', /\bmini\s+dolce[-\s]?vita\b/i),
-      alias('Ultra-Chron', /\bultra[-\s]?chron\b/i),
-      alias('Pilot Majetek', /\bpilot\s+majetek\b/i),
-      alias('Heritage Classic', /\bheritage\s+classic\b/i),
-      alias('Heritage Military', /\bheritage\s+military\b/i),
-      alias('Elegant Collection', /\belegant\s+collection\b/i),
-      alias('Avigation', /\bavigation\b/i),
-      alias('Lindbergh Hour Angle', /\blindbergh\s+hour\s+angle\b/i)
-    ])
+    seriesRequired: false,
+    series: Object.freeze([]),
+    aliases: Object.freeze([])
   }),
   diesel: Object.freeze({
     displayName: 'Diesel',
@@ -429,22 +223,9 @@ const BRAND_PROFILE_META = Object.freeze({
     displayName: 'Certina',
     promptPath: 'prompts/brands/certina.txt',
     fallbackSeries: null,
-    series: Object.freeze(['DS+', 'DS-1', 'DS-2', 'DS-6', 'DS-7', 'DS-8', 'DS Action', 'DS PH', 'DS Caimano', 'DS Jubile', 'DS', 'DS Podium', 'DS-X']),
-    aliases: Object.freeze([
-      alias('DS Action', /\bds[-\s]?action\b/i),
-      alias('DS Podium', /\bds[-\s]?podium\b/i),
-      alias('DS Caimano', /\bds[-\s]?caimano\b/i),
-      alias('DS PH', /\bds[-\s]?ph\b/i),
-      alias('DS-1', /\bds[-\s]?1\b/i),
-      alias('DS-2', /\bds[-\s]?2\b/i),
-      alias('DS-6', /\bds[-\s]?6\b/i),
-      alias('DS-7', /\bds[-\s]?7\b/i),
-      alias('DS-8', /\bds[-\s]?8\b/i),
-      alias('DS+', /\bds\s*\+\b/i),
-      alias('DS Jubile', /\bds\s+jubile\b/i),
-      alias('DS-X', /\bds[-\s]?x\b/i),
-      alias('DS', /\bds\b/i)
-    ])
+    seriesRequired: false,
+    series: Object.freeze([]),
+    aliases: Object.freeze([])
   }),
   generic: Object.freeze({
     displayName: 'Общий профиль',
@@ -461,8 +242,7 @@ const BRAND_PROFILE_META = Object.freeze({
 const BRAND_SPECIAL_RULES = Object.freeze({
   benyar: Object.freeze([
     'В названии бренда используй только точное слово BENYAR; новый логотип или монограмму не создавай.',
-    'Automatic, Explorer, Professional Divers, Ladies, Sport и голое Chronograph не являются серией по внешнему виду или догадке.',
-    'Для BY-5163, BY-5177 и BY-5208 код является поисковым ключом; при отсутствии подтверждённой серии используй режим без серии с Benyar во второй строке.'
+    'Серии и линейки для заглавной карточки Benyar полностью исключены; категории, механизмы, рекламные теги и названия вроде Automatic, Explorer, Professional Divers, Ladies, Sport или Chronograph в заголовок не добавляй.'
   ]),
   casio: Object.freeze([
     'Сохрани точное написание CASIO из главного шаблона; верхний логотип уже готов и не перерисовывается.',
@@ -520,22 +300,141 @@ export function resolveTitleSpec(modelName) {
       explicitSeries: null,
       explicitSeriesPrint: null,
       fallbackSeries: null,
-      seriesRequired: true,
+      seriesRequired: false,
       fixedLines: Object.freeze(['Pagani', 'Design', referenceCode || 'полный код PD-модели']),
+      titleLayout: titleLayoutFor(profile, ['Pagani', 'Design'], 'forbidden'),
+      mode: 'fixed'
+    });
+  }
+  if (profile === 'orient') {
+    return Object.freeze({
+      profile,
+      brand: 'Orient',
+      referenceCode,
+      explicitSeries: null,
+      explicitSeriesPrint: null,
+      fallbackSeries: null,
+      seriesRequired: false,
+      fixedLines: Object.freeze(['Orient', referenceCode || 'полный код модели из исходного названия']),
+      titleLayout: titleLayoutFor(profile, ['Orient'], 'forbidden'),
+      mode: 'fixed'
+    });
+  }
+  if (profile === 'seiko') {
+    return Object.freeze({
+      profile,
+      brand: 'Seiko',
+      referenceCode,
+      explicitSeries: null,
+      explicitSeriesPrint: null,
+      fallbackSeries: null,
+      seriesRequired: false,
+      fixedLines: Object.freeze(['Seiko', referenceCode || 'полный код модели из исходного названия']),
+      titleLayout: titleLayoutFor(profile, ['Seiko'], 'forbidden'),
+      mode: 'fixed'
+    });
+  }
+  if (profile === 'tissot') {
+    return Object.freeze({
+      profile,
+      brand: 'Tissot',
+      referenceCode,
+      explicitSeries: null,
+      explicitSeriesPrint: null,
+      fallbackSeries: null,
+      seriesRequired: false,
+      fixedLines: Object.freeze(['Tissot', referenceCode || 'полный код модели из исходного названия']),
+      titleLayout: titleLayoutFor(profile, ['Tissot'], 'forbidden'),
+      mode: 'fixed'
+    });
+  }
+  if (profile === 'longines') {
+    return Object.freeze({
+      profile,
+      brand: 'Longines',
+      referenceCode,
+      explicitSeries: null,
+      explicitSeriesPrint: null,
+      fallbackSeries: null,
+      seriesRequired: false,
+      fixedLines: Object.freeze(['Longines', referenceCode || 'полный код модели из исходного названия']),
+      titleLayout: titleLayoutFor(profile, ['Longines'], 'forbidden'),
+      mode: 'fixed'
+    });
+  }
+  if (profile === 'citizen') {
+    return Object.freeze({
+      profile,
+      brand: 'Citizen',
+      referenceCode,
+      explicitSeries: null,
+      explicitSeriesPrint: null,
+      fallbackSeries: null,
+      seriesRequired: false,
+      fixedLines: Object.freeze(['Citizen', referenceCode || 'полный код модели из исходного названия']),
+      titleLayout: titleLayoutFor(profile, ['Citizen'], 'forbidden'),
+      mode: 'fixed'
+    });
+  }
+  if (profile === 'certina') {
+    return Object.freeze({
+      profile,
+      brand: 'Certina',
+      referenceCode,
+      explicitSeries: null,
+      explicitSeriesPrint: null,
+      fallbackSeries: null,
+      seriesRequired: false,
+      fixedLines: Object.freeze(['Certina', referenceCode || 'полный код модели из исходного названия']),
+      titleLayout: titleLayoutFor(profile, ['Certina'], 'forbidden'),
+      mode: 'fixed'
+    });
+  }
+  if (profile === 'benyar') {
+    return Object.freeze({
+      profile,
+      brand: 'Benyar',
+      referenceCode,
+      explicitSeries: null,
+      explicitSeriesPrint: null,
+      fallbackSeries: null,
+      seriesRequired: false,
+      fixedLines: Object.freeze(['Benyar', referenceCode || 'полный код модели из исходного названия']),
+      titleLayout: titleLayoutFor(profile, ['Benyar'], 'forbidden'),
+      mode: 'fixed'
+    });
+  }
+  if (profile === 'q_and_q') {
+    return Object.freeze({
+      profile,
+      brand: 'Q&Q',
+      referenceCode,
+      explicitSeries: null,
+      explicitSeriesPrint: null,
+      fallbackSeries: null,
+      seriesRequired: false,
+      fixedLines: Object.freeze(['Q&Q', referenceCode || 'полный код модели из исходного названия']),
+      titleLayout: titleLayoutFor(profile, ['Q&Q'], 'forbidden'),
       mode: 'fixed'
     });
   }
   const explicitSeries = resolveExplicitBrandSeries(normalizedModelName);
   const explicitSeriesPrint = printableSeriesName(profile, explicitSeries);
   const fallbackSeries = metadata.fallbackSeries || null;
+  const brand = brandLabelForTitle(profile, normalizedModelName);
+  const seriesPolicy = metadata.seriesRequired === true
+    ? 'required'
+    : (metadata.series || []).length ? 'optional' : 'forbidden';
   return Object.freeze({
     profile,
-    brand: brandLabelForTitle(profile, normalizedModelName),
+    brand,
     referenceCode,
     explicitSeries,
     explicitSeriesPrint,
     fallbackSeries,
-    seriesRequired: metadata.seriesRequired === true,
+    seriesRequired: seriesPolicy === 'required',
+    titleLayout: titleLayoutFor(profile, [brand], seriesPolicy),
+    seriesVocabulary: metadata.series,
     fixedLines: null,
     mode: explicitSeries ? 'candidate' : 'search'
   });
@@ -547,6 +446,86 @@ export function buildTitleContract(modelName, options = {}) {
   const templateRef = inputPlan.refs.template || 'главный шаблон';
   const code = spec.referenceCode || 'полный технический код из исходного названия';
   if (spec.mode === 'fixed') {
+    if (spec.profile === 'seiko') {
+      return [
+        'TITLE CONTRACT — ФИКСИРОВАННЫЙ ДВУХСТРОЧНЫЙ БЛОК SEIKO',
+        'В заголовке Seiko запрещены любые линейки, серии и дополнительные строки между брендом и кодом модели.',
+        'Строка 1: «Seiko».',
+        `Строка 2: «${spec.fixedLines[1]}» — полный код модели; он расположен непосредственно под брендом и набран меньше бренда.`,
+        'Не добавляй третью строку и не помещай в заголовок названия линеек, серий или подсерий.',
+        `Сохрани геометрию блока из ${templateRef}. Допускаются ровно две строки: Seiko и код модели.`
+      ].join('\n');
+    }
+    if (spec.profile === 'tissot') {
+      return [
+        'TITLE CONTRACT — ФИКСИРОВАННЫЙ ДВУХСТРОЧНЫЙ БЛОК TISSOT',
+        'В заголовке Tissot запрещены любые коллекции, линейки, серии и дополнительные строки между брендом и кодом модели.',
+        'Строка 1: «Tissot».',
+        `Строка 2: «${spec.fixedLines[1]}» — полный код модели; он расположен непосредственно под брендом и набран меньше бренда.`,
+        'Не добавляй третью строку и не помещай в заголовок названия коллекций или серий.',
+        `Сохрани геометрию блока из ${templateRef}. Допускаются ровно две строки: Tissot и код модели.`
+      ].join('\n');
+    }
+    if (spec.profile === 'longines') {
+      return [
+        'TITLE CONTRACT — ФИКСИРОВАННЫЙ ДВУХСТРОЧНЫЙ БЛОК LONGINES',
+        'В заголовке Longines запрещены любые коллекции, линейки, серии и дополнительные строки между брендом и кодом модели.',
+        'Строка 1: «Longines».',
+        `Строка 2: «${spec.fixedLines[1]}» — полный код модели; он расположен непосредственно под брендом и набран меньше бренда.`,
+        'Не добавляй третью строку и не помещай в заголовок названия коллекций или серий.',
+        `Сохрани геометрию блока из ${templateRef}. Допускаются ровно две строки: Longines и код модели.`
+      ].join('\n');
+    }
+    if (spec.profile === 'citizen') {
+      return [
+        'TITLE CONTRACT — ФИКСИРОВАННЫЙ ДВУХСТРОЧНЫЙ БЛОК CITIZEN',
+        'В заголовке Citizen запрещены любые линейки, коллекции, серии и дополнительные строки между брендом и кодом модели.',
+        'Строка 1: «Citizen».',
+        `Строка 2: «${spec.fixedLines[1]}» — полный код модели; он расположен непосредственно под брендом и набран меньше бренда.`,
+        'Не добавляй третью строку и не помещай в заголовок названия линеек, коллекций или серий.',
+        `Сохрани геометрию блока из ${templateRef}. Допускаются ровно две строки: Citizen и код модели.`
+      ].join('\n');
+    }
+    if (spec.profile === 'certina') {
+      return [
+        'TITLE CONTRACT — ФИКСИРОВАННЫЙ ДВУХСТРОЧНЫЙ БЛОК CERTINA',
+        'В заголовке Certina запрещены любые коллекции, семейства, серии и дополнительные строки между брендом и кодом модели.',
+        'Строка 1: «Certina».',
+        `Строка 2: «${spec.fixedLines[1]}» — полный код модели; он расположен непосредственно под брендом и набран меньше бренда.`,
+        'Не добавляй третью строку и не помещай в заголовок названия коллекций, семейств или серий.',
+        `Сохрани геометрию блока из ${templateRef}. Допускаются ровно две строки: Certina и код модели.`
+      ].join('\n');
+    }
+    if (spec.profile === 'benyar') {
+      return [
+        'TITLE CONTRACT — ФИКСИРОВАННЫЙ ДВУХСТРОЧНЫЙ БЛОК BENYAR',
+        'В заголовке Benyar запрещены любые коллекции, линейки, серии и дополнительные строки между брендом и кодом модели.',
+        'Строка 1: «Benyar».',
+        `Строка 2: «${spec.fixedLines[1]}» — полный код модели; он расположен непосредственно под брендом и набран меньше бренда.`,
+        'Не добавляй третью строку и не помещай в заголовок названия коллекций, линеек или серий.',
+        `Сохрани геометрию блока из ${templateRef}. Допускаются ровно две строки: Benyar и код модели.`
+      ].join('\n');
+    }
+    if (spec.profile === 'q_and_q') {
+      return [
+        'TITLE CONTRACT — ФИКСИРОВАННЫЙ ДВУХСТРОЧНЫЙ БЛОК Q&Q',
+        'В заголовке Q&Q запрещены любые коллекции, линейки, серии и дополнительные строки между брендом и кодом модели.',
+        'Строка 1: «Q&Q».',
+        `Строка 2: «${spec.fixedLines[1]}» — полный код модели; он расположен непосредственно под брендом и набран меньше бренда.`,
+        'Не добавляй третью строку и не помещай в заголовок названия SmileSolar, Superior, Sports, Fashion, Digital, Elegant или любые другие названия коллекций и серий.',
+        `Сохрани геометрию блока из ${templateRef}. Допускаются ровно две строки: Q&Q и полный код модели.`
+      ].join('\n');
+    }
+    if (spec.profile === 'orient') {
+      return [
+        'TITLE CONTRACT — ФИКСИРОВАННЫЙ ДВУХСТРОЧНЫЙ БЛОК ORIENT',
+        'В заголовке Orient запрещены любые серии, коллекции и дополнительные строки между брендом и кодом модели.',
+        'Строка 1: «Orient».',
+        `Строка 2: «${spec.fixedLines[1]}» — полный код модели; он расположен непосредственно под брендом и набран меньше бренда.`,
+        'Не добавляй третью строку и не помещай в заголовок слова Bambino, Mako, Kamasu, Orient Star, Classic, Sports или другие названия коллекций/серий.',
+        `Сохрани геометрию блока из ${templateRef}. Допускаются ровно две строки: Orient и код модели.`
+      ].join('\n');
+    }
     return [
       'TITLE CONTRACT — ОБЯЗАТЕЛЬНЫЙ ФИНАЛЬНЫЙ БЛОК НАЗВАНИЯ',
       'Этот контракт имеет приоритет над общими формулировками о заголовке. Это не рекомендация, а фиксированная разметка.',
@@ -628,6 +607,126 @@ function buildPaganiBrandInstruction(modelName, options = {}) {
     `— Для этой модели технический код: ${codeLabel}. Выведи его один раз в третьей строке, без сокращений и дублей; строку модели сделай заметно меньше двух брендовых строк.`,
     '— Серии для Pagani Design не используются. Между «Design» и моделью серию не вставляй. После строки модели ничего не добавляй: категории, механизмы, назначение и homage-модели исключены из блока названия.',
     `— Сохрани межстрочный ритм, позицию и композицию текстового блока из ${templateRef}; визуальную иерархию соблюдай: Pagani / Design крупно, модель меньшим кеглем.`
+  ].join('\n');
+}
+
+function buildOrientBrandInstruction(modelName, options = {}) {
+  const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
+  const templateRef = inputPlan.refs.template || 'главный шаблон';
+  const referenceCode = extractReferenceCode(modelName);
+  return [
+    'ПРОФИЛЬ БРЕНДА ORIENT — СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ',
+    `— Используй новую композицию Orient из ${templateRef}: логотип Orient и «2 Года гарантии» в шапке, крупный блок Orient с кодом модели ниже, два УТП слева, водозащита и диаметр корпуса внизу.`,
+    `— Код модели: ${referenceCode ? `«${referenceCode}»` : 'точный полный код из исходного названия'}. Выведи его один раз непосредственно под словом «Orient».`,
+    '— Заголовок содержит ровно две строки: «Orient» и полный код модели. Не добавляй серию, коллекцию, подсерии или описательные слова ни в заголовок, ни вместо кода.',
+    '— Не ищи и не определяй серии. Названия Bambino, Mako, Kamasu, Orient Star, Classic, Sports и любые другие коллекции не включай в карточку.',
+    '— Сохрани фиксированные зоны, размер и расположение элементов референса. В референсе УТП — «Минеральное стекло» и «Автоматический механизм»; для другой модели используй только подтверждённые для её кода характеристики.',
+    '— Водозащиту и диаметр корпуса переноси из подтверждённых источников для конкретного артикула. Не копируй значения 5 атм и 40,5 мм с референса, если они не соответствуют модели.'
+  ].join('\n');
+}
+
+function buildSeikoBrandInstruction(modelName, options = {}) {
+  const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
+  const templateRef = inputPlan.refs.template || 'главный шаблон';
+  const referenceCode = extractReferenceCode(modelName);
+  return [
+    'ПРОФИЛЬ БРЕНДА SEIKO — ЛИНЕЙКИ И СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ',
+    `— Используй композицию Seiko из ${templateRef}: логотип Seiko и «2 Года гарантии» в шапке, крупный блок Seiko с кодом модели ниже, два УТП слева, водозащита и диаметр корпуса внизу.`,
+    `— Код модели: ${referenceCode ? `«${referenceCode}»` : 'точный полный код из исходного названия'}. Выведи его один раз непосредственно под словом «Seiko».`,
+    '— Заголовок содержит ровно две строки: «Seiko» и полный код модели. Не добавляй линейку, серию, подсерии или описательные слова ни в заголовок, ни вместо кода.',
+    '— Не ищи и не определяй линейки или серии. Названия Prospex, Presage, Astron, 5 Sports, King Seiko и любые другие линейки не включай в карточку.',
+    '— Сохрани фиксированные зоны, размер и расположение элементов референса. В референсе УТП — «Минеральное стекло» и «Автоматический механизм»; для другой модели используй только подтверждённые для её кода характеристики.',
+    '— Водозащиту и диаметр корпуса переноси из подтверждённых источников для конкретного артикула. Не копируй значения 5 атм и 40,5 мм с референса, если они не соответствуют модели.'
+  ].join('\n');
+}
+
+function buildTissotBrandInstruction(modelName, options = {}) {
+  const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
+  const templateRef = inputPlan.refs.template || 'главный шаблон';
+  const referenceCode = extractReferenceCode(modelName);
+  return [
+    'ПРОФИЛЬ БРЕНДА TISSOT — КОЛЛЕКЦИИ И СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ',
+    `— Используй композицию Tissot из ${templateRef}: знак Tissot и «2 Года гарантии» в шапке, крупный блок Tissot с кодом модели ниже, два УТП слева, водозащита и диаметр корпуса внизу.`,
+    `— Код модели: ${referenceCode ? `«${referenceCode}»` : 'точный полный код из исходного названия'}. Выведи его один раз непосредственно под словом «Tissot».`,
+    '— Заголовок содержит ровно две строки: «Tissot» и полный код модели. Не добавляй коллекцию, линейку, серию или описательные слова ни в заголовок, ни вместо кода.',
+    '— Не ищи и не определяй коллекции или серии. Названия PRX, Seastar, Le Locle, Gentleman и любые другие названия коллекций не включай в карточку.',
+    '— Сохрани фиксированные зоны, размер и расположение элементов референса. В примере показаны УТП «Минеральное стекло» и «Кварцевый механизм»; для другой модели используй только подтверждённые для её кода характеристики.',
+    '— Водозащиту и диаметр корпуса переноси из подтверждённых источников для конкретного артикула. Не копируй значения 10 атм и 40 мм с референса, если они не соответствуют модели.'
+  ].join('\n');
+}
+
+function buildLonginesBrandInstruction(modelName, options = {}) {
+  const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
+  const templateRef = inputPlan.refs.template || 'главный шаблон';
+  const referenceCode = extractReferenceCode(modelName);
+  return [
+    'ПРОФИЛЬ БРЕНДА LONGINES — КОЛЛЕКЦИИ И СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ',
+    `— Используй композицию Longines из ${templateRef}: крылатый логотип Longines и «2 Года гарантии» в шапке, крупный блок Longines с кодом модели ниже, два УТП слева, водозащита и диаметр корпуса внизу.`,
+    `— Код модели: ${referenceCode ? `«${referenceCode}»` : 'точный полный код из исходного названия'}. Выведи его один раз непосредственно под словом «Longines».`,
+    '— Заголовок содержит ровно две строки: «Longines» и полный код модели. Не добавляй коллекцию, линейку, серию или описательные слова ни в заголовок, ни вместо кода.',
+    '— Не ищи и не определяй коллекции или серии. Названия HydroConquest, Conquest, Spirit, Master Collection и любые другие названия линеек не включай в карточку.',
+    '— Сохрани фиксированные зоны, размер и расположение элементов референса. В примере показаны УТП «Сапфировое стекло» и «Автоматический механизм»; для другой модели используй только подтверждённые для её кода характеристики.',
+    '— Водозащиту и диаметр корпуса переноси из подтверждённых источников для конкретного артикула. Не копируй значения 10 атм и 41 мм с референса, если они не соответствуют модели.'
+  ].join('\n');
+}
+
+function buildCitizenBrandInstruction(modelName, options = {}) {
+  const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
+  const templateRef = inputPlan.refs.template || 'главный шаблон';
+  const referenceCode = extractReferenceCode(modelName);
+  return [
+    'ПРОФИЛЬ БРЕНДА CITIZEN — ЛИНЕЙКИ И СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ',
+    `— Используй композицию Citizen из ${templateRef}: орлиный логотип Citizen и «2 Года гарантии» в шапке, крупный блок Citizen с кодом модели ниже, два УТП слева, водозащита и диаметр корпуса внизу.`,
+    `— Код модели: ${referenceCode ? `«${referenceCode}»` : 'точный полный код из исходного названия'}. Выведи его один раз непосредственно под словом «Citizen».`,
+    '— Заголовок содержит ровно две строки: «Citizen» и полный код модели. Не добавляй линейку, семейство, коллекцию, серию или описательные слова ни в заголовок, ни вместо кода.',
+    '— Не ищи и не определяй линейки или серии. Названия Eco-Drive, Promaster, Tsuyosa, Series8, Attesa и любые другие названия линеек не включай в карточку.',
+    '— Сохрани фиксированные зоны, размер и расположение элементов референса. В примере показаны УТП «Минеральное стекло» и «Кварцевый механизм»; для другой модели используй только подтверждённые для её кода характеристики.',
+    '— Водозащиту и диаметр корпуса переноси из подтверждённых источников для конкретного артикула. Не копируй значения 10 атм и 42 мм с референса, если они не соответствуют модели.'
+  ].join('\n');
+}
+
+function buildCertinaBrandInstruction(modelName, options = {}) {
+  const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
+  const templateRef = inputPlan.refs.template || 'главный шаблон';
+  const referenceCode = extractReferenceCode(modelName);
+  return [
+    'ПРОФИЛЬ БРЕНДА CERTINA — СЕМЕЙСТВА И СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ',
+    `— Используй композицию Certina из ${templateRef}: логотип Certina и «2 Года гарантии» в шапке, крупный блок Certina с кодом модели ниже, два УТП слева, водозащита и диаметр корпуса внизу.`,
+    `— Код модели: ${referenceCode ? `«${referenceCode}»` : 'точный полный код из исходного названия'}. Выведи его один раз непосредственно под словом «Certina».`,
+    '— Заголовок содержит ровно две строки: «Certina» и полный код модели. Не добавляй семейство, коллекцию, серию или описательные слова ни в заголовок, ни вместо кода.',
+    '— Не ищи и не определяй семейства или серии. Названия DS, DS Action, DS Podium, DS PH и любые другие названия линеек не включай в карточку.',
+    '— Сохрани фиксированные зоны, размер и расположение элементов референса. В примере показаны УТП «Сапфировое стекло» и «Кварцевый механизм»; для другой модели используй только подтверждённые для её кода характеристики.',
+    '— Водозащиту и диаметр корпуса переноси из подтверждённых источников для конкретного артикула. Не копируй значения 10 атм и 41 мм с референса, если они не соответствуют модели.'
+  ].join('\n');
+}
+
+function buildBenyarBrandInstruction(modelName, options = {}) {
+  const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
+  const templateRef = inputPlan.refs.template || 'главный шаблон';
+  const referenceCode = extractReferenceCode(modelName);
+  return [
+    'ПРОФИЛЬ БРЕНДА BENYAR — ЛИНЕЙКИ И СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ',
+    `— Используй композицию Benyar из ${templateRef}: эмблема Benyar и «2 Года гарантии» в шапке, крупный блок Benyar с кодом модели ниже, два УТП слева, водозащита и диаметр корпуса внизу.`,
+    `— Код модели: ${referenceCode ? `«${referenceCode}»` : 'точный полный код из исходного названия'}. Выведи его один раз непосредственно под словом «Benyar».`,
+    '— Заголовок содержит ровно две строки: «Benyar» и полный код модели. Не добавляй линейку, коллекцию, серию или описательные слова ни в заголовок, ни вместо кода.',
+    '— Не ищи и не определяй линейки или серии. Названия Casual Date, Moonphase, Grand Master, SportX и любые другие линейки не включай в карточку.',
+    '— Сохрани фиксированные зоны, размер и расположение элементов референса. В примере показаны УТП «Ударопрочный корпус» и «Автоматический механизм»; для другой модели используй только подтверждённые для её кода характеристики.',
+    '— Водозащиту и диаметр корпуса переноси из подтверждённых источников для конкретного артикула. Не копируй значения 5 атм и 41 мм с референса, если они не соответствуют модели.'
+  ].join('\n');
+}
+
+function buildQAndQBrandInstruction(modelName, options = {}) {
+  const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
+  const templateRef = inputPlan.refs.template || 'главный шаблон';
+  const referenceCode = extractReferenceCode(modelName);
+  return [
+    'ПРОФИЛЬ БРЕНДА Q&Q — ЛИНЕЙКИ И СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ',
+    `— Используй композицию Q&Q из ${templateRef}: логотип Q&Q и «2 Года гарантии» в верхней синей шапке, крупный блок Q&Q с кодом модели ниже, часы справа, два УТП слева и отдельные зоны водозащиты/диаметра внизу.`,
+    `— Код модели: ${referenceCode ? `«${referenceCode}»` : 'точный полный код из исходного названия'}. Выведи его один раз непосредственно под надписью «Q&Q».`,
+    '— Заголовок содержит ровно две строки: «Q&Q» и полный код модели. Не добавляй линейку, коллекцию, серию или описательные слова ни в заголовок, ни вместо кода.',
+    '— Не ищи и не определяй коллекции или серии. Названия SmileSolar, Superior, Sports, Fashion, Digital, Elegant и любые другие линейки/коллекции не включай в карточку.',
+    '— Сохрани фиксированные зоны, размер и расположение элементов референса. В примере показаны УТП «Минеральное стекло» и «Кварцевый механизм»; для другой модели используй только подтверждённые для её кода характеристики.',
+    '— Водозащиту и диаметр корпуса переноси из подтверждённых источников для конкретного артикула. Не копируй значения 5 атм и 40 мм с референса, если они не соответствуют модели.'
   ].join('\n');
 }
 
@@ -722,6 +821,14 @@ export function buildBrandInstruction(modelName, options = {}) {
   const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
   const templateRef = inputPlan.refs.template || 'главный шаблон';
   if (profile === 'pagani_design') return buildPaganiBrandInstruction(modelName, { ...options, inputPlan });
+  if (profile === 'orient') return buildOrientBrandInstruction(modelName, { ...options, inputPlan });
+  if (profile === 'seiko') return buildSeikoBrandInstruction(modelName, { ...options, inputPlan });
+  if (profile === 'tissot') return buildTissotBrandInstruction(modelName, { ...options, inputPlan });
+  if (profile === 'longines') return buildLonginesBrandInstruction(modelName, { ...options, inputPlan });
+  if (profile === 'citizen') return buildCitizenBrandInstruction(modelName, { ...options, inputPlan });
+  if (profile === 'certina') return buildCertinaBrandInstruction(modelName, { ...options, inputPlan });
+  if (profile === 'benyar') return buildBenyarBrandInstruction(modelName, { ...options, inputPlan });
+  if (profile === 'q_and_q') return buildQAndQBrandInstruction(modelName, { ...options, inputPlan });
   const normalizedModelName = normalizeModelName(modelName);
   const referenceCode = extractReferenceCode(modelName);
   const metadata = getBrandProfile(profile);
@@ -750,25 +857,39 @@ export function buildBrandInstruction(modelName, options = {}) {
   return lines.join('\n').trim();
 }
 
-function stripSeriesSection(promptText) {
+function stripSeriesSection(promptText, profile) {
   const text = String(promptText || '');
   const start = text.search(/^ПОИСК МОДЕЛИ И СЕРИИ\s*$/im);
   const end = text.search(/^ПРОВЕРКА ФАКТОВ И УТП\s*$/im);
   if (start < 0 || end < 0 || end <= start) return text;
+  const checklistLine = profile === 'orient'
+    ? '4. Заголовок содержит ровно две строки: «Orient» и полный код модели; серия отсутствует.'
+    : profile === 'seiko'
+      ? '4. Заголовок содержит ровно две строки: «Seiko» и полный код модели; линейка и серия отсутствуют.'
+      : profile === 'tissot'
+        ? '4. Заголовок содержит ровно две строки: «Tissot» и полный код модели; коллекция и серия отсутствуют.'
+        : profile === 'longines'
+          ? '4. Заголовок содержит ровно две строки: «Longines» и полный код модели; коллекция и серия отсутствуют.'
+          : profile === 'citizen'
+            ? '4. Заголовок содержит ровно две строки: «Citizen» и полный код модели; линейка и серия отсутствуют.'
+            : profile === 'certina'
+              ? '4. Заголовок содержит ровно две строки: «Certina» и полный код модели; семейство и серия отсутствуют.'
+              : profile === 'benyar'
+                ? '4. Заголовок содержит ровно две строки: «Benyar» и полный код модели; коллекция и серия отсутствуют.'
+                : profile === 'q_and_q'
+                  ? '4. Заголовок содержит ровно две строки: «Q&Q» и полный код модели; коллекция и серия отсутствуют.'
+                : '4. Заголовок содержит две строки «Pagani» и «Design», затем код модели; полный код написан один раз.';
   return `${text.slice(0, start).trim()}\n\n${text.slice(end).trim()}`
     .replace(/названию бренда или серии/gi, 'названию бренда')
-    .replace(
-      '4. Заголовок следует правилу подтверждённой серии или режиму без серии; полный код написан один раз.',
-      '4. Заголовок содержит две строки «Pagani» и «Design», полный код написан один раз.'
-    );
+    .replace('4. Заголовок дословно соответствует выбранному TITLE CONTRACT: обязательные строки не потеряны и не объединены, полный код написан один раз.', checklistLine);
 }
 
 export function buildGenerationPrompt(basePrompt, modelName, brandPrompt = '', options = {}) {
   const normalizedModelName = normalizeModelName(modelName);
   const profile = detectBrandProfile(normalizedModelName);
   const inputPlan = options?.inputPlan || buildInputPlan(options?.inputMode);
-  let prompt = profile === 'pagani_design'
-    ? stripSeriesSection(basePrompt)
+  let prompt = ['pagani_design', 'orient', 'seiko', 'tissot', 'longines', 'citizen', 'certina', 'benyar', 'q_and_q'].includes(profile)
+    ? stripSeriesSection(basePrompt, profile)
     : String(basePrompt || '');
   for (const placeholder of MODEL_PLACEHOLDERS) {
     prompt = prompt.replaceAll(placeholder, normalizedModelName);

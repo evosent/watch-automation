@@ -16,8 +16,11 @@ import {
   brandProfileIds,
   getBrandProfile,
   buildGenerationPrompt,
-  detectBrandProfile
+  detectBrandProfile,
+  resolveTitleSpec,
+  resolveBrandSeries
 } from '../extension/prompt-profiles.js';
+import { titleLayoutWarnings } from '../extension/title-layout-utils.js';
 import {
   AUTOMATION_ERROR_CLASSES,
   classifyAutomationError,
@@ -81,11 +84,11 @@ const basePrompt = await readFile(path.join(extensionDir, 'Base Prompt v5.txt'),
 const representativeModels = Object.freeze({
   casio: 'Casio Collection MDV-107D-1A3',
   orient: 'Orient RA-AA0001B19B',
+  seiko: 'Seiko SRPB43',
   tissot: 'Tissot PRX T137.410.11.041.00',
   pagani_design: 'Pagani Design PD-1661',
   benyar: 'Benyar BY-5101-1B',
   q_and_q: 'Q&Q M173J001Y',
-  seiko: 'Seiko SRPD55K1',
   citizen: 'Citizen NJ0150-81Z',
   longines: 'Longines L3.781.4.56.6',
   diesel: 'Diesel DZ4343',
@@ -222,6 +225,183 @@ test('Pagani Design title uses two brand lines and a smaller model line with no 
   assert.match(prompt, /третьей строке.*меньшим кеглем|Строка 3: модель.*меньшим кеглем/);
   assert.match(prompt, /Серии для Pagani Design не используются/);
   assert.doesNotMatch(prompt, /NO-SERIES MODE обязан быть ровно таким/);
+  const title = resolveTitleSpec(representativeModels.pagani_design);
+  assert.equal(title.seriesRequired, false);
+  assert.deepEqual(title.titleLayout.brandLines, ['Pagani', 'Design']);
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
+});
+
+test('Orient profile excludes series and fixes a two-line brand/model title', async () => {
+  const meta = getBrandProfile('orient');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const title = resolveTitleSpec(representativeModels.orient);
+  const prompt = buildGenerationPrompt(basePrompt, representativeModels.orient, brandPrompt, { inputMode: '2' });
+
+  assert.equal(title.seriesRequired, false);
+  assert.equal(title.explicitSeries, null);
+  assert.equal(title.explicitSeriesPrint, null);
+  assert.deepEqual(title.fixedLines, ['Orient', 'RA-AA0001B19B']);
+  assert.equal(resolveBrandSeries('Orient Star RA-AA0001B19B'), null);
+  assert.match(prompt, /ровно две строки/);
+  assert.match(prompt, /серии, коллекции и подсерии полностью исключены/);
+  assert.match(prompt, /любые другие коллекции не включай в карточку/);
+  assert.doesNotMatch(prompt, /ПОИСК МОДЕЛИ И СЕРИИ|SERIES MODE обязан|NO-SERIES MODE обязан/);
+
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
+});
+
+test('Seiko profile excludes line names and fixes a two-line brand/model title', async () => {
+  const meta = getBrandProfile('seiko');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const title = resolveTitleSpec(representativeModels.seiko);
+  const prompt = buildGenerationPrompt(basePrompt, representativeModels.seiko, brandPrompt, { inputMode: '2' });
+
+  assert.equal(meta.seriesRequired, false);
+  assert.deepEqual(meta.series, []);
+  assert.deepEqual(meta.aliases, []);
+  assert.equal(title.seriesRequired, false);
+  assert.equal(title.explicitSeries, null);
+  assert.equal(title.explicitSeriesPrint, null);
+  assert.deepEqual(title.fixedLines, ['Seiko', 'SRPB43']);
+  assert.equal(resolveBrandSeries('Seiko Prospex SRPB43'), null);
+  assert.match(prompt, /ровно две строки/);
+  assert.match(prompt, /Линейки, серии и подсерии полностью исключены/);
+  assert.match(prompt, /любые другие названия линеек или коллекций/);
+  assert.doesNotMatch(prompt, /ПОИСК МОДЕЛИ И СЕРИИ|SERIES MODE обязан|NO-SERIES MODE обязан/);
+
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
+});
+
+test('Tissot profile excludes collections and fixes a two-line brand/model title', async () => {
+  const meta = getBrandProfile('tissot');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const title = resolveTitleSpec(representativeModels.tissot);
+  const prompt = buildGenerationPrompt(basePrompt, representativeModels.tissot, brandPrompt, { inputMode: '2' });
+
+  assert.equal(meta.seriesRequired, false);
+  assert.deepEqual(meta.series, []);
+  assert.deepEqual(meta.aliases, []);
+  assert.equal(title.seriesRequired, false);
+  assert.equal(title.explicitSeries, null);
+  assert.equal(title.explicitSeriesPrint, null);
+  assert.deepEqual(title.fixedLines, ['Tissot', 'T137.410.11.041.00']);
+  assert.equal(resolveBrandSeries('Tissot PRX T137.410.11.041.00'), null);
+  assert.match(prompt, /ровно две строки/);
+  assert.match(prompt, /Коллекции, линейки, серии и подсерии полностью исключены/);
+  assert.match(prompt, /любые другие названия коллекций или линеек/);
+  assert.doesNotMatch(prompt, /ПОИСК МОДЕЛИ И СЕРИИ|SERIES MODE обязан|NO-SERIES MODE обязан/);
+
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
+});
+
+test('Q&Q profile excludes collections and fixes a two-line brand/model title', async () => {
+  const meta = getBrandProfile('q_and_q');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const title = resolveTitleSpec('Q&Q G06A-005VY');
+  const prompt = buildGenerationPrompt(basePrompt, 'Q&Q G06A-005VY', brandPrompt, { inputMode: '2' });
+
+  assert.equal(meta.seriesRequired, false);
+  assert.deepEqual(meta.series, []);
+  assert.deepEqual(meta.aliases, []);
+  assert.equal(title.seriesRequired, false);
+  assert.equal(title.explicitSeries, null);
+  assert.equal(title.explicitSeriesPrint, null);
+  assert.deepEqual(title.fixedLines, ['Q&Q', 'G06A-005VY']);
+  assert.equal(resolveBrandSeries('Q&Q SmileSolar G06A-005VY'), null);
+  assert.match(prompt, /ровно две строки/);
+  assert.match(prompt, /ЛИНЕЙКИ И СЕРИИ ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ/i);
+  assert.match(prompt, /любые другие линейки\/коллекции/);
+  assert.doesNotMatch(prompt, /ПОИСК МОДЕЛИ И СЕРИИ|SERIES MODE обязан|NO-SERIES MODE обязан/);
+
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
+});
+
+test('Longines profile excludes collections and fixes a two-line brand/model title', async () => {
+  const meta = getBrandProfile('longines');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const title = resolveTitleSpec(representativeModels.longines);
+  const prompt = buildGenerationPrompt(basePrompt, representativeModels.longines, brandPrompt, { inputMode: '2' });
+
+  assert.equal(meta.seriesRequired, false);
+  assert.deepEqual(meta.series, []);
+  assert.deepEqual(meta.aliases, []);
+  assert.equal(title.seriesRequired, false);
+  assert.equal(title.explicitSeries, null);
+  assert.equal(title.explicitSeriesPrint, null);
+  assert.deepEqual(title.fixedLines, ['Longines', 'L3.781.4.56.6']);
+  assert.equal(resolveBrandSeries('Longines HydroConquest L3.781.4.56.6'), null);
+  assert.match(prompt, /ровно две строки/);
+  assert.match(prompt, /Коллекции, линейки и серии полностью исключены/);
+  assert.match(prompt, /любые другие названия линеек/);
+  assert.doesNotMatch(prompt, /ПОИСК МОДЕЛИ И СЕРИИ|SERIES MODE обязан|NO-SERIES MODE обязан/);
+
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
+});
+
+test('Citizen profile excludes line names and fixes a two-line brand/model title', async () => {
+  const meta = getBrandProfile('citizen');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const title = resolveTitleSpec(representativeModels.citizen);
+  const prompt = buildGenerationPrompt(basePrompt, representativeModels.citizen, brandPrompt, { inputMode: '2' });
+
+  assert.equal(meta.seriesRequired, false);
+  assert.deepEqual(meta.series, []);
+  assert.deepEqual(meta.aliases, []);
+  assert.equal(title.seriesRequired, false);
+  assert.equal(title.explicitSeries, null);
+  assert.equal(title.explicitSeriesPrint, null);
+  assert.deepEqual(title.fixedLines, ['Citizen', 'NJ0150-81Z']);
+  assert.equal(resolveBrandSeries('Citizen Eco-Drive NB6010-81E'), null);
+  assert.match(prompt, /ровно две строки/);
+  assert.match(prompt, /Линейки, семейства, коллекции и серии полностью исключены/);
+  assert.match(prompt, /любые другие названия линеек/);
+  assert.doesNotMatch(prompt, /ПОИСК МОДЕЛИ И СЕРИИ|SERIES MODE обязан|NO-SERIES MODE обязан/);
+
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
+});
+
+test('Certina profile excludes families and fixes a two-line brand/model title', async () => {
+  const meta = getBrandProfile('certina');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const title = resolveTitleSpec(representativeModels.certina);
+  const prompt = buildGenerationPrompt(basePrompt, representativeModels.certina, brandPrompt, { inputMode: '2' });
+
+  assert.equal(meta.seriesRequired, false);
+  assert.deepEqual(meta.series, []);
+  assert.deepEqual(meta.aliases, []);
+  assert.equal(title.seriesRequired, false);
+  assert.equal(title.explicitSeries, null);
+  assert.equal(title.explicitSeriesPrint, null);
+  assert.deepEqual(title.fixedLines, ['Certina', 'C032.807.11.051.00']);
+  assert.equal(resolveBrandSeries('Certina DS Action C032.417.11.041.03'), null);
+  assert.match(prompt, /ровно две строки/);
+  assert.match(prompt, /Семейства, линейки, коллекции и серии полностью исключены/);
+  assert.match(prompt, /любые другие названия семейств или линеек/);
+  assert.doesNotMatch(prompt, /ПОИСК МОДЕЛИ И СЕРИИ|SERIES MODE обязан|NO-SERIES MODE обязан/);
+
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
+});
+
+test('Benyar profile excludes collections and fixes a two-line brand/model title', async () => {
+  const meta = getBrandProfile('benyar');
+  const brandPrompt = await readFile(path.join(extensionDir, meta.promptPath), 'utf8');
+  const title = resolveTitleSpec(representativeModels.benyar);
+  const prompt = buildGenerationPrompt(basePrompt, representativeModels.benyar, brandPrompt, { inputMode: '2' });
+
+  assert.equal(meta.seriesRequired, false);
+  assert.deepEqual(meta.series, []);
+  assert.deepEqual(meta.aliases, []);
+  assert.equal(title.seriesRequired, false);
+  assert.equal(title.explicitSeries, null);
+  assert.equal(title.explicitSeriesPrint, null);
+  assert.deepEqual(title.fixedLines, ['Benyar', 'BY-5101-1B']);
+  assert.equal(resolveBrandSeries('Benyar Casual Date BY-5101-1B'), null);
+  assert.match(prompt, /ровно две строки/);
+  assert.match(prompt, /Линейки, коллекции и серии полностью исключены/);
+  assert.match(prompt, /любые другие названия линеек/);
+  assert.doesNotMatch(prompt, /ПОИСК МОДЕЛИ И СЕРИИ|SERIES MODE обязан|NO-SERIES MODE обязан/);
+
+  assert.equal(title.titleLayout.seriesPolicy, 'forbidden');
 });
 
 test('reference path parser accepts current reference layout', () => {
@@ -1013,6 +1193,8 @@ test('facts postprocess accepts only a complete extraction envelope', async () =
     caseSize: '54,4 мм',
     uncertain: []
   });
+  const noSeries = '{"titleBrand":"Orient","titleSeries":null,"titleModel":"RA-AA0001B19B","utp1":"Минеральное стекло","utp2":"Автоматический механизм","waterResistance":"5 атм","caseSize":"40,5 мм","uncertain":[]}';
+  assert.equal(facts.isCompleteFactsResponse(noSeries), true, 'an explicit null series is valid for a no-series title layout');
 
   const streamedPrefix = '{"titleBrand":"Casio",';
   assert.equal(facts.isCompleteFactsResponse(streamedPrefix), false);
@@ -1272,10 +1454,52 @@ test('0.3.11 ordinary MV3 worker wake rehydrates live tasks instead of forcing m
 import {
   meaningfulFactValue,
   effectiveFactsWarnings,
+  factsSeriesPolicy,
+  displayFactsTitleBrand,
   factsDisplayState,
   sortGalleryRecords,
   physicalPngCount
 } from '../extension/gallery-utils.js';
+
+test('brand title layout policy is shared by fixed, required, optional, and unknown profiles', () => {
+  const pagani = resolveTitleSpec('Pagani Design PD-1759CBWWS');
+  const casio = resolveTitleSpec('Casio G-SHOCK GA-2100-1A1');
+  const diesel = resolveTitleSpec('Diesel Mega Chief DZ4343');
+  const unknown = resolveTitleSpec('Unknown Brand ZX-1200');
+
+  assert.deepEqual(pagani.titleLayout, {
+    version: 1, brandLines: ['Pagani', 'Design'], brandLineCount: 2, seriesPolicy: 'forbidden'
+  });
+  assert.equal(casio.titleLayout.seriesPolicy, 'required');
+  assert.equal(diesel.titleLayout.seriesPolicy, 'optional');
+  assert.equal(unknown.titleLayout.seriesPolicy, 'forbidden');
+  assert.deepEqual(titleLayoutWarnings({ titleBrand: 'Pagani Design', titleSeries: null, titleModel: 'PD-1759CBWWS' }, pagani), []);
+  assert.deepEqual(titleLayoutWarnings({ titleBrand: 'Pagani Design', titleSeries: 'Automatic', titleModel: 'PD-1759CBWWS' }, pagani), ['TITLE_SERIES_MISMATCH']);
+  assert.deepEqual(titleLayoutWarnings({ titleBrand: 'Casio', titleSeries: null, titleModel: 'GA-2100-1A1' }, casio), ['MISSING_SERIES']);
+  assert.deepEqual(titleLayoutWarnings({ titleBrand: 'Diesel', titleSeries: 'Made Up', titleModel: 'DZ4343' }, diesel), ['TITLE_SERIES_MISMATCH']);
+});
+
+test('gallery applies brand series policy and repairs the legacy Pagani brand-line interpretation', () => {
+  const complete = { titleBrand: 'Orient', titleModel: 'RA-AA0001B19B', utp1: 'A', utp2: 'B',
+    waterResistance: '5 атм', caseSize: '40,5 мм', status: 'ok', warnings: [] };
+  assert.equal(factsSeriesPolicy(complete, 'Orient RA-AA0001B19B'), 'forbidden');
+  assert.deepEqual(effectiveFactsWarnings(complete, 'Orient RA-AA0001B19B'), []);
+
+  const casioMissing = { ...complete, profileId: 'casio', titleBrand: 'Casio', seriesRequired: true, titleSeries: null };
+  assert.equal(factsSeriesPolicy(casioMissing, 'Casio GA-2100-1A1'), 'required');
+  assert.ok(effectiveFactsWarnings(casioMissing, 'Casio GA-2100-1A1').includes('MISSING_SERIES'));
+
+  const dieselOptional = { ...complete, profileId: 'diesel', titleBrand: 'Diesel', titleSeries: null };
+  assert.equal(factsSeriesPolicy(dieselOptional, 'Diesel DZ4343'), 'optional');
+  assert.ok(!effectiveFactsWarnings(dieselOptional, 'Diesel DZ4343').includes('MISSING_SERIES'));
+
+  const legacyPagani = { ...complete, profileId: 'pagani_design', titleBrand: 'Pagani', titleSeries: 'Design', titleModel: 'PD-1759CBWWS',
+    expectedTitleBrand: 'Pagani Design', seriesRequired: true,
+    warnings: ['TITLE_BRAND_MISMATCH', 'TITLE_SERIES_MISMATCH', 'MISSING_SERIES'] };
+  assert.equal(displayFactsTitleBrand(legacyPagani, 'Pagani Design PD-1759CBWWS'), 'Pagani Design');
+  assert.equal(factsSeriesPolicy(legacyPagani, 'Pagani Design PD-1759CBWWS'), 'forbidden');
+  assert.deepEqual(effectiveFactsWarnings(legacyPagani, 'Pagani Design PD-1759CBWWS'), []);
+});
 
 test('rate-limit ignore window accepts a persisted 10-minute setting and expires deterministically', () => {
   assert.equal(normalizeRateLimitIgnoreMinutes(10), 10);
@@ -1486,7 +1710,7 @@ test('gallery reconstructs missing-field warnings for legacy partial facts', () 
 
 test('gallery sorting supports date, natural name and text-issue order', () => {
   const rows = [
-    { modelName: 'Casio 10', generatedAt: '2026-09-20T10:00:00Z', facts: { titleBrand:'Casio', titleModel:'10', utp1:'A', utp2:'B', waterResistance:'100 м', caseSize:'45 мм', warnings:[] } },
+    { modelName: 'Casio 10', generatedAt: '2026-09-20T10:00:00Z', facts: { profileId:'casio', titleBrand:'Casio', titleSeries:'Collection', titleModel:'10', utp1:'A', utp2:'B', waterResistance:'100 м', caseSize:'45 мм', warnings:[] } },
     { modelName: 'Casio 2', generatedAt: '2026-09-21T10:00:00Z', facts: null },
     { modelName: 'Casio 1', generatedAt: '2026-09-19T10:00:00Z', factsStatus:'error', facts:{ status:'error', warnings:[] } }
   ];
@@ -1503,6 +1727,10 @@ test('0.3.13 facts prompt is literal OCR and does not leak expected model values
   assert.match(block, /Источник значений — ТОЛЬКО пиксели/);
   assert.match(block, /Мировое время 48 городов/);
   assert.match(block, /48,2 мм/);
+  assert.match(block, /titleSpec = resolveTitleSpec/);
+  assert.match(block, /titleLayout\.brandLineCount/);
+  assert.match(block, /В этом профиле серия запрещена/);
+  assert.match(block, /весь видимый брендовый заголовок/);
   assert.doesNotMatch(block, /Контрольная модель:/);
   assert.doesNotMatch(block, /Ожидаемый бренд/);
   assert.doesNotMatch(block, /Ожидаемый код/);

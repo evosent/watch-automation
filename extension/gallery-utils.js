@@ -1,3 +1,5 @@
+import { isLegacyPaganiBrandStack, titleLayoutSpecFor, titleLayoutWarnings, displayTitleBrand } from './title-layout-utils.js';
+
 const PLACEHOLDER_TEXT = /^(?:—|–|-|_+|null|undefined|n\/?a|нет|неизвестно)$/i;
 
 export function physicalPngCount(activePngCount, archivedPngCount = 0) {
@@ -11,18 +13,38 @@ export function meaningfulFactValue(value) {
   return Boolean(text) && !PLACEHOLDER_TEXT.test(text);
 }
 
-export function effectiveFactsWarnings(facts) {
+export function factsSeriesPolicy(facts, modelName = '') {
+  return titleLayoutSpecFor(modelName, facts).titleLayout?.seriesPolicy || 'forbidden';
+}
+
+export function displayFactsTitleBrand(facts, modelName = '') {
+  return displayTitleBrand(facts, modelName);
+}
+
+export function effectiveFactsWarnings(facts, modelName = '') {
   if (!facts || typeof facts !== 'object') return [];
   const warnings = new Set(Array.isArray(facts.warnings) ? facts.warnings.filter(Boolean) : []);
+  const seriesPolicy = factsSeriesPolicy(facts, modelName);
+  const legacyPaganiStack = isLegacyPaganiBrandStack(facts, modelName);
+
+  if (legacyPaganiStack) {
+    warnings.delete('TITLE_BRAND_MISMATCH');
+    warnings.delete('TITLE_SERIES_MISMATCH');
+    warnings.delete('MISSING_SERIES');
+  } else if (seriesPolicy === 'forbidden') {
+    warnings.delete('MISSING_SERIES');
+  }
+  for (const warning of titleLayoutWarnings(facts, titleLayoutSpecFor(modelName, facts))) warnings.add(warning);
 
   if (!meaningfulFactValue(facts.utp1)) warnings.add('MISSING_UTP_1');
   if (!meaningfulFactValue(facts.utp2)) warnings.add('MISSING_UTP_2');
   if (!meaningfulFactValue(facts.waterResistance)) warnings.add('MISSING_WATER_RESISTANCE');
   if (!meaningfulFactValue(facts.caseSize)) warnings.add('MISSING_CASE_SIZE');
 
-  if (!meaningfulFactValue(facts.titleBrand)) warnings.add('MISSING_TITLE_BRAND');
+  if (!meaningfulFactValue(displayFactsTitleBrand(facts, modelName))) warnings.add('MISSING_TITLE_BRAND');
   if (!meaningfulFactValue(facts.titleModel)) warnings.add('MISSING_TITLE_MODEL');
-  if ((facts.seriesRequired === true || meaningfulFactValue(facts.expectedTitleSeries)) && !meaningfulFactValue(facts.titleSeries)) {
+  if ((seriesPolicy === 'required' || meaningfulFactValue(facts.expectedTitleSeries))
+    && !meaningfulFactValue(facts.titleSeries) && !legacyPaganiStack) {
     warnings.add('MISSING_SERIES');
   }
 
@@ -34,7 +56,7 @@ export function effectiveFactsWarnings(facts) {
 export function factsDisplayState(record) {
   const facts = record?.facts && typeof record.facts === 'object' ? record.facts : null;
   const status = String(record?.factsStatus || facts?.status || '').trim().toLowerCase();
-  const warnings = effectiveFactsWarnings(facts);
+  const warnings = effectiveFactsWarnings(facts, record?.modelName || record?.fileName || '');
   const scalarKeys = ['titleBrand', 'titleSeries', 'titleModel', 'utp1', 'utp2', 'waterResistance', 'caseSize'];
   const hasContent = Boolean(facts && scalarKeys.some((key) => meaningfulFactValue(facts[key])));
 
