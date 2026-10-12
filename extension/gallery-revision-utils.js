@@ -27,6 +27,8 @@ export function galleryRecordsFromAccountingSnapshot(snapshot, catalog = [], rev
   if (!snapshot || !Array.isArray(snapshot.entries)) return [];
   const catalogBySku = new Map((catalog || []).filter((model) => model?.skuKey)
     .map((model) => [String(model.skuKey), model]));
+  const revisionsByGenerationId = new Map((revisions || []).filter((revision) => revision?.generationId)
+    .map((revision) => [String(revision.generationId), revision]));
   const revisionCounts = new Map();
   const countedGenerationIds = new Set();
   for (const revision of revisions || []) {
@@ -64,8 +66,21 @@ export function galleryRecordsFromAccountingSnapshot(snapshot, catalog = [], rev
       || String(facts.outputHash || '').toLowerCase() !== String(revision.outputHash).toLowerCase()) return [];
 
     const catalogRecord = catalogBySku.get(skuKey);
+    const storedRevision = revisionsByGenerationId.get(generationId);
+    const issueMetadataMatches = storedRevision
+      && String(storedRevision.sourceId || '') === skuKey
+      && String(storedRevision.generationId || '') === generationId
+      && String(storedRevision.factsJobId || '') === String(revision.factsJobId)
+      && String(storedRevision.outputPath || '') === String(revision.outputPath || '')
+      && String(storedRevision.outputHash || '').toLowerCase() === String(revision.outputHash).toLowerCase()
+      && storedRevision.facts?.status === 'ok'
+      && String(storedRevision.facts.generationId || '') === generationId
+      && String(storedRevision.facts.factsJobId || '') === String(revision.factsJobId)
+      && String(storedRevision.facts.outputHash || '').toLowerCase() === String(revision.outputHash).toLowerCase();
     return [{
       ...revision,
+      ...(issueMetadataMatches ? { qualityIssueResolutions: Array.isArray(storedRevision.qualityIssueResolutions)
+        ? storedRevision.qualityIssueResolutions : [] } : {}),
       sourceId: skuKey,
       skuKey,
       generationId,

@@ -61,7 +61,18 @@ test('changing generation parameters continues to invalidate stale preflight che
   assert.equal((section.match(/lastPreflight = null/g) || []).length, 3);
 });
 
-test('design stylesheet remains an exact copy of the supplied patch', () => {
+test('result navigation promotes the gallery and keeps both existing actions', () => {
+  assert.ok(html.indexOf('id="openGallery"') < html.indexOf('id="openDownloadsFolder"'));
+  assert.match(html, /class="gallery-launch-label">Галерея готовых результатов<\/span>/);
+  assert.match(html, /id="openDownloadsFolder" class="secondary results-folder-button"/);
+  assert.match(css, /\.gallery-launch \{[^}]*background:var\(--accent\)[^}]*font-size:15px/);
+  assert.match(css, /\.header-actions \.results-folder-button \{[^}]*max-width:94px[^}]*font-size:11px/);
+  assert.match(script, /\$\('openGallery'\)\?\.addEventListener\('click'/);
+  assert.match(script, /\$\('openDownloadsFolder'\)\?\.addEventListener\('click'/);
+  assert.match(gallery, /id="exportCustomer"[^>]*>Собрать финальный архив<\/button>/);
+});
+
+test('approved design stylesheet retains the requested result navigation styling', () => {
   const digest = createHash('sha256').update(css.replace(/\r\n/g, '\n').trimEnd()).digest('hex');
-  assert.equal(digest, 'd2fcc59396694e37dff71cca17bd2d16c6ed416cd5dfaf0da297cb26e0b5da58');
+  assert.equal(digest, 'ecc881892e9617cf4f05606746c772c2d33924031723c115de9b50c5f75feb16');
 });

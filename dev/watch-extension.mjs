@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { createUpdateManager, installedUpdateStatus, scheduleApplicationRestart, UPDATE_STATE_FILE,
   AUTOMATION_LAUNCHER_TEMPLATE_MARKER, prepareAutomationBrowserStartup,
-  repairAutomationLauncherFromTemplate } from './update-utils.mjs';
+  repairAutomationLauncherFromTemplate, validateAutomationInstallation } from './update-utils.mjs';
 import { createResultsTransferManager } from '../extension/local-service/results-transfer.mjs';
 import { createArtifactAccountingVerifier } from '../extension/local-service/artifact-accounting.mjs';
 import {
@@ -1313,7 +1313,15 @@ async function startAutomationStartupMaintenance() {
     .catch(() => console.warn('[watch-extension] Root launcher repair was skipped.'));
 }
 
-if (process.argv[2] === '--prepare-browser-startup') {
+if (process.argv[2] === '--check-installation') {
+  try {
+    await validateAutomationInstallation(PROJECT_ROOT);
+    console.log(`Automation installation ready: ${PROJECT_ROOT}`);
+  } catch (error) {
+    console.error(error?.message || error);
+    process.exitCode = 1;
+  }
+} else if (process.argv[2] === '--prepare-browser-startup') {
   try {
     const result = await prepareAutomationBrowserStartup(process.argv[3]);
     console.log(`Browser startup prepared; startup URL count: ${result.startupUrlCount}.`);

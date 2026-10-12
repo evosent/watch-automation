@@ -63,6 +63,30 @@ test('editing enforces SKU identity, Russian UTPs and brand-specific no-series',
   const manual = { ...a, imageTextMatchesFacts: false, originalPrintedFacts: a.facts, facts: { ...a.facts, utp1: 'Сапфировое стекло' } };
   assert.equal(validateCardChanges(manual, manual.facts).changes[0].before, 'Минеральное стекло');
 });
+
+test('card edit prompt locks the 3:4 canvas and permits only literal replacements in named blocks', () => {
+  const a = { ...record(), outputWidth: 1086, outputHeight: 1448 };
+  const { changes } = validateCardChanges(a, { ...a.facts, utp1: 'Сапфировое стекло' });
+  const prompt = buildCardEditPrompt(a, changes);
+  assert.match(prompt, /строго 3:4 \(ширина:высота\)/);
+  assert.match(prompt, /1086 × 1448 пикселей/);
+  assert.match(prompt, /9:16, 2:3, квадрат.*запрещены/);
+  assert.match(prompt, /обрезка, сжатие, растяжение/);
+  assert.match(prompt, /Совпадающие слова в других блоках менять запрещено/);
+  assert.match(prompt, /Все надписи, отсутствующие в списке замен, должны остаться прежними/);
+  assert.match(prompt, /Единственный источник новых значений — строки to в JSON/);
+  assert.match(prompt, /WATCHES WORLD/);
+  assert.match(prompt, /перерисовка и ретушь часов/);
+  const data = JSON.parse(prompt.match(/\{\n[\s\S]*\n\}/)[0]);
+  assert.equal(data.model, a.modelName);
+  assert.deepEqual(data.replacements, [{ field: 'utp1', from: 'Минеральное стекло', to: 'Сапфировое стекло' }]);
+  for (const dimensions of [{}, { outputWidth: 1080, outputHeight: 1920 }, { outputWidth: -3, outputHeight: -4 }]) {
+    const fallback = buildCardEditPrompt({ ...record(), ...dimensions }, changes);
+    assert.match(fallback, /строго 3:4/);
+    assert.doesNotMatch(fallback, /Размер полного выходного холста:/);
+    assert.match(fallback, /Формат результата 3:4 обязателен/);
+  }
+});
 test('XLSX is a native OOXML package with literal identifiers, dates, frozen headers and customer privacy', () => {
   const a = record(); a.facts.utp1 = '=HYPERLINK("https://example.com")'; a.chatUrl = 'https://chatgpt.com/c/private';
   const files = unzipStored(buildCardWorkbook([a], { customer: true }));
@@ -108,13 +132,13 @@ test('rejecting edit leaves source image, facts and current model intact', async
   assert.equal((await getModelCatalog(original.sourceId)).latestReadyGenerationId, 'original');
   assert.ok((await getGenerationRevision('original')).facts);
 });
-function controllerFixture() {
+function controllerFixture(options = {}) {
   const stored = {}, calls = []; let tail = Promise.resolve();
   globalThis.chrome = { storage: { local: { async get(keys) { return Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map(k => [k, stored[k]])); }, async set(value) { Object.assign(stored, structuredClone(value)); } } },
     tabs: { async create(options) { calls.push(options); return { id: 7 }; }, async get() { return { id: 7 }; }, async sendMessage(_id, message) { calls.push(message); } },
     alarms: { async create() {}, async clear() {} }, downloads: { async download() { return 17; }, async search() { return []; } } };
   globalThis.fetch = async () => ({ ok: true, async json() { return { valid: true, sha256: hash, bytes: 100 }; }, async arrayBuffer() { return new Uint8Array([1]).buffer; } });
-  const ctrl = createCardEditController({ lock: task => { const next = tail.then(task); tail = next.catch(() => {}); return next; }, buildFactsPrompt: () => 'OCR', normalizeFacts: (_record, text) => JSON.parse(text), refreshAccounting: async () => {}, runIsActive: run => run?.state === 'RUNNING' });
+  const ctrl = createCardEditController({ lock: task => { const next = tail.then(task); tail = next.catch(() => {}); return next; }, buildFactsPrompt: () => 'OCR', normalizeFacts: (_record, text) => JSON.parse(text), refreshAccounting: async () => {}, runIsActive: run => run?.state === 'RUNNING', ...options });
   return { ctrl, stored, calls };
 }
 test('manual facts job creates separate pending revision and preserves original provenance', async () => {
@@ -124,6 +148,7 @@ test('manual facts job creates separate pending revision and preserves original 
   const changed = await getGenerationRevision(job.id); assert.equal(changed.facts.utp1, 'Сапфировое стекло');
   assert.equal(changed.imageTextMatchesFacts, false); assert.equal(changed.originalPrintedFacts.utp1, a.facts.utp1);
   assert.equal((await getModelCatalog(a.sourceId)).latestReadyGenerationId, a.generationId);
+  assert.equal(await ctrl.busy(), false, 'a saved candidate does not block generation or another edit');
   assert.equal((await getAllGenerationRevisions()).length, 2);
   stored.run = { state: 'RUNNING' };
   await assert.rejects(ctrl.handle({ type: 'REVIEW_CARD_VERSION', generationId: job.id, expectedAcceptedId: a.generationId, decision: 'accept' }, {}), /Заверши/);
@@ -159,7 +184,7 @@ test('image editing is single-owner, cancellable and never sends again after tim
   const a = await seed(), { ctrl, stored, calls } = controllerFixture();
   const request = { type: 'START_CARD_EDIT', generationId: a.generationId, expectedAcceptedId: a.generationId, fields: { ...a.facts, utp1: 'Сапфировое стекло' } };
   const job = await ctrl.handle(request, {}); assert.equal(calls.length, 1);
-  await assert.rejects(ctrl.handle(request, {}), /предыдущее/);
+  await assert.rejects(ctrl.handle(request, {}), /предыдущ/);
   assert.equal(await ctrl.handle({ type: 'CARD_EDIT_CLAIM', requestedId: job.id }, { tab: { id: 8 } }), null);
   await ctrl.handle({ type: 'CANCEL_CARD_EDIT' }, {});
   assert.equal(stored.cardEditJob.stage, 'cancelled');
@@ -207,21 +232,100 @@ test('failed image claim releases the edit job with an actionable error', async 
   await assert.rejects(ctrl.handle({ type: 'CARD_EDIT_CLAIM', requestedId: job.id }, { tab: { id: 7 } }), /прочитать/);
   assert.equal(stored.cardEditJob.stage, 'error'); assert.equal(await ctrl.busy(), false);
 });
-test('content edit route uses the exact attachment, adapter string API, OCR and one result submission', async () => {
+
+test('worker boots its saved tab outside the lock and reports a handshake failure immediately', async () => {
+  const a = await seed(); let fixture, observed;
+  fixture = controllerFixture({ prepareTab: async (tabId, id) => {
+    observed = { tabId, id, stage: fixture.stored.cardEditJob.stage };
+    // A second lock acquisition completes, proving boot is outside start lock.
+    await fixture.ctrl.handle({ type: 'CANCEL_CARD_EDIT' }, {});
+    throw new Error('handshake failed');
+  } });
+  const job = await fixture.ctrl.handle({ type: 'START_CARD_EDIT', generationId: a.generationId, expectedAcceptedId: a.generationId, fields: { ...a.facts, utp1: 'Сапфировое стекло' } }, {});
+  for (let i=0; i<10 && fixture.stored.cardEditJob.stage === 'opening'; i++) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.deepEqual(observed, { tabId: 7, id: job.id, stage: 'opening' });
+  assert.equal(fixture.stored.cardEditJob.stage, 'cancelled');
+  const next = controllerFixture({ prepareTab: async () => { throw new Error('ChatGPT did not respond'); } });
+  await next.ctrl.handle({ type: 'START_CARD_EDIT', generationId: a.generationId, expectedAcceptedId: a.generationId, fields: { ...a.facts, utp1: 'Сапфировое стекло' } }, {});
+  for (let i=0; i<10 && next.stored.cardEditJob.stage === 'opening'; i++) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(next.stored.cardEditJob.stage, 'error');
+  assert.equal(next.stored.cardEditJob.error, 'ChatGPT did not respond');
+  assert.equal(await next.ctrl.busy(), false);
+});
+
+test('opening and attachment watchdogs release the job long before the full generation deadline', async () => {
+  const a = await seed(), { ctrl, stored } = controllerFixture();
+  const request = { type: 'START_CARD_EDIT', generationId: a.generationId, expectedAcceptedId: a.generationId, fields: { ...a.facts, utp1: 'Сапфировое стекло' } };
+  const job = await ctrl.handle(request, {});
+  assert.ok(stored.cardEditJob.stageDeadline < stored.cardEditJob.deadline - 10 * 60000);
+  await ctrl.onAlarm({ name: 'watch-card-edit-deadline' });
+  assert.equal(stored.cardEditJob.stage, 'opening', 'an early alarm must only reschedule');
+  stored.cardEditJob.stageDeadline = Date.now() - 1;
+  await ctrl.onAlarm({ name: 'watch-card-edit-deadline' });
+  assert.match(stored.cardEditJob.error, /90 секунд/);
+  assert.equal(await ctrl.busy(), false);
+  const second = await ctrl.handle(request, {});
+  globalThis.fetch = async url => ({ ok: true, arrayBuffer: async () => new Uint8Array([1]).buffer });
+  // Reconcile an interrupted attachment stage without retrying its prompt.
+  stored.cardEditJob.stage = 'preparing'; stored.cardEditJob.stageDeadline = Date.now() - 1;
+  await ctrl.onAlarm({ name: 'watch-card-edit-deadline' });
+  assert.match(stored.cardEditJob.error, /3 минуты/);
+  assert.equal(await ctrl.handle({ type: 'CARD_EDIT_CLAIM', requestedId: second.id }, { tab: { id: 7 } }), null);
+  assert.equal((await getModelCatalog(a.sourceId)).latestReadyGenerationId, 'original');
+});
+test('content edit boot survives stripped URL/gate and duplicated injection, attaching the exact PNG before one send', async () => {
   const source = await readFile(new URL('../extension/card-edit-content.js', import.meta.url), 'utf8');
   const calls = [], png = new Uint8Array([137,80,78,71,13,10,26,10,1]);
   const task = { id: 'id', deadline: Date.now() + 60000, file: { name: 'exact.png', dataUrl: 'data:image/png;base64,AA==' }, prompt: 'edit', factsPrompt: 'OCR' };
-  let done; const finished = new Promise(resolve => { done = resolve; });
+  let done, receiver, listeners = 0, sends = 0; const finished = new Promise(resolve => { done = resolve; });
   const adapter = { async ensureChatMode() {}, async waitForComposerReadyForInput() {}, async waitForComposerReadyForSend() {},
     async uploadFiles(value) { calls.push(['upload', value.files[0].name]); }, async setComposerText(value) { assert.equal(typeof value, 'string'); calls.push(['prompt', value]); },
-    async sendPrompt() { return { baselineAssistantCount: 0 }; }, async waitForGeneratedImage() { return { src: 'https://image/result' }; }, async waitForSettledAssistantText() { return { text: 'json' }; } };
+    async sendPrompt() { sends++; return { baselineAssistantCount: 0, userTurnId: 'turn' }; }, async waitForGeneratedImage() { return { src: 'https://image/result' }; }, async waitForSettledAssistantText(options) { assert.equal(options.afterUserTurnId, 'turn'); return { text: 'json' }; } };
   class Reader { readAsDataURL() { this.result = 'data:image/png;base64,AA=='; this.onload(); } }
-  runInNewContext(source, { window: { __WATCH_AUTOMATION_ENABLED__: true, WatchChatGPTAdapter: adapter }, URL, Blob, FileReader: Reader, AbortController, setTimeout, clearTimeout,
-    location: { href: 'https://chatgpt.com/c/result?watch_card_edit=id' }, fetch: async () => ({ ok: true, blob: async () => new Blob([png]) }),
-    chrome: { runtime: { onMessage: { addListener() {} }, async sendMessage(message) { calls.push(message.type); if (message.type === 'CARD_EDIT_RESULT') done(); return { ok: true, value: message.type === 'CARD_EDIT_CLAIM' ? task : message.type === 'CARD_EDIT_STAGE' ? { stage: message.stage } : null }; } } } });
+  const context = { window: { __WATCH_AUTOMATION_ENABLED__: false, WatchChatGPTAdapter: adapter }, URL, Blob, FileReader: Reader, AbortController, setTimeout, clearTimeout,
+    location: { href: 'https://chatgpt.com/c/result' }, fetch: async () => ({ ok: true, blob: async () => new Blob([png]) }),
+    chrome: { runtime: { onMessage: { addListener(fn) { listeners++; receiver = fn; } }, async sendMessage(message) { calls.push(message.type); if (message.type === 'CARD_EDIT_RESULT') done(); return { ok: true, value: message.type === 'CARD_EDIT_CLAIM' ? task : message.type === 'CARD_EDIT_STAGE' ? { stage: message.stage } : null }; } } } };
+  runInNewContext(source, context);
+  runInNewContext(source, context);
+  assert.equal(listeners, 1); assert.equal(calls.length, 0, 'loading a page must not race the saved worker tab ID');
+  receiver({ type: 'CARD_EDIT_START', id: task.id }, {}, () => {});
+  receiver({ type: 'CARD_EDIT_START', id: task.id }, {}, () => {});
   await finished;
   assert.deepEqual(calls.filter(c => Array.isArray(c)), [['upload', 'exact.png'], ['prompt', 'edit'], ['prompt', 'OCR']]);
   assert.equal(calls.filter(c => c === 'CARD_EDIT_RESULT').length, 1);
+  assert.equal(calls.filter(c => c === 'CARD_EDIT_CLAIM').length, 1);
+  assert.equal(sends, 2, 'one image edit and one OCR request');
+});
+
+test('attachment failure and cancellation during claim never click Send or replace the original', async () => {
+  const source = await readFile(new URL('../extension/card-edit-content.js', import.meta.url), 'utf8');
+  for (const mode of ['attachment-failure', 'cancel-during-claim']) {
+    let receiver, releaseClaim, sent = 0, uploaded = 0, done;
+    const finished = new Promise(resolve => { done = resolve; });
+    const claim = new Promise(resolve => { releaseClaim = resolve; });
+    const task = { id: mode, deadline: Date.now() + 60000, file: { name: 'exact.png' }, prompt: 'edit' };
+    const errors = [];
+    const adapter = { async ensureChatMode() {}, async waitForComposerReadyForInput() {},
+      async uploadFiles() { uploaded++; throw new Error('PNG не прикрепился'); },
+      async setComposerText() { throw new Error('must not write prompt'); }, async sendPrompt() { sent++; } };
+    runInNewContext(source, { window: { WatchChatGPTAdapter: adapter }, AbortController, setTimeout, clearTimeout,
+      chrome: { runtime: { onMessage: { addListener(fn) { receiver = fn; } }, async sendMessage(message) {
+        if (message.type === 'CARD_EDIT_CLAIM') return { ok: true, value: mode === 'cancel-during-claim' ? await claim : task };
+        if (message.type === 'CARD_EDIT_ERROR') { errors.push(message); done(); }
+        return { ok: true };
+      } } } });
+    receiver({ type: 'CARD_EDIT_START', id: task.id }, {}, () => {});
+    if (mode === 'cancel-during-claim') {
+      receiver({ type: 'CANCEL_CARD_EDIT', id: task.id }, {}, () => {});
+      releaseClaim(task);
+    }
+    await finished;
+    receiver({ type: 'CARD_EDIT_START', id: task.id }, {}, () => {});
+    await Promise.resolve();
+    assert.equal(sent, 0); assert.equal(uploaded, mode === 'attachment-failure' ? 1 : 0);
+    assert.equal(errors.length, 1); assert.equal(errors[0].id, mode);
+    assert.match(errors[0].error, mode === 'attachment-failure' ? /не прикрепился/ : /отменено/);
+  }
 });
 test('customer delivery ZIP streams exact images and contains Excel without chat URLs', async t => {
   const root = await mkdtemp(path.join(tmpdir(), 'watch-customer-')); t.after(() => rm(root, { recursive: true, force: true }));

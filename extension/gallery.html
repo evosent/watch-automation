@@ -25,7 +25,7 @@
             <button id="exportFactsJson" class="button secondary" type="button">Скачать JSON</button>
           </div>
         </details>
-        <button id="exportCustomer" class="button secondary" type="button">Архив заказчику</button>
+        <button id="exportCustomer" class="button secondary" type="button">Собрать финальный архив</button>
         <button id="refreshGallery" class="button" type="button">Обновить файлы</button>
       </div>
     </header>
@@ -48,7 +48,7 @@
           <option value="name_desc">Название: Я → А</option>
           <option value="brand_asc">Бренд: А → Я</option>
           <option value="brand_desc">Бренд: Я → А</option>
-          <option value="facts_issues">Текст: проблемы сначала</option>
+          <option value="facts_issues">Проверка: замечания сначала</option>
         </select>
       </label>
     </section>
@@ -73,17 +73,19 @@
         </select>
       </label>
       <label>
-        <span>Текст карточки</span>
+        <span>Проверка карточки</span>
         <select id="factsFilter">
           <option value="all">Все</option>
           <option value="missing">Не извлечено / пусто</option>
-          <option value="warnings">Есть замечания</option>
-          <option value="quality_issues">Проверка характеристик</option>
+          <option value="warnings">Все активные замечания</option>
+          <option value="extraction">Распознавание текста</option>
+          <option value="quality_issues">Проверить значение</option>
+          <option value="variants">Расхождения между расцветками</option>
           <option value="error">Ошибка извлечения</option>
           <option value="missing_series">Серия / заголовок</option>
           <option value="missing_utp">Проблемы УТП</option>
-          <option value="missing_water">Нет водозащиты</option>
-          <option value="missing_size">Нет размера</option>
+          <option value="missing_water">Проблемы водозащиты</option>
+          <option value="missing_size">Проблемы размера</option>
         </select>
       </label>
       <label class="fast-reject-toggle" title="Если включено, кнопка «Брак» отправляет изображение в архив без дополнительного подтверждения">
@@ -111,7 +113,15 @@
     </section>
 
     <section id="cardEditStatus" class="card-edit-status" hidden role="status"><span id="cardEditStatusText"></span><button id="cardEditOpen" class="button secondary" type="button" hidden>Открыть новую версию</button><button id="cardEditCancel" class="button secondary" type="button" hidden>Отменить редактирование</button></section>
+    <div class="gallery-review-toolbar">
+      <div class="gallery-view-switch" role="group" aria-label="Представление результатов">
+        <button id="cardsView" type="button" aria-pressed="true">Карточки</button>
+        <button id="comparisonView" type="button" aria-pressed="false">Сравнение расцветок</button>
+      </div>
+      <span id="qualityViewHint" class="review-note" role="status">Замечания относятся к основной версии каждой карточки.</span>
+    </div>
     <section id="grid" class="generation-grid" aria-live="polite"></section>
+    <section id="comparisonGroups" class="comparison-groups" aria-label="Группы возможных расцветок" aria-live="polite" hidden></section>
     <div class="load-more-wrap"><button id="loadMore" class="button secondary" type="button" hidden>Показать ещё</button></div>
   </main>
 

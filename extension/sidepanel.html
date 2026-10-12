@@ -32,12 +32,14 @@
         <button class="workspace-tab is-active" type="button" data-workspace-tab="run" aria-selected="true">Прогон</button>
         <button class="workspace-tab" type="button" data-workspace-tab="service" aria-selected="false">Настройки</button>
       </nav>
-      <div class="header-actions"><button id="openDownloadsFolder" class="secondary" type="button">Папка результатов</button>
-      <button id="openGallery" class="gallery-launch" type="button" title="Открыть галерею генераций в отдельной вкладке">
-        <span class="gallery-launch-icon" aria-hidden="true">▦</span>
-        <span class="gallery-launch-label">Результаты</span>
-        <span class="gallery-launch-arrow" aria-hidden="true">↗</span>
-      </button></div>
+      <div class="header-actions">
+        <button id="openGallery" class="gallery-launch" type="button" title="Открыть галерею готовых результатов в отдельной вкладке">
+          <span class="gallery-launch-icon" aria-hidden="true">▦</span>
+          <span class="gallery-launch-label">Галерея готовых результатов</span>
+          <span class="gallery-launch-arrow" aria-hidden="true">↗</span>
+        </button>
+        <button id="openDownloadsFolder" class="secondary results-folder-button" type="button" title="Открыть папку с PNG в проводнике">Папка результатов</button>
+      </div>
     </header>
 
     <div id="feedback" class="feedback" role="status" aria-live="polite" hidden>

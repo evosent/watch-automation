@@ -1,6 +1,8 @@
 import { initResultsTransfer } from './results-transfer-ui.js';
 import { initGalleryReview } from './gallery-review-ui.js';
-import { auditCardRecords } from './gallery-quality-utils.js';
+import { auditCardRecords, buildComparisonGroups, QUALITY_CATEGORY_LABELS } from './gallery-quality-utils.js';
+import { renderComparisonGroups } from './gallery-quality-ui.js';
+import { matchesGalleryQualityFilter } from './gallery-quality-filters.js';
 import {
   WATCH_BRAND_FILTERS,
   QUEUE_GROUP_IDS,
@@ -38,6 +40,11 @@ let viewerSourceId = null;
 let viewerGenerationId = null;
 let allRevisions = [];
 let qualityIssues = [];
+let allQualityIssues = [];
+let qualityIssuesByGeneration = new Map();
+let allQualityIssuesByGeneration = new Map();
+let comparisonGroups = [];
+let galleryView = 'cards';
 let viewerRenderSequence = 0;
 let compareObjectUrl = null;
 let viewerObjectUrl = null;
@@ -280,7 +287,19 @@ async function loadState() {
   records = galleryRecordsFromCatalog(catalog, currentRevisionRecords, accountingView);
   allRevisions = currentRevisionRecords;
   records = records.map(record => ({ ...record, versionCount: galleryVersionsForRecord(record, allRevisions).length }));
-  qualityIssues = auditCardRecords(records);
+  allQualityIssues = auditCardRecords(records, { includeResolved: true });
+  qualityIssues = allQualityIssues.filter(issue => !issue.resolved);
+  const indexIssues = items => {
+    const index = new Map();
+    for (const issue of items) {
+      if (!index.has(issue.generationId)) index.set(issue.generationId, []);
+      index.get(issue.generationId).push(issue);
+    }
+    return index;
+  };
+  qualityIssuesByGeneration = indexIssues(qualityIssues);
+  allQualityIssuesByGeneration = indexIssues(allQualityIssues);
+  comparisonGroups = buildComparisonGroups(records);
 
   const customPermission = await permission(outputHandle, 'read');
   const currentCatalogCards = records.filter((record) => !record.outsideCurrentCatalog).length;
@@ -337,25 +356,20 @@ function applyFilters() {
     if (brand !== 'all' && brandId(record) !== brand) return false;
     if (sale !== 'all' && groupSale(record.groupId) !== sale) return false;
     if (quality !== 'all' && groupQuality(record.groupId) !== quality) return false;
-    const factsState = factsDisplayState(record);
-    const warnings = factsState.warnings;
-    if (factsFilter === 'missing' && factsState.kind !== 'missing') return false;
-    if (factsFilter === 'warnings' && factsState.kind !== 'warning') return false;
-    if (factsFilter === 'quality_issues' && !qualityIssues.some(issue => issue.sourceId === record.sourceId)) return false;
-    if (factsFilter === 'error' && factsState.kind !== 'error') return false;
-    if (factsFilter === 'missing_series' && !warnings.includes('MISSING_SERIES') && !warnings.includes('TITLE_SERIES_MISMATCH')) return false;
-    if (factsFilter === 'missing_utp' && !warnings.some((item) => item === 'MISSING_UTP_1' || item === 'MISSING_UTP_2')) return false;
-    if (factsFilter === 'missing_water' && !warnings.includes('MISSING_WATER_RESISTANCE')) return false;
-    if (factsFilter === 'missing_size' && !warnings.includes('MISSING_CASE_SIZE')) return false;
+    if (!matchesGalleryQualityFilter(record, factsFilter, qualityIssuesByGeneration.get(record.generationId))) return false;
     return true;
   });
   const sortOrder = $('sortOrder')?.value || 'date_desc';
   filtered = sortGalleryRecords(filtered, sortOrder, (record) => recordMeta(record).brand);
+  if (sortOrder === 'facts_issues') filtered.sort((a, b) =>
+    (qualityIssuesByGeneration.get(b.generationId)?.length || 0) - (qualityIssuesByGeneration.get(a.generationId)?.length || 0));
   shown = PAGE_SIZE;
   render();
   if ($('viewer').open) {
     viewerIndex = filtered.findIndex(item => item.sourceId === viewerSourceId);
-    if (viewerIndex < 0) closeViewer();
+    // Acknowledging the final issue may remove this card from a QA filter.
+    // Keep the exact selected version open while the underlying model exists.
+    if (!records.some(item => item.sourceId === viewerSourceId)) closeViewer();
     else if (!reviewUi.editing) renderViewer().catch(showError);
   }
 }
@@ -379,17 +393,39 @@ function render() {
   if (scopeHint) scopeHint.textContent = outsideCatalogCount
     ? `· ${currentCatalogCount} в текущем каталоге · ${outsideCatalogCount} вне каталога`
     : '';
-  $('emptyState').hidden = filtered.length !== 0;
-  $('loadMore').hidden = shown >= filtered.length;
+  const comparing = galleryView === 'comparison';
+  const visibleIds = new Set(filtered.map(record => record.sourceId));
+  const visibleGroups = comparisonGroups.filter(group => group.members.some(record => visibleIds.has(record.sourceId)));
+  $('emptyState').hidden = comparing ? visibleGroups.length > 0 : filtered.length !== 0;
+  $('emptyState').querySelector('h2').textContent = comparing ? 'Нет групп по текущим фильтрам' : 'Нет карточек по текущим фильтрам';
+  $('emptyState').querySelector('p').textContent = comparing
+    ? 'Группа появляется при наличии двух сохранённых моделей с общим базовым артикулом. Доступны правила Casio, Pagani Design и Tissot.'
+    : 'Измени фильтры или обнови файлы.';
+  $('loadMore').hidden = shown >= (comparing ? visibleGroups.length : filtered.length);
+  grid.hidden = comparing;
+  $('comparisonGroups').hidden = !comparing;
+  $('cardsView').setAttribute('aria-pressed', String(!comparing));
+  $('comparisonView').setAttribute('aria-pressed', String(comparing));
+  $('qualityViewHint').textContent = comparing
+    ? `${visibleGroups.length} групп · показаны все участники каждой группы, включая скрытых фильтром. Сходство артикула требует сверки.`
+    : 'Замечания относятся к основной версии каждой карточки.';
+  if (comparing) {
+    grid.replaceChildren();
+    $('comparisonGroups').innerHTML = renderComparisonGroups(visibleGroups.slice(0, shown), qualityIssues, escapeHtml);
+    $('comparisonGroups').querySelectorAll('[data-quality-open-source]').forEach(button => {
+      button.addEventListener('click', () => selectViewerVersion(button.dataset.qualityOpenSource, button.dataset.qualityOpenGeneration));
+    });
+    return;
+  }
+  $('comparisonGroups').replaceChildren();
   grid.innerHTML = page.map((record) => {
     const meta = recordMeta(record);
     const factsState = factsDisplayState(record);
-    const warnings = factsState.warnings;
-    const issues = qualityIssues.filter(issue => issue.sourceId === record.sourceId);
-    const factsChip = factsState.kind === 'ok'
-      ? '<span class="chip good">Текст ✓</span>'
-      : factsState.kind === 'warning'
-        ? `<span class="chip warning" title="Замечания к тексту карточки">⚠ ${warnings.length}</span>`
+    const issues = qualityIssuesByGeneration.get(record.generationId) || [];
+    const resolved = (allQualityIssuesByGeneration.get(record.generationId) || []).filter(issue => issue.resolved);
+    const categories = [...new Set(issues.map(issue => QUALITY_CATEGORY_LABELS[issue.category] || issue.category))].join('; ');
+    const factsChip = ['ok', 'warning'].includes(factsState.kind)
+      ? '<span class="chip muted" title="Поля прочитаны с изображения. Значения проверяются отдельно.">Текст считан</span>'
         : factsState.kind === 'error'
           ? '<span class="chip error">ошибка</span>'
           : factsState.kind === 'pending'
@@ -399,7 +435,7 @@ function render() {
       <div class="thumb" data-open="1" role="button" tabindex="0" aria-label="Открыть ${escapeHtml(record.modelName || record.fileName || 'карточку')}">
         <div class="thumb-placeholder">Загрузка превью…</div>
         <img alt="${escapeHtml(record.modelName || record.fileName || '')}" loading="lazy">
-        <div class="thumb-badges"><span class="chip">${escapeHtml(meta.brand)}</span>${record.versionCount > 1 ? `<span class="chip">версий ${record.versionCount}</span>` : ''}${factsChip}${issues.length ? `<span class="chip warning">Проверка ${issues.length}</span>` : ''}${record.reviewStatus === 'accepted' ? '<span class="chip good">Проверено</span>' : ''}</div>
+        <div class="thumb-badges"><span class="chip">${escapeHtml(meta.brand)}</span>${record.versionCount > 1 ? `<span class="chip">версий ${record.versionCount}</span>` : ''}${factsChip}${issues.length ? `<span class="chip warning" title="${escapeHtml(categories)}">Проверка ${issues.length}</span>` : ''}${resolved.length ? `<span class="chip good">Подтверждено ${resolved.length}</span>` : ''}${record.reviewStatus === 'accepted' ? '<span class="chip muted">Карточка подтверждена</span>' : ''}</div>
       </div>
       <div class="card-body" data-open="1">
         <div class="card-title">${escapeHtml(record.modelName || record.fileName || 'Без названия')}</div>
@@ -586,12 +622,19 @@ async function reject(record) {
 }
 
 function openViewerBySource(sourceId) {
-  viewerIndex = filtered.findIndex((item) => item.sourceId === sourceId);
-  if (viewerIndex < 0) return;
+  const record = records.find(item => item.sourceId === sourceId);
+  if (record) return selectViewerVersion(sourceId, record.generationId);
+}
+function currentViewerRecord() {
+  return records.find(item => item.sourceId === viewerSourceId);
+}
+function selectViewerVersion(sourceId, generationId) {
+  if (!records.some(record => record.sourceId === sourceId)) return;
+  viewerIndex = filtered.findIndex(item => item.sourceId === sourceId);
   viewerSourceId = sourceId;
-  viewerGenerationId = filtered[viewerIndex].generationId;
-  $('viewer').showModal();
-  renderViewer().catch(showError);
+  viewerGenerationId = generationId;
+  if (!$('viewer').open) $('viewer').showModal();
+  return renderViewer().catch(showError);
 }
 function closeViewer() {
   ++viewerRenderSequence;
@@ -606,26 +649,6 @@ function setZoom(value) {
   zoom = Math.min(3, Math.max(.5, value));
   $('viewerImage').style.transform = `scale(${zoom})`;
   $('zoomValue').textContent = `${Math.round(zoom * 100)}%`;
-}
-
-function warningLabel(code) {
-  const labels = {
-    MISSING_UTP_1: 'Нет первого УТП',
-    MISSING_UTP_2: 'Нет второго УТП',
-    MISSING_WATER_RESISTANCE: 'Не найдена водозащита',
-    MISSING_CASE_SIZE: 'Не найден размер корпуса',
-    MISSING_SERIES: 'Не найдена обязательная серия',
-    TITLE_SERIES_MISMATCH: 'Серия на карточке не совпадает',
-    TITLE_BRAND_MISMATCH: 'Бренд в заголовке не совпадает',
-    TITLE_MODEL_MISMATCH: 'Код модели в заголовке не совпадает',
-    MISSING_TITLE_BRAND: 'Не найден бренд в заголовке',
-    MISSING_TITLE_MODEL: 'Не найден код модели в заголовке',
-    UNCERTAIN_TEXT: 'Есть неуверенно прочитанные поля',
-    FACTS_INCOMPLETE_RESPONSE: 'Ответ постпроверки оборвался до полного JSON',
-    FACTS_PARSE_ERROR: 'Ответ постпроверки не удалось разобрать',
-    EMPTY_FACTS: 'Постпроверка не содержит распознанного текста'
-  };
-  return labels[code] || code;
 }
 
 function renderFactsPanel(record) {
@@ -647,31 +670,25 @@ function renderFactsPanel(record) {
     return;
   }
   const modelName = record?.modelName || record?.fileName || '';
-  const warnings = effectiveFactsWarnings(facts, modelName);
   const seriesRow = factsSeriesPolicy(facts, modelName) === 'forbidden'
-    ? '' : `<div><dt>Серия</dt><dd>${escapeHtml(facts.titleSeries || '—')}</dd></div>`;
+    ? '' : `<div><dt>Серия</dt><dd data-fact-value="titleSeries">${escapeHtml(facts.titleSeries || '—')}</dd></div>`;
   panel.innerHTML = `
     <div class="facts-title">Спецификация</div>
     <dl class="facts-grid">
-      <div><dt>Бренд</dt><dd>${escapeHtml(displayFactsTitleBrand(facts, modelName) || '—')}</dd></div>
+      <div><dt>Бренд</dt><dd data-fact-value="titleBrand">${escapeHtml(displayFactsTitleBrand(facts, modelName) || '—')}</dd></div>
       ${seriesRow}
-      <div><dt>Модель</dt><dd>${escapeHtml(facts.titleModel || '—')}</dd></div>
-      <div><dt>УТП 1</dt><dd>${escapeHtml(facts.utp1 || '—')}</dd></div>
-      <div><dt>УТП 2</dt><dd>${escapeHtml(facts.utp2 || '—')}</dd></div>
-      <div><dt>Водозащита</dt><dd>${escapeHtml(facts.waterResistance || '—')}</dd></div>
-      <div><dt>Размер корпуса</dt><dd>${escapeHtml(facts.caseSize || '—')}</dd></div>
-    </dl>
-    <div class="facts-warnings ${warnings.length ? 'has-warnings' : ''}">
-      ${warnings.length
-        ? warnings.map((code) => `<div>⚠ ${escapeHtml(warningLabel(code))}</div>`).join('')
-        : '<div>Автоматических замечаний нет</div>'}
-    </div>`;
+      <div><dt>Модель</dt><dd data-fact-value="titleModel">${escapeHtml(facts.titleModel || '—')}</dd></div>
+      <div><dt>УТП 1</dt><dd data-fact-value="utp1">${escapeHtml(facts.utp1 || '—')}</dd></div>
+      <div><dt>УТП 2</dt><dd data-fact-value="utp2">${escapeHtml(facts.utp2 || '—')}</dd></div>
+      <div><dt>Водозащита</dt><dd data-fact-value="waterResistance">${escapeHtml(facts.waterResistance || '—')}</dd></div>
+      <div><dt>Размер корпуса</dt><dd data-fact-value="caseSize">${escapeHtml(facts.caseSize || '—')}</dd></div>
+    </dl>`;
 }
 
 async function renderViewer() {
-  if (viewerIndex < 0 || viewerIndex >= filtered.length) return;
+  const accepted = currentViewerRecord();
+  if (!accepted) return;
   const sequence = ++viewerRenderSequence;
-  const accepted = filtered[viewerIndex];
   const versions = galleryVersionsForRecord(accepted, allRevisions);
   const record = versions.find(item => item.generationId === viewerGenerationId) || accepted;
   viewerGenerationId = record.generationId;
@@ -682,14 +699,14 @@ async function renderViewer() {
   const meta = recordMeta(record);
   $('viewerTitle').textContent = record.modelName || record.fileName || 'Без названия';
   $('viewerMeta').textContent = `${meta.brand} · ${meta.sale} · ${meta.quality} · ${formatDate(record.generatedAt)}`;
-  $('viewerCounter').textContent = `${viewerIndex + 1} / ${filtered.length}`;
+  $('viewerCounter').textContent = viewerIndex < 0 ? 'Карточка вне текущего фильтра' : `${viewerIndex + 1} / ${filtered.length}`;
   const chatUrl = /^https:\/\/chatgpt\.com\/c\/[^/?#]+/.test(String(record.chatUrl || '')) ? String(record.chatUrl) : '';
   $('viewerOpenChat').hidden = !chatUrl;
   $('viewerOpenChat').disabled = !chatUrl;
   renderFactsPanel(record);
   reviewUi.render(record, accepted);
   $('viewerPrev').disabled = viewerIndex <= 0;
-  $('viewerNext').disabled = viewerIndex >= filtered.length - 1;
+  $('viewerNext').disabled = viewerIndex < 0 || viewerIndex >= filtered.length - 1;
   $('viewerPlaceholder').hidden = false;
   $('viewerPlaceholder').textContent = 'Загрузка изображения…';
   const image = $('viewerImage');
@@ -742,6 +759,7 @@ async function renderViewer() {
   }
 }
 function viewerMove(delta) {
+  if (viewerIndex < 0) return;
   const next = viewerIndex + delta;
   if (next < 0 || next >= filtered.length) return;
   viewerIndex = next;
@@ -807,7 +825,8 @@ function exportFactsRows() {
       outputFileName: record.outputFileName || '',
       generatedAt: record.generatedAt || '',
       sourceId: record.sourceId, generationId: record.generationId, factsJobId: record.factsJobId,
-      outputHash: record.outputHash, reviewStatus: record.reviewStatus || 'unreviewed', imageTextMatchesFacts: record.imageTextMatchesFacts !== false
+      outputHash: record.outputHash, reviewStatus: record.reviewStatus || 'unreviewed', imageTextMatchesFacts: record.imageTextMatchesFacts !== false,
+      qualityIssues: allQualityIssuesByGeneration.get(record.generationId) || []
     };
   });
 }
@@ -839,20 +858,13 @@ $('refreshGallery').addEventListener('click', () => {
   loadState().catch(showError);
 });
 function selectedViewerRecord() {
-  const accepted = filtered[viewerIndex];
+  const accepted = currentViewerRecord();
   return accepted && (galleryVersionsForRecord(accepted, allRevisions).find(item => item.generationId === viewerGenerationId) || accepted);
 }
-const reviewUi = initGalleryReview({ selected: selectedViewerRecord, current: () => filtered[viewerIndex],
+const reviewUi = initGalleryReview({ selected: selectedViewerRecord, current: currentViewerRecord,
   allRecords: ({ scope = 'all' } = {}) => scope === 'filtered' ? filtered : records,
   reload: loadState, renderViewer, showError, showToast, download: downloadBlob, escapeHtml,
-  selectVersion: (sourceId, id) => {
-    if (!filtered.some(record => record.sourceId === sourceId)) {
-      $('search').value = '';
-      ['brandFilter', 'saleFilter', 'qualityFilter', 'factsFilter'].forEach(key => { $(key).value = 'all'; });
-      applyFilters();
-    }
-    openViewerBySource(sourceId); viewerGenerationId = id; renderViewer().catch(showError);
-  } });
+  selectVersion: selectViewerVersion });
 $('viewerVersion').addEventListener('change', () => { viewerGenerationId = $('viewerVersion').value; renderViewer().catch(showError); });
 $('viewerCompare').addEventListener('change', () => renderViewer().catch(showError));
 $('exportFactsJson')?.addEventListener('click', exportFactsJson);
@@ -860,6 +872,11 @@ initResultsTransfer({ reload: () => { clearThumbCache(); return loadState(); } }
 if (location.hash === '#transfer') $('resultsTransferOpen').click();
 $('search').addEventListener('input', applyFilters);
 ['brandFilter', 'saleFilter', 'qualityFilter', 'factsFilter', 'sortOrder'].forEach((id) => $(id)?.addEventListener('change', applyFilters));
+$('factsFilter').addEventListener('change', () => {
+  if ($('factsFilter').value === 'variants') { galleryView = 'comparison'; render(); }
+});
+$('cardsView').addEventListener('click', () => { galleryView = 'cards'; render(); });
+$('comparisonView').addEventListener('click', () => { galleryView = 'comparison'; render(); });
 $('loadMore').addEventListener('click', () => { shown += PAGE_SIZE; render(); });
 $('viewerClose').addEventListener('click', closeViewer);
 $('viewerPrev').addEventListener('click', () => viewerMove(-1));

@@ -9,13 +9,34 @@ export const UPDATE_ASSET_NAME = 'watch-automation-update.zip';
 export const UPDATE_PACKAGE_MANIFEST = 'watch-automation-update-package.json';
 export const UPDATE_STATE_FILE = '.watch-automation-update-state.json';
 export const AUTOMATION_STARTUP_URL = 'https://chatgpt.com/?watch_automation=1';
-export const AUTOMATION_LAUNCHER_TEMPLATE_MARKER = 'WATCH_AUTOMATION_STARTUP_TABS_V1';
+export const AUTOMATION_LAUNCHER_TEMPLATE_MARKER = 'WATCH_AUTOMATION_STARTUP_TABS_V2';
 
 const CHROME_STARTUP_URLS_PREF_VALUE = 4;
 const STARTUP_PROFILE_DIRECTORY = 'Default';
 const STARTUP_PREFERENCES_FILE = 'Preferences';
 const STARTUP_LAUNCHER_TEMPLATE = 'extension/local-service/launcher-templates/launch-automation-profile.cmd';
 const STARTUP_LAUNCHER_DESTINATION = 'launch-automation-profile.cmd';
+
+// The managed ChromeProfile is shared by application launches. An incomplete
+// source checkout must never replace its watcher or load a new extension origin
+// into that profile: unpacked extension IDs depend on their installation path.
+export async function validateAutomationInstallation(projectRoot) {
+  const root = path.resolve(projectRoot);
+  const requiredDirectories = ['extension', 'input-ref-images', 'input-watches-images'];
+  for (const name of requiredDirectories) {
+    const directory = path.join(root, name);
+    let info;
+    try {
+      info = await fs.stat(directory);
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+    }
+    if (!info?.isDirectory()) {
+      throw new Error(`В папке запуска отсутствует ${name}: ${directory}. Запусти START_AUTOGENERATION.cmd из основной установленной папки приложения. Профиль и память сохранены.`);
+    }
+  }
+  return { projectRoot: root };
+}
 
 function normalizeAutomationProfilePath(profilePath) {
   const resolved = path.resolve(String(profilePath || ''));
@@ -502,6 +523,8 @@ function Get-ManagedBrowsers {
 }
 try {
   if ($config.acknowledgementPath) { [IO.File]::WriteAllText($config.acknowledgementPath, [string]$PID) }
+  $installationCheck = & $config.nodeExecutable $config.watcherPath '--check-installation' 2>&1
+  if ($LASTEXITCODE -ne 0) { throw ('Automation installation check failed: ' + ($installationCheck -join ' ')) }
   Wait-Process -Id $config.previousPid -Timeout 30 -ErrorAction SilentlyContinue
   if (Get-Process -Id $config.previousPid -ErrorAction SilentlyContinue) { throw 'Previous local service did not stop' }
   $env:WATCH_AUTOMATION_HOST = $config.hostName

@@ -1,5 +1,5 @@
 import { zipBytes } from './portable-zip.js';
-import { CARD_FIELDS, auditCardRecords, waterInBar, sizeInMm } from './gallery-quality-utils.js';
+import { CARD_FIELDS, auditCardRecords, waterInBar, sizeInMm, QUALITY_CATEGORY_LABELS } from './gallery-quality-utils.js';
 import { factsSeriesPolicy } from './gallery-utils.js';
 
 const xml = value => String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
@@ -17,8 +17,11 @@ function sheetXml(rows, widths, { filter = true, freeze = true, reviewColumn = -
   return `<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="${ns}"><dimension ref="${range}"/><sheetViews><sheetView workbookViewId="0" showGridLines="0">${freeze ? '<pane xSplit="2" ySplit="1" topLeftCell="C2" activePane="bottomRight" state="frozen"/>' : ''}</sheetView></sheetViews><cols>${widths.map((width, i) => `<col min="${i + 1}" max="${i + 1}" width="${width}" customWidth="1"/>`).join('')}</cols><sheetData>${data}</sheetData>${filter ? `<autoFilter ref="${range}"/>` : ''}</worksheet>`;
 }
 
-export function cardWorkbookSheets(records, { customer = false, exportedAt = new Date() } = {}) {
-  const issues = auditCardRecords(records), byId = new Map();
+export function cardWorkbookSheets(records, { customer = false, exportedAt = new Date(), auditRecords = records } = {}) {
+  // Filtering exported rows must not shrink their comparison family.
+  const exportedVersions = new Set(records.map(record => record.generationId));
+  const allIssues = auditCardRecords(auditRecords, { includeResolved: true }).filter(issue => exportedVersions.has(issue.generationId));
+  const issues = allIssues.filter(issue => !issue.resolved), byId = new Map();
   for (const issue of issues) { if (!byId.has(issue.generationId)) byId.set(issue.generationId, []); byId.get(issue.generationId).push(issue); }
   const headers = ['Название часов', 'Бренд', 'Серия', 'Код модели', 'УТП 1', 'УТП 2', 'Водозащита (текст)', 'Водозащита (бар)', 'Размер (текст)', 'Размер (мм)', 'PNG', 'Статус проверки', 'Замечания', 'Комментарий проверяющего', 'Дата результата', 'ID модели', 'ID версии', 'SHA-256 PNG'];
   if (!customer) headers.push('ID извлечения', 'Чат');
@@ -26,15 +29,18 @@ export function cardWorkbookSheets(records, { customer = false, exportedAt = new
     const f = record.facts || {}, warnings = byId.get(record.generationId) || [];
     const row = [record.modelName, f.titleBrand, factsSeriesPolicy(f, record.modelName) === 'forbidden' ? '' : f.titleSeries, f.titleModel,
       f.utp1, f.utp2, f.waterResistance, waterInBar(f.waterResistance), f.caseSize, sizeInMm(f.caseSize),
-      record.deliveryFileName || record.outputFileName, record.imageTextMatchesFacts === false ? 'Требуется исправление PNG' : record.reviewStatus === 'accepted' ? 'Проверено' : 'Ожидает проверки',
+      record.deliveryFileName || record.outputFileName, record.imageTextMatchesFacts === false ? 'Требуется исправление PNG'
+        : warnings.length ? `Активных замечаний: ${warnings.length}` : record.reviewStatus === 'accepted' ? 'Карточка подтверждена' : 'Ожидает проверки',
       warnings.map(issue => issue.reason).join('\n'), record.reviewComment || '', record.generatedAt && Number.isFinite(Date.parse(record.generatedAt)) ? new Date(record.generatedAt) : '', record.sourceId, record.generationId, record.outputHash];
     if (!customer) row.push(record.factsJobId, record.chatUrl || '');
     return row;
   });
   return [
     { name: 'Карточки', rows: [headers, ...cards], reviewColumn: 13, widths: [44, 20, 22, 24, 32, 32, 26, 16, 24, 14, 42, 27, 54, 40, 22, 32, 38, 68, ...(!customer ? [38, 48] : [])] },
-    { name: 'Проверки', rows: [['Модель', 'Важность', 'Поле', 'Значение', 'Причина', 'Связанные варианты', 'ID модели', 'ID версии'], ...issues.map(i => [i.modelName, i.severity, CARD_FIELDS.find(([key]) => key === i.field)?.[1] || '', i.value, i.reason, i.related.join('\n'), i.sourceId, i.generationId])], severityColumn: 1, widths: [44, 16, 22, 28, 65, 65, 32, 38] },
-    { name: 'Инструкция', rows: [['Раздел', 'Описание'], ['Дата выгрузки', exportedAt.toLocaleString('ru-RU')], ['Источник', 'Сохранённые текущие ревизии WatchAutomation. Поля описывают текст инфографики; достоверность характеристик сверяется отдельно.'], ['Проверка', 'Отфильтруй лист Проверки по важности. Запиши решение и замечания в жёлтой колонке на листе Карточки.'], ['Единицы', 'Для сравнения 1 атм и 1 бар считаются эквивалентными 10 м заявленной водозащиты. Это маркировка, не разрешённая глубина погружения.'], ['Варианты', 'Группы Casio, Pagani Design и Tissot предполагают сходство моделей. Различия требуют проверки точных артикулов. Для остальных брендов автоматическое объединение не применяется.'], ['Серии', 'Пустая серия допустима согласно профилю бренда. Код модели хранится текстом и сохраняет все точки и нули.'], ['Редактирование Excel', 'Изменения в Excel служат проверке заказчиком. Автоматического обратного импорта Excel нет. Исправления в приложении выполняются через галерею.'], ['Версии', 'ID версии и SHA-256 связывают строку с конкретным PNG. Исходные версии сохраняются.']], widths: [24, 120], filter: false, freeze: false }
+    { name: 'Проверки', rows: [['Модель', 'Важность', 'Поле', 'Значение', 'Причина', 'Связанные варианты', 'ID модели', 'ID версии', 'Категория', 'Решение'],
+      ...allIssues.map(i => [i.modelName, i.severity, CARD_FIELDS.find(([key]) => key === i.field)?.[1] || 'Общее замечание', i.value, i.reason, i.related.join('\n'), i.sourceId, i.generationId,
+        QUALITY_CATEGORY_LABELS[i.category] || i.category, i.resolved ? 'Подтверждено для этой версии' : 'Требует проверки'])], severityColumn: 1, widths: [44, 16, 22, 28, 65, 65, 32, 38, 28, 34] },
+    { name: 'Инструкция', rows: [['Раздел', 'Описание'], ['Дата выгрузки', exportedAt.toLocaleString('ru-RU')], ['Источник', 'Сохранённые текущие ревизии WatchAutomation. Поля описывают текст инфографики; достоверность характеристик сверяется отдельно.'], ['Проверка', 'Отфильтруй лист Проверки по категории и решению «Требует проверки». Запиши комментарий в жёлтой колонке на листе Карточки. Подтверждение отдельного замечания сохраняется в галерее для выбранной версии.'], ['Единицы', 'Для сравнения 1 атм и 1 бар считаются эквивалентными 10 м заявленной водозащиты. Это маркировка, не разрешённая глубина погружения.'], ['Варианты', 'Группы Casio, Pagani Design и Tissot предполагают сходство моделей. Различия требуют проверки точных артикулов. Для остальных брендов автоматическое объединение не применяется.'], ['Серии', 'Пустая серия допустима согласно профилю бренда. Код модели хранится текстом и сохраняет все точки и нули.'], ['Редактирование Excel', 'Изменения в Excel служат проверке заказчиком. Автоматического обратного импорта Excel нет. Исправления в приложении выполняются через галерею.'], ['Версии', 'ID версии и SHA-256 связывают строку с конкретным PNG. Исходные версии сохраняются.']], widths: [24, 120], filter: false, freeze: false }
   ];
 }
 

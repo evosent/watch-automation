@@ -123,7 +123,8 @@ const AUTOMATION_CONTENT_SCRIPT_FILES = [
   'overlay.js',
   'facts-json-utils.js',
   'chatgpt-adapter.js',
-  'content-script.js'
+  'content-script.js',
+  'card-edit-content.js'
 ];
 const AUDIT_ALARM_NAME = 'watch-automation-generation-audit';
 const AUDIT_INTERVAL_MS = 5000;
@@ -8696,7 +8697,7 @@ async function startRun(options = {}) {
     throw new Error('Канонический учёт изменился во время предварительной проверки. Обнови список очереди и запусти проверку ещё раз.');
   }
   const assignments = await withStateLock(async () => {
-    if (await cardEditController.busy()) throw new Error('Заверши проверку редактируемой карточки перед запуском прогона');
+    if (await cardEditController.busy()) throw new Error('Дождись сохранения редактируемого изображения или отмени редактирование перед запуском прогона');
     const updateLock = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']);
     if (updateLock.resultsImportJournal) throw new Error('Завершается импорт результатов');
     if (updateLock.manualExtensionUpdateLock?.active) {
@@ -9707,6 +9708,16 @@ function isIdentityMigrationSafeWhileIdle(run, sessionRestartIntent) {
 
 async function buildControlDiagnosticSnapshot() {
   const value = await ensureGenerationMemoryState();
+  let cardEdit = null;
+  try {
+    const { cardEditJob: job } = await chrome.storage.local.get('cardEditJob');
+    if (job) cardEdit = {
+      id: job.id, stage: job.stage, error: job.error || null, tabId: job.tabId,
+      sourceId: job.base?.sourceId, generationId: job.base?.generationId,
+      changes: job.changes, startedAt: job.startedAt, deadline: job.deadline,
+      stageDeadline: job.stageDeadline, events: job.events
+    };
+  } catch (_) { /* Optional edit telemetry must not suppress the run archive. */ }
   let runArchive = null;
   let runArchiveError = null;
   try {
@@ -9785,6 +9796,7 @@ async function buildControlDiagnosticSnapshot() {
       running: memoryItems.filter((item) => item.status === 'running').length,
       notReady: memoryItems.filter((item) => item.status === 'not_ready').length
     },
+    cardEdit,
     activeMemoryItems: memoryItems
       .filter((item) => item.status === 'running' || item.lastError)
       .slice(-500)
@@ -13856,7 +13868,14 @@ async function assertCardEditIdle() {
 const cardEditController = createCardEditController({ lock: withStateLock,
   buildFactsPrompt: buildFactsExtractionPrompt, normalizeFacts: normalizeExtractedFacts,
   refreshAccounting: () => refreshCanonicalAccountingSnapshot({ force: true }),
-  runIsActive: run => Boolean(run && !['DONE', 'STOPPED', 'IDLE'].includes(run.state)) });
+  runIsActive: run => Boolean(run && !['DONE', 'STOPPED', 'IDLE'].includes(run.state)),
+  prepareTab: async (tabId, id) => {
+    await waitTabReady(tabId, 60000);
+    // Bind by tab ID even when a locale/login redirect removed the URL marker.
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['card-edit-content.js'] });
+    const response = await sendTabMessage(tabId, { type: 'CARD_EDIT_START', id }, 5000);
+    if (!response?.ok || !response.value?.ready) throw new Error('Вкладка ChatGPT не подтвердила готовность к редактированию');
+  } });
 chrome.alarms.onAlarm.addListener(alarm => { void cardEditController.onAlarm(alarm).catch(() => {}); });
 chrome.downloads.onChanged.addListener(delta => { void cardEditController.onDownload(delta).catch(() => {}); });
 chrome.tabs.onRemoved.addListener(tabId => { void cardEditController.onTabRemoved(tabId).catch(() => {}); });
@@ -13874,12 +13893,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const rows = galleryRecordsFromAccountingSnapshot(snapshot);
       const ids = new Set(Array.isArray(message.generationIds) ? message.generationIds : []);
       const accepted = rows.filter(r => ids.has(r.generationId) && r.reviewStatus === 'accepted' && r.imageTextMatchesFacts !== false);
-      if (!accepted.length) throw new Error('В выбранных карточках нет версий, подтверждённых кнопкой «Принять версию»');
+      if (!accepted.length) throw new Error('Сначала подтверди проверку выбранных карточек в просмотре галереи');
       return resultsTransferRequest('customer', { method: 'POST', body: { records: accepted } });
     })().then(value => sendResponse({ ok: true, value })).catch(error => sendResponse({ ok: false, error: error.message }));
     return true;
   }
-  if (['GET_CARD_EDIT', 'START_CARD_EDIT', 'SAVE_CARD_FACTS', 'CANCEL_CARD_EDIT', 'REVIEW_CARD_VERSION',
+  if (['GET_CARD_EDIT', 'START_CARD_EDIT', 'SAVE_CARD_FACTS', 'CANCEL_CARD_EDIT', 'REVIEW_CARD_VERSION', 'REVIEW_CARD_ISSUE',
     'CARD_EDIT_CLAIM', 'CARD_EDIT_STAGE', 'CARD_EDIT_RESULT', 'CARD_EDIT_ERROR'].includes(message?.type)) {
     const pageEvent = message.type.startsWith('CARD_EDIT_');
     const origin = sender?.url || sender?.tab?.url || '';
@@ -13887,7 +13906,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: 'Редактирование доступно из галереи расширения' }); return false;
     }
     cardEditController.handle(message, sender).then(async value => {
-      if (['REVIEW_CARD_VERSION', 'SAVE_CARD_FACTS'].includes(message.type)) await refreshCanonicalAccountingSnapshot({ force: true });
+      if (['REVIEW_CARD_VERSION', 'REVIEW_CARD_ISSUE', 'SAVE_CARD_FACTS'].includes(message.type)) await refreshCanonicalAccountingSnapshot({ force: true });
       sendResponse({ ok: true, value });
     }).catch(error => sendResponse({ ok: false, error: error.message }));
     return true;

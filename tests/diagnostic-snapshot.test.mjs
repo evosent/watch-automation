@@ -113,7 +113,11 @@ test('local diagnostic control returns the same complete run archive as the manu
   const calls = [];
   const context = vm.createContext({
     ensureGenerationMemoryState: async () => value,
-    chrome: { storage: { local: {} }, runtime: { getManifest: () => ({ version: '0.3.52' }) } },
+    chrome: { storage: { local: { get: async () => ({ cardEditJob: {
+      id: 'edit', stage: 'preparing', tabId: 9, base: { sourceId: 'casio:GA21001A', generationId: 'original', facts: { private: true } },
+      fields: { private: true }, prompt: 'private prompt', file: { dataUrl: 'private PNG' },
+      changes: [{ key: 'utp1', before: 'old', after: 'new' }], events: [{ stage: 'preparing' }]
+    } }) } }, runtime: { getManifest: () => ({ version: '0.3.52' }) } },
     diagnosticOutbox: { read: async () => null },
     getRunDiagnostic: async () => archive,
     listRunDiagnostics: async () => [],
@@ -133,6 +137,11 @@ test('local diagnostic control returns the same complete run archive as the manu
   assert.equal(snapshot.generationMemorySummary.total, 3);
   assert.equal(snapshot.generationMemorySummary.running, 1);
   assert.equal(snapshot.activeMemoryItems.length, 2);
+  assert.equal(snapshot.cardEdit.stage, 'preparing');
+  assert.equal(snapshot.cardEdit.generationId, 'original');
+  assert.equal(snapshot.cardEdit.events.length, 1);
+  assert.equal(snapshot.cardEdit.prompt, undefined); assert.equal(snapshot.cardEdit.file, undefined);
+  assert.equal(snapshot.cardEdit.fields, undefined); assert.equal(snapshot.cardEdit.base, undefined);
   assert.deepEqual(Array.from(snapshot.domSnapshots), []);
 });
 
@@ -153,7 +162,7 @@ test('local diagnostic control captures DOM from tracked ChatGPT tabs in the aut
     URL,
     ensureGenerationMemoryState: async () => value,
     chrome: {
-      storage: { local: {} },
+      storage: { local: { get: async () => ({}) } },
       runtime: { getManifest: () => ({ version: '0.3.52' }) },
       tabs: { query: async (query) => tabs.filter((tab) => tab.windowId === query.windowId) }
     },

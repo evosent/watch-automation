@@ -1,6 +1,11 @@
 import { isLegacyPaganiBrandStack, titleLayoutSpecFor, titleLayoutWarnings, displayTitleBrand } from './title-layout-utils.js';
 
 const PLACEHOLDER_TEXT = /^(?:—|–|-|_+|null|undefined|n\/?a|нет|неизвестно)$/i;
+const COMPUTED_FACT_WARNING_CODES = new Set([
+  'MISSING_UTP_1', 'MISSING_UTP_2', 'MISSING_WATER_RESISTANCE', 'MISSING_CASE_SIZE',
+  'MISSING_TITLE_BRAND', 'MISSING_TITLE_MODEL', 'MISSING_SERIES', 'EMPTY_FACTS',
+  'TITLE_BRAND_MISMATCH', 'TITLE_SERIES_MISMATCH', 'TITLE_MODEL_MISMATCH'
+]);
 
 export function physicalPngCount(activePngCount, archivedPngCount = 0) {
   return Math.max(0, Math.trunc(Number(activePngCount) || 0))
@@ -23,7 +28,15 @@ export function displayFactsTitleBrand(facts, modelName = '') {
 
 export function effectiveFactsWarnings(facts, modelName = '') {
   if (!facts || typeof facts !== 'object') return [];
-  const warnings = new Set(Array.isArray(facts.warnings) ? facts.warnings.filter(Boolean) : []);
+  // These warnings describe current field values and title-layout policy. Old
+  // revisions may contain an earlier computed result, so retain only warnings
+  // that came from extraction and recalculate every policy-driven code below.
+  const warnings = new Set(Array.isArray(facts.warnings)
+    ? facts.warnings.filter((warning) => {
+      const code = typeof warning === 'string' ? warning : warning?.code || warning?.warning;
+      return warning && !COMPUTED_FACT_WARNING_CODES.has(String(code || warning).trim());
+    })
+    : []);
   const seriesPolicy = factsSeriesPolicy(facts, modelName);
   const legacyPaganiStack = isLegacyPaganiBrandStack(facts, modelName);
 

@@ -1,7 +1,13 @@
 @echo off
 setlocal
-rem WATCH_AUTOMATION_STARTUP_TABS_V1
+rem WATCH_AUTOMATION_STARTUP_TABS_V2
 set "ROOT=%~dp0"
+rem Validate this installation before touching the shared watcher or profile.
+rem A source worktree without the photo library must not open an empty copy.
+where node >nul 2>nul
+if errorlevel 1 goto node_missing
+node "%ROOT%dev\watch-extension.mjs" --check-installation
+if errorlevel 1 exit /b 1
 rem Keep Chrome's writable profile outside the package. This lets the ZIP live
 rem on a read-only folder, USB drive, or a shared directory.
 set "PROFILE=%LocalAppData%\WatchAutomation\ChromeProfile"
@@ -24,8 +30,9 @@ start "Watch Automation watcher" /min "%ComSpec%" /d /c call "%ROOT%watch-extens
 rem Give the local service a short head start. Chrome may open before this
 rem completes; the extension will retry, but this avoids the common first
 rem gallery scan racing watcher startup.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ok=$false; for($i=0;$i -lt 20;$i++){ try { $h=Invoke-RestMethod -UseBasicParsing -TimeoutSec 1 'http://127.0.0.1:17321/health'; if($h.ok -and [int]$h.apiVersion -ge 7){$ok=$true; break} } catch {}; Start-Sleep -Milliseconds 250 }; if(-not $ok){exit 2}" >nul 2>nul
-if errorlevel 2 echo Watcher не подтвердил API v7. Галерея покажет диагностический статус.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$expectedRoot=[IO.Path]::GetFullPath($env:ROOT).TrimEnd([char]92,[char]47); $ok=$false; for($i=0;$i -lt 20;$i++){ try { $h=Invoke-RestMethod -UseBasicParsing -TimeoutSec 1 'http://127.0.0.1:17321/health'; if($h.ok -and [int]$h.apiVersion -ge 7 -and [IO.Path]::GetFullPath($h.projectRoot).TrimEnd([char]92,[char]47) -eq $expectedRoot){$ok=$true; break} } catch {}; Start-Sleep -Milliseconds 250 }; if(-not $ok){exit 2}" >nul 2>nul
+if errorlevel 2 echo Локальный сервис не подтвердил папку приложения. Chrome не запущен, профиль сохранен.
+if errorlevel 2 exit /b 1
 goto watcher_ready
 
 :node_missing

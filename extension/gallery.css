@@ -199,11 +199,66 @@ html:has(.viewer[open]) { overflow: hidden; }
 .review-buttons { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
 .review-buttons button { padding:10px; border:1px solid var(--line); border-radius:10px; background:var(--panel-2); color:var(--text); cursor:pointer; font:inherit; font-size:12px; }
 .review-buttons button:disabled { opacity:.5; cursor:wait; }
-.card-editor { display:grid; gap:12px; }
-.card-editor label { display:grid; gap:6px; font-size:12px; color:var(--muted); }
-.card-editor textarea { width:100%; resize:vertical; font:inherit; font-size:14px; padding:8px; color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:8px; }
-.card-editor textarea[readonly] { opacity:.65; }
-.review-comment { display:grid; gap:6px; margin:12px 0; font-size:12px; color:var(--muted); }
-.review-comment textarea { width:100%; resize:vertical; padding:8px; font:inherit; color:var(--text); border:1px solid var(--line); border-radius:8px; background:var(--bg); }
+.spec-edit-tools { margin:-4px 0 20px; }
+.spec-edit-toggle { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel-2); color:var(--text); font:inherit; font-size:12px; cursor:pointer; }
+.spec-edit-toggle:disabled { opacity:.5; cursor:default; }
+.facts-grid textarea { display:block; box-sizing:border-box; width:100%; min-height:40px; resize:vertical; font:inherit; font-size:14px; line-height:1.5; padding:8px; color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:8px; }
+.facts-grid textarea:focus { outline:2px solid var(--accent); outline-offset:1px; }
+.spec-edit-actions { margin-top:16px; }
+.spec-edit-actions > .button { width:100%; white-space:normal; }
+.spec-edit-actions [hidden] { display:none; }
+.spec-edit-error, .spec-edit-status.has-error { color:var(--bad); }
+.spec-edit-error, .spec-edit-status { font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+.spec-edit-status .review-buttons { margin-bottom:0; }
 .card-edit-status { display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding:14px; margin-bottom:20px; border:1px solid var(--line); border-radius:12px; font-size:13px; }
 .card-edit-status[hidden] { display:none; }
+
+.gallery-review-toolbar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; margin:0 0 20px; }
+.gallery-view-switch { display:inline-flex; gap:4px; padding:4px; border:1px solid var(--line-soft); border-radius:12px; background:var(--panel); }
+.gallery-view-switch button { border:0; border-radius:8px; padding:8px 12px; color:var(--muted); background:transparent; cursor:pointer; font-size:13px; }
+.gallery-view-switch button[aria-pressed="true"] { background:#1b3154; color:var(--text); }
+.gallery-review-toolbar > .review-note { max-width:700px; }
+.card-quality-review { border-top:1px solid var(--line); margin-top:20px; padding-top:16px; }
+.card-quality-review h3, .quality-family h3 { margin:0 0 8px; font-size:15px; font-weight:600; }
+.card-quality-review-header { display:flex; flex-wrap:wrap; align-items:center; gap:4px 12px; }
+.quality-active-count { color:var(--warning); font-size:12px; }
+.quality-version-context, .quality-empty, .quality-family-note, .comparison-groups-legend { color:var(--muted); font-size:12px; line-height:1.6; }
+.quality-family header { display:flex; flex-wrap:wrap; gap:4px 10px; font-size:12px; color:var(--muted); }
+.quality-family-active { color:var(--warning); }
+.quality-issue-reason { color:var(--warning); }
+.quality-issue-facts > div { margin-top:6px; }
+.quality-issue-facts code { font:inherit; white-space:normal; }
+.quality-issue-related ul { padding-left:16px; }
+.quality-issue-related li { margin:8px 0; }
+.quality-context-label { color:var(--muted); }
+.quality-current-indicator { display:block; color:var(--accent); font-size:11px; margin-top:3px; }
+.card-quality-review h4, .quality-category h4 { margin:18px 0 8px; font-size:12px; color:var(--muted); font-weight:600; }
+.quality-issue { margin:8px 0; padding:12px; border:1px solid #6b533340; border-radius:10px; background:#302b233b; font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+.quality-issue p { margin:4px 0 8px; }
+.quality-issue strong { color:var(--warning); font-weight:600; }
+.quality-issue dl { margin:8px 0; }
+.quality-issue dt { color:var(--muted); }
+.quality-issue dd { margin:2px 0 8px; }
+.quality-issue button, .comparison-table button { border:1px solid var(--line); border-radius:8px; padding:7px 9px; background:var(--panel-2); color:var(--text); cursor:pointer; font-size:12px; text-align:left; }
+.quality-issue button:hover, .comparison-table button:hover { border-color:var(--accent); }
+.quality-issue .review-buttons { margin-bottom:0; }
+.quality-resolved { margin-top:14px; font-size:12px; color:var(--muted); }
+.quality-resolved > summary { padding:8px 0; }
+.quality-resolved .quality-issue { background:var(--panel); border-color:var(--line-soft); }
+.quality-resolved .quality-issue strong { color:var(--muted); }
+.quality-family { margin:20px 0 4px; }
+.comparison-groups { display:grid; gap:20px; }
+.comparison-group { min-width:0; border:1px solid var(--line); border-radius:14px; padding:20px; background:var(--panel); }
+.comparison-group h2, .comparison-group h3 { margin:0; font-size:18px; }
+.comparison-group header { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; justify-content:space-between; }
+.comparison-table-wrap { max-width:100%; overflow-x:auto; margin-top:12px; }
+.comparison-table { width:100%; min-width:440px; border-collapse:collapse; font-size:12px; line-height:1.5; }
+.comparison-table th, .comparison-table td { padding:10px 8px; text-align:left; border-bottom:1px solid var(--line-soft); vertical-align:top; overflow-wrap:anywhere; }
+.comparison-table th { color:var(--muted); font-weight:500; }
+.comparison-table .is-different { background:#3a2d1b66; color:var(--warning); }
+.comparison-table .is-current { box-shadow:inset 3px 0 0 var(--accent); }
+.comparison-table .is-current td:first-child { padding-left:12px; }
+.comparison-table caption { text-align:left; margin-bottom:8px; color:var(--muted); }
+.comparison-group .comparison-table { min-width:560px; font-size:13px; }
+@media (min-width:801px) { .viewer-body { grid-template-columns:44px minmax(0,1fr) minmax(330px,410px) 44px; } }
+@media (max-width:520px) { .gallery-view-switch { width:100%; } .gallery-view-switch button { flex:1; } .comparison-group { padding:14px; } }

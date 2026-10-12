@@ -45,17 +45,37 @@ window.chrome = { storage: { onChanged: { addListener: fn => listeners.push(fn) 
     window.fixtureMessages.push(structuredClone(message));
     return { ok: true, value: await ctrl.handle(message, {}) };
   } catch (error) { return { ok: false, error: error.message }; }
- } }, downloads: { search: async () => [], download: async () => 1 },
+ } }, downloads: { search: async () => storage.fixtureDownload ? [storage.fixtureDownload] : [], download: async options => {
+   storage.fixtureDownload = { id: 1, state: 'complete', filename: 'D:/Fixture/' + options.filename }; return 1;
+ } },
  tabs: { create: async () => ({ id: 9 }), get: async () => ({ id: 9 }), sendMessage: async () => {} },
  alarms: { create: async () => {}, clear: async () => {} } };
 window.fixtureMessages = [];
-for (const r of revisions) await upsertGenerationRevision(r);
-await replaceModelCatalog(models);
+window.fixtureStorage = storage;
+window.fixtureRefresh = async () => chrome.storage.local.set({ accountingSnapshot: await snapshot() });
+window.fixtureFinishEdit = async () => {
+ const job = storage.cardEditJob, sender = { tab: { id: 9 } };
+ const payload = await ctrl.handle({ type: 'CARD_EDIT_CLAIM', requestedId: job.id }, sender);
+ await ctrl.handle({ type: 'CARD_EDIT_STAGE', id: job.id, stage: 'submitted' }, sender);
+ await ctrl.handle({ type: 'CARD_EDIT_STAGE', id: job.id, stage: 'extracting' }, sender);
+ await ctrl.handle({ type: 'CARD_EDIT_RESULT', id: job.id, dataUrl: payload.file.dataUrl, rawFacts: JSON.stringify(job.fields), chatUrl: 'https://chatgpt.com/c/fixture-edit' }, sender);
+ return storage.cardEditJob;
+};
+window.fixtureFailEdit = async () => {
+ const job = storage.cardEditJob;
+ await ctrl.handle({ type: 'CARD_EDIT_ERROR', id: job.id, error: 'Проверочный сбой прикрепления' }, { tab: { id: 9 } });
+};
+// Keep confirmations and accepted pointers across reloads for persistence QA.
+if (!(await getAllGenerationRevisions()).length) {
+ for (const r of revisions) await upsertGenerationRevision(r);
+ await replaceModelCatalog(models);
+}
 await import('/extension/gallery.js');
 `;
 http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, origin);
+    if (url.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
     if (url.pathname === '/fixture.js') { res.setHeader('Content-Type', 'text/javascript'); return res.end(fixture); }
     if (url.pathname === '/health') { res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify({ ok: true, service: 'watch-extension', apiVersion: 8 })); }
     if (url.pathname === '/output-files') { res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify({ ok: true, root: 'D:/Fixture/WatchAutomation', files: [] })); }
@@ -68,7 +88,7 @@ http.createServer(async (req, res) => {
     const file = path.resolve(root, '.' + relative);
     if (!file.startsWith(root + path.sep) || !relative.startsWith('/extension/')) { res.writeHead(404); return res.end(); }
     let bytes = await readFile(file);
-    if (file.endsWith('gallery.html')) bytes = Buffer.from(bytes.toString().replace('<script type="module" src="gallery.js"></script>', '<script type="module" src="/fixture.js"></script>'));
+    if (file.endsWith('gallery.html')) bytes = Buffer.from(bytes.toString().replace('href="gallery.css"', 'href="/extension/gallery.css"').replace('<script type="module" src="gallery.js"></script>', '<script type="module" src="/fixture.js"></script>'));
     if (file.endsWith('gallery.js')) bytes = Buffer.from(bytes.toString().replace("const WATCHER_BASE = 'http://127.0.0.1:17321'", "const WATCHER_BASE = '" + origin + "'"));
     res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html'); res.end(bytes);
   } catch (error) { res.writeHead(500); res.end(error.message); }
