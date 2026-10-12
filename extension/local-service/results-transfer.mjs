@@ -4,8 +4,10 @@ import path from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { RESULTS_PACKAGE_FORMAT, RESULTS_PACKAGE_VERSION, MAX_RESULT_RECORDS,
-  portableResult, validateResultsManifest } from '../results-transfer-utils.js';
+  portableResult, portableRevisionKey, validateResultsManifest } from '../results-transfer-utils.js';
 import { MAX_RESULTS_ARCHIVE_BYTES, pngMetadata, writeResultsZip, extractResultsZip } from './results-archive.mjs';
+import { buildCardWorkbook } from '../card-workbook.js';
+import { auditCardRecords } from '../gallery-quality-utils.js';
 
 const MAX_IMAGE_BYTES = 64 * 1024 * 1024;
 async function safeDirectory(directory) {
@@ -86,6 +88,34 @@ export function createResultsTransferManager({ outputRoot }) {
     })().catch((error) => { job.phase = 'error'; job.error = error.message; cache.set(job.id, structuredClone(job)); });
   };
   return {
+    async startCustomerExport(records, owner) {
+      if (!Array.isArray(records) || !records.length || records.length > MAX_RESULT_RECORDS) throw new Error('Выбери от 1 до 5000 проверенных карточек');
+      if (records.some(r => r.reviewStatus !== 'accepted' || r.imageTextMatchesFacts === false || r.factsStatus !== 'ok')) throw new Error('Выгружать можно только проверенные версии с согласованными характеристиками');
+      if (records.some(r => portableResult(r).factsStatus !== 'ok')) throw new Error('Спецификация должна быть привязана к точному PNG');
+      const job = { id: randomUUID(), owner, kind: 'export', customer: true, phase: 'exporting', processed: 0, total: records.length, skipped: [] };
+      await save(job);
+      launch(job, async () => {
+        const { root, directory } = await pathsFor(job.id), items = [], entries = [];
+        for (const record of records) {
+          const file = await readPng(record.outputPath, root);
+          if (file.metadata.sha256 !== record.outputHash) throw new Error(`PNG изменился: ${record.modelName}`);
+          const stem = String(record.facts.titleModel || 'watch').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+          const brand = String(record.profileId || record.facts.profileId || 'watches').replace(/[^A-Za-z0-9_-]/g, '_');
+          const name = `images/${brand}/${stem}__${items.length + 1}_${file.metadata.sha256.slice(0, 12)}.png`;
+          const staged = path.join(directory, 'images', `${items.length}.png`);
+          await fs.mkdir(path.dirname(staged), { recursive: true }); await fs.writeFile(staged, file.bytes, { flag: 'wx' });
+          entries.push({ name, path: staged }); items.push({ ...record, deliveryFileName: name });
+          job.processed++; await save(job);
+        }
+        const issues = auditCardRecords(items);
+        entries.unshift({ name: 'Карточки.xlsx', bytes: Buffer.from(buildCardWorkbook(items, { customer: true })) },
+          { name: 'Проверка.txt', bytes: Buffer.from(`Карточек: ${items.length}\nЗамечаний: ${issues.length}\nХарактеристики требуют сверки с точными артикулами производителя.\nФайлы привязаны к строкам Excel по ID версии и SHA-256.\n`) });
+        await writeResultsZip(path.join(directory, 'results.zip'), entries, { allowedEntry: name => ['Карточки.xlsx', 'Проверка.txt'].includes(name) || /^images\/[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+\.png$/.test(name) });
+        await fs.rm(path.join(directory, 'images'), { recursive: true, force: true });
+        job.phase = 'ready'; job.count = items.length; await save(job);
+      });
+      return job;
+    },
     async startExport(records, owner) {
       if (!Array.isArray(records) || !records.length || records.length > MAX_RESULT_RECORDS) throw new Error('Выбери от 1 до 5000 результатов');
       const job = { id: randomUUID(), owner, kind: 'export', phase: 'exporting', processed: 0, total: records.length, skipped: [] };
@@ -96,7 +126,7 @@ export function createResultsTransferManager({ outputRoot }) {
         for (const record of records) {
           try {
             const portable = portableResult(record);
-            const key = `${portable.sourceId}|${portable.outputHash}`;
+            const key = portableRevisionKey(portable);
             if (seen.has(key)) { job.processed++; continue; }
             seen.add(key);
             const file = await readPng(record.outputPath, root);

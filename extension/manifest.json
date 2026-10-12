@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Автогенерация",
-  "version": "0.3.53",
+  "version": "0.3.54",
   "description": "Автогенерация карточек часов: фоновые OCR-проверки и атомарные ревизии PNG, характеристик и ChatGPT-чатов.",
   "permissions": [
     "tabs",
@@ -34,7 +34,8 @@
         "overlay.js",
         "facts-json-utils.js",
         "chatgpt-adapter.js",
-        "content-script.js"
+        "content-script.js",
+        "card-edit-content.js"
       ],
       "run_at": "document_idle"
     }

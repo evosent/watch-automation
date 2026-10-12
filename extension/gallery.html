@@ -20,10 +20,12 @@
         <details class="export-menu">
           <summary class="button secondary">Экспорт спецификаций <span aria-hidden="true">⌄</span></summary>
           <div class="export-options">
-            <button id="exportFactsCsv" class="button secondary" type="button">Скачать CSV</button>
+            <label class="export-scope">Объём выгрузки<select id="exportScope"><option value="filtered">Карточки по текущим фильтрам</option><option value="all">Все карточки</option></select></label>
+            <button id="exportFactsXlsx" class="button secondary" type="button">Скачать Excel</button>
             <button id="exportFactsJson" class="button secondary" type="button">Скачать JSON</button>
           </div>
         </details>
+        <button id="exportCustomer" class="button secondary" type="button">Архив заказчику</button>
         <button id="refreshGallery" class="button" type="button">Обновить файлы</button>
       </div>
     </header>
@@ -76,6 +78,7 @@
           <option value="all">Все</option>
           <option value="missing">Не извлечено / пусто</option>
           <option value="warnings">Есть замечания</option>
+          <option value="quality_issues">Проверка характеристик</option>
           <option value="error">Ошибка извлечения</option>
           <option value="missing_series">Серия / заголовок</option>
           <option value="missing_utp">Проблемы УТП</option>
@@ -107,6 +110,7 @@
       <p>Измени фильтры или обнови файлы.</p>
     </section>
 
+    <section id="cardEditStatus" class="card-edit-status" hidden role="status"><span id="cardEditStatusText"></span><button id="cardEditOpen" class="button secondary" type="button" hidden>Открыть новую версию</button><button id="cardEditCancel" class="button secondary" type="button" hidden>Отменить редактирование</button></section>
     <section id="grid" class="generation-grid" aria-live="polite"></section>
     <div class="load-more-wrap"><button id="loadMore" class="button secondary" type="button" hidden>Показать ещё</button></div>
   </main>
@@ -117,6 +121,8 @@
         <div class="viewer-title-wrap">
           <div class="viewer-kicker" id="viewerMeta">—</div>
           <h2 id="viewerTitle">—</h2>
+          <label class="version-control">Версия <select id="viewerVersion" aria-label="Версия карточки"></select></label>
+          <label class="compare-toggle"><input id="viewerCompare" type="checkbox"> Сравнить с текущей</label>
         </div>
         <div class="viewer-head-actions">
           <button id="viewerOpenChat" class="icon-button viewer-chat-button" type="button" title="Открыть чат, где была создана эта карточка" hidden>Чат ↗</button>
@@ -128,8 +134,8 @@
       <div class="viewer-body">
         <button id="viewerPrev" class="nav-button prev" type="button" aria-label="Предыдущая">‹</button>
         <div id="viewerStage" class="viewer-stage">
-          <div id="viewerPlaceholder" class="viewer-placeholder">Загрузка изображения…</div>
-          <img id="viewerImage" alt="" draggable="false">
+          <figure class="version-figure"><figcaption>Выбранная версия</figcaption><div id="viewerPlaceholder" class="viewer-placeholder">Загрузка изображения…</div><img id="viewerImage" alt="" draggable="false"></figure>
+          <figure id="viewerCompareFigure" class="version-figure" hidden><figcaption>Текущая версия</figcaption><img id="viewerCompareImage" alt="Текущая версия" draggable="false"><p id="viewerCompareError" class="review-note" hidden></p></figure>
         </div>
         <aside id="viewerFacts" class="viewer-facts" aria-label="Спецификация карточки"></aside>
         <button id="viewerNext" class="nav-button next" type="button" aria-label="Следующая">›</button>

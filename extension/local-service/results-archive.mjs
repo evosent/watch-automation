@@ -65,13 +65,13 @@ export function pngMetadata(bytes) {
 
 // PNGs are already compressed. Store entries sequentially; never load a whole
 // export or import archive into memory.
-export async function writeResultsZip(destination, entries) {
+export async function writeResultsZip(destination, entries, { allowedEntry = allowedName } = {}) {
   const file = await fs.open(destination, 'wx');
   const central = [];
   let offset = 0;
   try {
     for (const entry of entries) {
-      if (!allowedName(entry.name)) throw new Error('Недопустимый путь в архиве');
+      if (!allowedEntry(entry.name)) throw new Error('Недопустимый путь в архиве');
       const body = entry.bytes || await fs.readFile(entry.path);
       if (body.length > MAX_FILE_BYTES || offset + body.length > MAX_RESULTS_ARCHIVE_BYTES) throw new Error('Архив превышает допустимый размер');
       const name = Buffer.from(entry.name);

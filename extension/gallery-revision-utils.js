@@ -1,3 +1,25 @@
+export function galleryVersionsForRecord(current, revisions = []) {
+  const rows = [current, ...revisions].filter(revision => revision?.sourceId === current?.sourceId);
+  const seen = new Set();
+  return rows.flatMap(revision => {
+    if (!revision.generationId || seen.has(revision.generationId) || revision.identityQuarantined
+      || !['READY', 'REVIEW_PENDING'].includes(revision.status) || !revision.outputPath || !/^[a-f0-9]{64}$/i.test(revision.outputHash || '')) return [];
+    const facts = revision.facts || (revision.reviewStatus === 'rejected' ? revision.archivedFacts : null);
+    if (facts?.status !== 'ok' || facts.generationId !== revision.generationId
+      || facts.factsJobId !== revision.factsJobId || facts.outputHash !== revision.outputHash) return [];
+    seen.add(revision.generationId);
+    const archived = rows.find(r => r.outputHash === revision.outputHash && r.outputPath === revision.outputPath
+      && r.archivePath && r.archiveHash === revision.outputHash);
+    const outputPath = archived?.archivePath || revision.outputPath;
+    return [{ ...revision, modelName: revision.modelName || current.modelName,
+      profileId: revision.profileId || current.profileId, groupId: revision.groupId || current.groupId,
+      facts, factsStatus: 'ok', outputPath, generatedAt: revision.generatedAt || revision.completedAt,
+      artifactMode: String(outputPath).startsWith('custom://') ? 'custom' : 'watcher',
+      modifiedAt: Date.parse(revision.completedAt || revision.generatedAt || '') || 0,
+      isCurrentVersion: revision.generationId === current.generationId }];
+  }).sort((a, b) => b.modifiedAt - a.modifiedAt);
+}
+
 export function galleryRecordsFromAccountingSnapshot(snapshot, catalog = [], revisions = []) {
   // Reconciliation gates new work, while the ledger may already contain
   // individually verified accepted results. Keep those results visible while

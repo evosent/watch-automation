@@ -68,6 +68,8 @@ function workerHarness({ version = '0.3.40', lock = null, run = null, importJour
     let devReloadPollInFlight = false;
     ${[
       'withStateLock',
+      'cardEditHasActiveWork',
+      'assertCardEditIdle',
       'requestLocalExtensionUpdate',
       'readManualExtensionUpdateStatus',
       'invalidateManualExtensionUpdateStatus',
@@ -86,6 +88,15 @@ function workerHarness({ version = '0.3.40', lock = null, run = null, importJour
 }
 
 const updateLock = () => ({ active: true, targetVersion: '0.3.40', startedAt: '2026-10-05T10:00:00.000Z' });
+
+test('active card editing blocks update, restart and developer reload before contacting the watcher', async () => {
+  const h = workerHarness(); h.data.cardEditJob = { id: 'edit', stage: 'submitted' };
+  await assert.rejects(h.context.startManualExtensionUpdate(), /редактирования/);
+  await assert.rejects(h.context.retryManualExtensionRestart(), /редактирования/);
+  assert.equal((await h.context.applyManualExtensionUpdate('0.3.54')).deferred, true);
+  assert.equal((await h.context.pollDevReload()).reason, 'card_edit');
+  assert.equal(h.requests.length, 0);
+});
 
 test('manual apply requests coalesce and serialize the lock with run state', async () => {
   let finishRequest;

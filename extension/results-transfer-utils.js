@@ -14,17 +14,29 @@ const REVISION_FIELDS = [
   'generationId', 'sourceId', 'modelName', 'fileName', 'groupId', 'sourceVariantId',
   'relativePath', 'sourceHash', 'recipeHash', 'profileId', 'profileVersion', 'attempt',
   'generatedAt', 'completedAt', 'downloadedAt', 'outputHash', 'outputWidth', 'outputHeight', 'factsJobId', 'operationId',
-  'originSourceId'
+  'originSourceId', 'parentGenerationId', 'revisionKind', 'imageTextMatchesFacts', 'reviewStatus', 'reviewedAt', 'reviewComment'
 ];
 const FACTS_FIELDS = [
   'titleBrand', 'titleSeries', 'titleModel', 'utp1', 'utp2', 'waterResistance',
   'waterResistanceValue', 'waterResistanceUnit', 'caseSize', 'caseSizeValueMm',
   'warnings', 'extractedAt', 'extractorVersion', 'completion', 'profileId',
   'titleLayoutVersion', 'seriesPolicy', 'brandLineCount', 'seriesRequired',
-  'expectedTitleBrand', 'expectedTitleSeries', 'expectedTitleModel'
+  'expectedTitleBrand', 'expectedTitleSeries', 'expectedTitleModel', 'factsSource'
 ];
 const pick = (object, keys) => Object.fromEntries(keys.filter((key) => object?.[key] != null)
   .map((key) => [key, object[key]]));
+
+// Manual data revisions can refer to the same PNG while carrying different
+// facts. Their original generation ID remains stable through re-export.
+export function portableRevisionKey(record) {
+  const base = `${record.sourceId}|${String(record.outputHash).toLowerCase()}`;
+  return record.revisionKind === 'manual_facts'
+    ? `${base}|manual:${record.importedGenerationId || record.generationId}` : base;
+}
+
+function samePortableRevision(saved, incoming) {
+  return portableRevisionKey(saved) === portableRevisionKey(incoming);
+}
 
 function canonicalPortableSourceId(record) {
   const canonicalId = sourceIdFor(record.groupId, record.relativePath, record.modelName);
@@ -67,8 +79,8 @@ function canonicalPortableSourceId(record) {
 
 export function transferableRevision(record) {
   return Boolean(record?.generationId && record.sourceId && record.outputPath
-    && HASH.test(String(record.outputHash || '')) && record.reviewStatus !== 'rejected'
-    && !['GENERATING', 'PENDING', 'CANCELLED', 'FAILED', 'REJECTED'].includes(String(record.status || '').toUpperCase()));
+    && HASH.test(String(record.outputHash || '')) && !['rejected', 'pending'].includes(record.reviewStatus)
+    && !['GENERATING', 'PENDING', 'REVIEW_PENDING', 'CANCELLED', 'FAILED', 'REJECTED'].includes(String(record.status || '').toUpperCase()));
 }
 
 export function portableResult(record) {
@@ -76,7 +88,7 @@ export function portableResult(record) {
   const result = pick(record, REVISION_FIELDS);
   for (const [key, value] of Object.entries(result)) {
     if (typeof value === 'string' && (value.length > 2048 || value.includes('\0'))) throw new Error(`Некорректное поле ${key}`);
-    if (!['string', 'number'].includes(typeof value)) throw new Error(`Некорректное поле ${key}`);
+    if (!['string', 'number', 'boolean'].includes(typeof value)) throw new Error(`Некорректное поле ${key}`);
   }
   if (!result.generationId || !result.modelName || !HASH.test(String(result.outputHash || ''))) {
     throw new Error('ID модели или контрольная сумма результата некорректны');
@@ -85,6 +97,10 @@ export function portableResult(record) {
   result.originSourceId = identity.originSourceId || undefined;
   result.sourceId = identity.sourceId;
   result.outputHash = result.outputHash.toLowerCase();
+  if (record.importedGenerationId) {
+    if (typeof record.importedGenerationId !== 'string' || record.importedGenerationId.length > 2048 || record.importedGenerationId.includes('\0')) throw new Error('Некорректный исходный ID ревизии');
+    result.generationId = record.importedGenerationId;
+  }
   if (!QUEUE_GROUP_IDS.includes(result.groupId)) throw new Error('Неизвестная категория результата');
   const facts = record.facts;
   const ready = Boolean(record.factsStatus === 'ok' && facts?.status === 'ok' && result.factsJobId
@@ -104,6 +120,11 @@ export function portableResult(record) {
   result.status = ready ? 'READY' : 'IMAGE_SAVED';
   result.facts = ready ? { ...selectedFacts, status: 'ok', sourceId: result.sourceId,
     generationId: result.generationId, factsJobId: result.factsJobId, outputHash: result.outputHash } : null;
+  if (record.originalPrintedFacts) {
+    const original = pick(record.originalPrintedFacts, ['titleBrand', 'titleSeries', 'titleModel', 'utp1', 'utp2', 'waterResistance', 'caseSize']);
+    if (Object.values(original).some(v => typeof v !== 'string' || v.length > 400 || v.includes('\0'))) throw new Error('Некорректная исходная спецификация');
+    result.originalPrintedFacts = original;
+  }
   return result;
 }
 
@@ -119,7 +140,7 @@ export function validateResultsManifest(manifest) {
     exportedAt: String(manifest.exportedAt || ''), items: manifest.items.map((item) => {
       const record = portableResult(item);
       if (item.image !== `images/${record.outputHash}.png`) throw new Error('Некорректный путь PNG в архиве');
-      const key = `${record.sourceId}|${record.outputHash}`;
+      const key = portableRevisionKey(record);
       if (seen.has(key)) throw new Error('Архив содержит повторяющийся результат');
       seen.add(key);
       return { ...record, image: item.image };
@@ -134,7 +155,7 @@ export function resultsImportPreview(items, existingRevisions = []) {
   let rejected = 0;
   for (const item of normalizedItems) {
     const sameModel = saved.filter((record) => record.sourceId === item.sourceId);
-    const sameImage = sameModel.find((record) => String(record.outputHash).toLowerCase() === item.outputHash);
+    const sameImage = sameModel.find((record) => samePortableRevision(record, item));
     if (sameImage) { duplicates += 1; if (sameImage.reviewStatus === 'rejected') rejected += 1; }
     else if (sameModel.length) conflicts += 1;
   }
@@ -161,10 +182,9 @@ export function planResultsMerge(items, { revisions = [], catalog = [], queue = 
   for (const incoming of [...items].sort((a, b) => String(a.completedAt || a.generatedAt || '').localeCompare(String(b.completedAt || b.generatedAt || '')))) {
     const portable = portableResult(incoming);
     if (!incoming.outputPath) throw new Error('PNG ещё не установлен в папку результатов');
-    const same = [...saved.values()].find((record) => record.sourceId === portable.sourceId
-      && String(record.outputHash || '').toLowerCase() === portable.outputHash);
+    const same = [...saved.values()].find((record) => samePortableRevision(record, portable));
     if (same?.reviewStatus === 'rejected') continue;
-    const id = same?.generationId || `import:${portable.sourceId}:${portable.outputHash}`;
+    const id = same?.generationId || `import:${portable.sourceId}:${portable.outputHash}${portable.revisionKind === 'manual_facts' ? `:manual:${portable.generationId}` : ''}`;
     const localFactsValid = same?.factsStatus === 'ok' && same.facts?.status === 'ok'
       && same.facts.generationId === same.generationId && same.facts.factsJobId === same.factsJobId
       && String(same.facts.outputHash || '').toLowerCase() === portable.outputHash;

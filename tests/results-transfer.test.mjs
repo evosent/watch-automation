@@ -283,6 +283,7 @@ test('durable journal resumes after failure between database and queue writes; a
     history: { items: {} }, run: null, resultsImportJournal: { id: 'transfer-test', items: [item] } };
   let fail = true;
   const context = { planResultsMerge, mergeResultsDatabase, getAllGenerationRevisions, getAllModelCatalog, modelCatalogRecordsFromGroups,
+    assertCardEditIdle: async () => {},
     withStateLock: (task) => task(), getStored: async () => structuredClone(state),
     runHasActiveAutomationWork: (run) => run?.state === 'RUNNING',
     resultsTransferRequest: async () => ({ items: [item] }),

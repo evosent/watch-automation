@@ -1,4 +1,6 @@
 import './facts-json-utils.js';
+import { createCardEditController } from './card-edit-controller.js';
+import { galleryRecordsFromAccountingSnapshot } from './gallery-revision-utils.js';
 import {
   QUEUE_GROUP_IDS,
   REGENERATION_QUEUE_ID,
@@ -4187,6 +4189,7 @@ async function pollDevReload(source = 'poll') {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DEV_RELOAD_POLL_TIMEOUT_MS);
   try {
+    if (await cardEditHasActiveWork()) return { ok: true, deferred: true, reason: 'card_edit' };
     const updateState = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']).catch(() => ({}));
     if (updateState.resultsImportJournal) return { ok: true, deferred: true, reason: 'results_import' };
     if (updateState.manualExtensionUpdateLock?.active) {
@@ -4275,6 +4278,7 @@ async function pollDevReload(source = 'poll') {
     }
 
     return await withStateLock(async () => {
+      if (await cardEditHasActiveWork()) return { ok: true, deferred: true, reason: 'card_edit' };
       const latest = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']);
       if (latest.resultsImportJournal) return { ok: true, deferred: true, reason: 'results_import' };
       if (latest.manualExtensionUpdateLock?.active) {
@@ -4430,6 +4434,7 @@ async function assertManualExtensionUpdateNotApplying() {
 }
 
 async function startManualExtensionUpdate() {
+  await assertCardEditIdle();
   await assertManualExtensionUpdateNotApplying();
   const { run } = await getStored();
   if (runHasActiveAutomationWork(run)) throw new Error('Перед обновлением дождись завершения прогона или останови его.');
@@ -4445,6 +4450,7 @@ async function startManualExtensionUpdate() {
 function retryManualExtensionRestart() {
   if (manualUpdateRestartInFlight) return manualUpdateRestartInFlight;
   manualUpdateRestartInFlight = withStateLock(async () => {
+    await assertCardEditIdle();
     const { run } = await getStored();
     if (runHasActiveAutomationWork(run)) throw new Error('Перед перезапуском дождись завершения прогона или останови его.');
     const stored = await chrome.storage.local.get(['resultsImportJournal', 'manualExtensionUpdateLock', 'devAutoReload']);
@@ -4495,6 +4501,7 @@ function applyManualExtensionUpdate(targetVersion = '') {
   if (manualUpdateApplyInFlight) return manualUpdateApplyInFlight;
   manualUpdateApplyInFlight = (async () => {
     const claim = await withStateLock(async () => {
+      if (await cardEditHasActiveWork()) return { deferred: true, reason: 'Редактирование карточки ещё выполняется.' };
       const { run } = await getStored();
       if (runHasActiveAutomationWork(run)) return { deferred: true, reason: 'Рабочие вкладки ещё заняты.' };
       const stored = await chrome.storage.local.get(['manualExtensionUpdateLock', 'devAutoReload', 'resultsImportJournal']);
@@ -8689,6 +8696,7 @@ async function startRun(options = {}) {
     throw new Error('Канонический учёт изменился во время предварительной проверки. Обнови список очереди и запусти проверку ещё раз.');
   }
   const assignments = await withStateLock(async () => {
+    if (await cardEditController.busy()) throw new Error('Заверши проверку редактируемой карточки перед запуском прогона');
     const updateLock = await chrome.storage.local.get(['manualExtensionUpdateLock', 'resultsImportJournal']);
     if (updateLock.resultsImportJournal) throw new Error('Завершается импорт результатов');
     if (updateLock.manualExtensionUpdateLock?.active) {
@@ -9586,6 +9594,7 @@ async function prepareResultsExport(operationId = '') {
 
 async function completeResultsImport() {
   return withStateLock(async () => {
+    await assertCardEditIdle();
     const { resultsImportJournal: journal } = await chrome.storage.local.get('resultsImportJournal');
     if (!journal) return { skipped: true };
     const installed = await resultsTransferRequest('verify', { id: journal.id });
@@ -9610,6 +9619,7 @@ async function importInstalledResults(id) {
   const job = await resultsTransferRequest('status', { id });
   if (job.kind !== 'import' || job.phase !== 'installed') throw new Error('Сначала дождись установки PNG в папку результатов');
   await withStateLock(async () => {
+    await assertCardEditIdle();
     const stored = await getStored();
     const locks = await chrome.storage.local.get(['resultsImportJournal', 'manualExtensionUpdateLock']);
     if (runHasActiveAutomationWork(stored.run)) throw new Error('Перед импортом заверши или сбрось активный прогон');
@@ -9625,6 +9635,7 @@ async function claimResultsImport(id) {
   const job = await resultsTransferRequest('status', { id });
   if (job.kind !== 'import' || !job.items || !['ready', 'installing', 'installed', 'error'].includes(job.phase)) throw new Error('Сначала проверь архив результатов');
   return withStateLock(async () => {
+    await assertCardEditIdle();
     const stored = await getStored();
     const locks = await chrome.storage.local.get(['resultsImportJournal', 'manualExtensionUpdateLock']);
     if (runHasActiveAutomationWork(stored.run)) throw new Error('Перед импортом заверши или сбрось активный прогон');
@@ -13835,7 +13846,52 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }).catch(() => {});
 });
 
+async function cardEditHasActiveWork() {
+  const { cardEditJob: job } = await chrome.storage.local.get('cardEditJob');
+  return Boolean(job && !['ready', 'error', 'cancelled', 'accepted', 'rejected'].includes(job.stage));
+}
+async function assertCardEditIdle() {
+  if (await cardEditHasActiveWork()) throw new Error('Дождись завершения редактирования карточки или отмени его в галерее');
+}
+const cardEditController = createCardEditController({ lock: withStateLock,
+  buildFactsPrompt: buildFactsExtractionPrompt, normalizeFacts: normalizeExtractedFacts,
+  refreshAccounting: () => refreshCanonicalAccountingSnapshot({ force: true }),
+  runIsActive: run => Boolean(run && !['DONE', 'STOPPED', 'IDLE'].includes(run.state)) });
+chrome.alarms.onAlarm.addListener(alarm => { void cardEditController.onAlarm(alarm).catch(() => {}); });
+chrome.downloads.onChanged.addListener(delta => { void cardEditController.onDownload(delta).catch(() => {}); });
+chrome.tabs.onRemoved.addListener(tabId => { void cardEditController.onTabRemoved(tabId).catch(() => {}); });
+void cardEditController.reconcile().catch(() => {});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'EXPORT_CUSTOMER_PACKAGE') {
+    const origin = sender?.url || sender?.tab?.url || '';
+    if (sender?.id !== chrome.runtime.id || !origin.startsWith(chrome.runtime.getURL(''))) {
+      sendResponse({ ok: false, error: 'Выгрузка доступна из галереи' }); return false;
+    }
+    (async () => {
+      const snapshot = await refreshCanonicalAccountingSnapshot({ force: true });
+      if (snapshot.stale || !snapshot.verificationAvailable) throw new Error('Сначала заверши проверку файлов');
+      const rows = galleryRecordsFromAccountingSnapshot(snapshot);
+      const ids = new Set(Array.isArray(message.generationIds) ? message.generationIds : []);
+      const accepted = rows.filter(r => ids.has(r.generationId) && r.reviewStatus === 'accepted' && r.imageTextMatchesFacts !== false);
+      if (!accepted.length) throw new Error('В выбранных карточках нет версий, подтверждённых кнопкой «Принять версию»');
+      return resultsTransferRequest('customer', { method: 'POST', body: { records: accepted } });
+    })().then(value => sendResponse({ ok: true, value })).catch(error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (['GET_CARD_EDIT', 'START_CARD_EDIT', 'SAVE_CARD_FACTS', 'CANCEL_CARD_EDIT', 'REVIEW_CARD_VERSION',
+    'CARD_EDIT_CLAIM', 'CARD_EDIT_STAGE', 'CARD_EDIT_RESULT', 'CARD_EDIT_ERROR'].includes(message?.type)) {
+    const pageEvent = message.type.startsWith('CARD_EDIT_');
+    const origin = sender?.url || sender?.tab?.url || '';
+    if (!pageEvent && (sender?.id !== chrome.runtime.id || !origin.startsWith(chrome.runtime.getURL('')))) {
+      sendResponse({ ok: false, error: 'Редактирование доступно из галереи расширения' }); return false;
+    }
+    cardEditController.handle(message, sender).then(async value => {
+      if (['REVIEW_CARD_VERSION', 'SAVE_CARD_FACTS'].includes(message.type)) await refreshCanonicalAccountingSnapshot({ force: true });
+      sendResponse({ ok: true, value });
+    }).catch(error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
   if (message?.type === 'GET_ACCOUNTING_SNAPSHOT') {
     refreshCanonicalAccountingSnapshot({ force: message.force === true })
       .then((value) => sendResponse({ ok: true, value }))

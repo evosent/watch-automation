@@ -1,4 +1,6 @@
 import { initResultsTransfer } from './results-transfer-ui.js';
+import { initGalleryReview } from './gallery-review-ui.js';
+import { auditCardRecords } from './gallery-quality-utils.js';
 import {
   WATCH_BRAND_FILTERS,
   QUEUE_GROUP_IDS,
@@ -13,7 +15,7 @@ import {
 import {
   factsDisplayState, effectiveFactsWarnings, factsSeriesPolicy, displayFactsTitleBrand, sortGalleryRecords
 } from './gallery-utils.js';
-import { galleryRecordsFromCatalog } from './gallery-revision-utils.js';
+import { galleryRecordsFromCatalog, galleryVersionsForRecord } from './gallery-revision-utils.js';
 import {
   ACCOUNTING_SNAPSHOT_STORAGE_KEY,
   acceptAccountingSnapshot,
@@ -32,6 +34,12 @@ let outputHandle = null;
 let outputDestination = { mode: 'downloads', folderName: null, permission: 'unknown' };
 let downloadItems = [];
 let viewerIndex = -1;
+let viewerSourceId = null;
+let viewerGenerationId = null;
+let allRevisions = [];
+let qualityIssues = [];
+let viewerRenderSequence = 0;
+let compareObjectUrl = null;
 let viewerObjectUrl = null;
 let zoom = 1;
 const thumbUrls = new Map();
@@ -270,6 +278,9 @@ async function loadState() {
   if (loadSequence !== galleryLoadSequence) return;
   const accountingView = accountingSnapshot || { version: 1, entries: [], stale: true, staleReason: 'снимок готовности отсутствует' };
   records = galleryRecordsFromCatalog(catalog, currentRevisionRecords, accountingView);
+  allRevisions = currentRevisionRecords;
+  records = records.map(record => ({ ...record, versionCount: galleryVersionsForRecord(record, allRevisions).length }));
+  qualityIssues = auditCardRecords(records);
 
   const customPermission = await permission(outputHandle, 'read');
   const currentCatalogCards = records.filter((record) => !record.outsideCurrentCatalog).length;
@@ -330,6 +341,7 @@ function applyFilters() {
     const warnings = factsState.warnings;
     if (factsFilter === 'missing' && factsState.kind !== 'missing') return false;
     if (factsFilter === 'warnings' && factsState.kind !== 'warning') return false;
+    if (factsFilter === 'quality_issues' && !qualityIssues.some(issue => issue.sourceId === record.sourceId)) return false;
     if (factsFilter === 'error' && factsState.kind !== 'error') return false;
     if (factsFilter === 'missing_series' && !warnings.includes('MISSING_SERIES') && !warnings.includes('TITLE_SERIES_MISMATCH')) return false;
     if (factsFilter === 'missing_utp' && !warnings.some((item) => item === 'MISSING_UTP_1' || item === 'MISSING_UTP_2')) return false;
@@ -341,6 +353,11 @@ function applyFilters() {
   filtered = sortGalleryRecords(filtered, sortOrder, (record) => recordMeta(record).brand);
   shown = PAGE_SIZE;
   render();
+  if ($('viewer').open) {
+    viewerIndex = filtered.findIndex(item => item.sourceId === viewerSourceId);
+    if (viewerIndex < 0) closeViewer();
+    else if (!reviewUi.editing) renderViewer().catch(showError);
+  }
 }
 
 function recordMeta(record) {
@@ -368,6 +385,7 @@ function render() {
     const meta = recordMeta(record);
     const factsState = factsDisplayState(record);
     const warnings = factsState.warnings;
+    const issues = qualityIssues.filter(issue => issue.sourceId === record.sourceId);
     const factsChip = factsState.kind === 'ok'
       ? '<span class="chip good">Текст ✓</span>'
       : factsState.kind === 'warning'
@@ -381,7 +399,7 @@ function render() {
       <div class="thumb" data-open="1" role="button" tabindex="0" aria-label="Открыть ${escapeHtml(record.modelName || record.fileName || 'карточку')}">
         <div class="thumb-placeholder">Загрузка превью…</div>
         <img alt="${escapeHtml(record.modelName || record.fileName || '')}" loading="lazy">
-        <div class="thumb-badges"><span class="chip">${escapeHtml(meta.brand)}</span>${record.versionCount > 1 ? `<span class="chip">версий ${record.versionCount}</span>` : ''}${factsChip}</div>
+        <div class="thumb-badges"><span class="chip">${escapeHtml(meta.brand)}</span>${record.versionCount > 1 ? `<span class="chip">версий ${record.versionCount}</span>` : ''}${factsChip}${issues.length ? `<span class="chip warning">Проверка ${issues.length}</span>` : ''}${record.reviewStatus === 'accepted' ? '<span class="chip good">Проверено</span>' : ''}</div>
       </div>
       <div class="card-body" data-open="1">
         <div class="card-title">${escapeHtml(record.modelName || record.fileName || 'Без названия')}</div>
@@ -414,10 +432,15 @@ async function fileForRecord(record) {
   const p = await permission(outputHandle, 'read');
   if (p !== 'granted') return null;
   try {
-    const expectedPath = `custom://${outputHandle.name}/${sanitizeFilename(record.groupId)}/${sanitizeFilename(record.outputFileName)}`;
-    if (lowerPath(expectedPath) !== lowerPath(record.outputPath)) return null;
-    const group = await outputHandle.getDirectoryHandle(sanitizeFilename(record.groupId), { create: false });
-    const handle = await group.getFileHandle(record.outputFileName, { create: false });
+    const prefix = `custom://${outputHandle.name}/`;
+    if (!String(record.outputPath).startsWith(prefix)) return null;
+    const parts = record.outputPath.slice(prefix.length).split('/');
+    if (parts.some(part => !part || part === '.' || part === '..' || /[\\\0]/.test(part))) return null;
+    if (!(parts.length === 2 && parts[0] === sanitizeFilename(record.groupId))
+      && !(parts.length === 3 && parts[0] === '_archive' && parts[1] === sanitizeFilename(record.groupId))) return null;
+    let group = outputHandle;
+    for (const part of parts.slice(0, -1)) group = await group.getDirectoryHandle(part, { create: false });
+    const handle = await group.getFileHandle(parts.at(-1), { create: false });
     return await handle.getFile();
   } catch (_) { return null; }
 }
@@ -565,10 +588,15 @@ async function reject(record) {
 function openViewerBySource(sourceId) {
   viewerIndex = filtered.findIndex((item) => item.sourceId === sourceId);
   if (viewerIndex < 0) return;
+  viewerSourceId = sourceId;
+  viewerGenerationId = filtered[viewerIndex].generationId;
   $('viewer').showModal();
   renderViewer().catch(showError);
 }
 function closeViewer() {
+  ++viewerRenderSequence;
+  if (compareObjectUrl?.startsWith('blob:')) URL.revokeObjectURL(compareObjectUrl);
+  compareObjectUrl = null;
   if (viewerObjectUrl?.startsWith('blob:')) URL.revokeObjectURL(viewerObjectUrl);
   viewerObjectUrl = null;
   $('viewerImage').src = '';
@@ -642,7 +670,15 @@ function renderFactsPanel(record) {
 
 async function renderViewer() {
   if (viewerIndex < 0 || viewerIndex >= filtered.length) return;
-  const record = filtered[viewerIndex];
+  const sequence = ++viewerRenderSequence;
+  const accepted = filtered[viewerIndex];
+  const versions = galleryVersionsForRecord(accepted, allRevisions);
+  const record = versions.find(item => item.generationId === viewerGenerationId) || accepted;
+  viewerGenerationId = record.generationId;
+  viewerSourceId = record.sourceId;
+  $('viewerVersion').innerHTML = versions.map(version => `<option value="${escapeHtml(version.generationId)}">${escapeHtml(formatDate(version.generatedAt))} · ${version.isCurrentVersion ? 'текущая' : version.reviewStatus === 'pending' ? 'на проверке' : version.reviewStatus === 'rejected' ? 'отклонена' : 'сохранена'}${version.revisionKind === 'manual_facts' ? ' · ручные данные' : version.revisionKind === 'image_edit' ? ' · исправленный PNG' : ''} · ${escapeHtml(version.generationId.slice(-8))}</option>`).join('');
+  $('viewerVersion').value = record.generationId;
+  $('viewerReject').disabled = record.generationId !== accepted.generationId;
   const meta = recordMeta(record);
   $('viewerTitle').textContent = record.modelName || record.fileName || 'Без названия';
   $('viewerMeta').textContent = `${meta.brand} · ${meta.sale} · ${meta.quality} · ${formatDate(record.generatedAt)}`;
@@ -651,6 +687,7 @@ async function renderViewer() {
   $('viewerOpenChat').hidden = !chatUrl;
   $('viewerOpenChat').disabled = !chatUrl;
   renderFactsPanel(record);
+  reviewUi.render(record, accepted);
   $('viewerPrev').disabled = viewerIndex <= 0;
   $('viewerNext').disabled = viewerIndex >= filtered.length - 1;
   $('viewerPlaceholder').hidden = false;
@@ -660,8 +697,16 @@ async function renderViewer() {
   image.src = '';
   if (viewerObjectUrl?.startsWith('blob:')) URL.revokeObjectURL(viewerObjectUrl);
   viewerObjectUrl = null;
+  const compare = $('viewerCompare').checked;
+  $('viewerStage').classList.toggle('is-comparing', compare);
+  $('viewerCompareFigure').hidden = !compare;
+  const compareImage = $('viewerCompareImage'); compareImage.src = ''; compareImage.classList.remove('is-loaded');
+  if (compareObjectUrl?.startsWith('blob:')) URL.revokeObjectURL(compareObjectUrl);
+  compareObjectUrl = null;
+  $('viewerCompareError').hidden = true;
   setZoom(1);
   const source = await sourceForRecord(record, { thumbnail: false });
+  if (sequence !== viewerRenderSequence) { if (source.revoke) URL.revokeObjectURL(source.url); return; }
   if (!source.url) {
     $('viewerPlaceholder').textContent = source.mode === 'hash-mismatch'
       ? 'Содержимое PNG отличается от сохранённого SHA-256. Другая версия файла не подставлена.'
@@ -678,6 +723,19 @@ async function renderViewer() {
   image.onerror = () => { $('viewerPlaceholder').textContent = 'Не удалось открыть изображение'; };
   image.alt = record.modelName || record.fileName || '';
   image.src = source.url;
+  if (compare) {
+    const original = await sourceForRecord(accepted, { thumbnail: false });
+    if (sequence !== viewerRenderSequence) { if (original.revoke) URL.revokeObjectURL(original.url); return; }
+    if (original.url) {
+      compareObjectUrl = original.revoke ? original.url : null;
+      compareImage.onload = () => compareImage.classList.add('is-loaded');
+      compareImage.onerror = () => { $('viewerCompareError').hidden = false; $('viewerCompareError').textContent = 'Точный PNG текущей версии недоступен'; };
+      compareImage.src = original.url;
+    } else {
+      $('viewerCompareError').hidden = false;
+      $('viewerCompareError').textContent = 'Точный PNG текущей версии недоступен';
+    }
+  }
   if (image.complete && image.naturalWidth > 0) {
     $('viewerPlaceholder').hidden = true;
     image.classList.add('is-loaded');
@@ -687,11 +745,13 @@ function viewerMove(delta) {
   const next = viewerIndex + delta;
   if (next < 0 || next >= filtered.length) return;
   viewerIndex = next;
+  viewerGenerationId = filtered[next].generationId;
+  viewerSourceId = filtered[next].sourceId;
   renderViewer().catch(showError);
 }
 
 function openCurrentChat() {
-  const record = filtered[viewerIndex];
+  const record = selectedViewerRecord();
   const url = String(record?.chatUrl || '');
   if (!/^https:\/\/chatgpt\.com\/c\/[^/?#]+/.test(url)) throw new Error('Ссылка на чат для этой генерации не сохранена');
   const opened = window.open(url, '_blank');
@@ -700,7 +760,7 @@ function openCurrentChat() {
 }
 
 async function openCurrentFile() {
-  const record = filtered[viewerIndex];
+  const record = selectedViewerRecord();
   if (!record) return;
   if (record.artifactMode === 'watcher' && record.outputPath) {
     const opened = window.open(watcherFileUrl(record), '_blank');
@@ -710,6 +770,7 @@ async function openCurrentFile() {
   }
   const file = await fileForRecord(record);
   if (!file) throw new Error('Не удалось получить локальный PNG');
+  if (!record.outputHash || await sha256Blob(file) !== String(record.outputHash).toLowerCase()) throw new Error('PNG изменён или не имеет проверенной контрольной суммы');
   const url = URL.createObjectURL(file);
   const opened = window.open(url, '_blank');
   if (!opened) {
@@ -722,7 +783,7 @@ async function openCurrentFile() {
 
 
 function exportFactsRows() {
-  return records.map((record) => {
+  return ($('exportScope').value === 'all' ? records : filtered).map((record) => {
     const f = record.facts || {};
     const modelName = record.modelName || record.fileName || '';
     return {
@@ -744,7 +805,9 @@ function exportFactsRows() {
       factsStatus: record.factsStatus || f.status || 'missing',
       chatUrl: record.chatUrl || f.chatUrl || '',
       outputFileName: record.outputFileName || '',
-      generatedAt: record.generatedAt || ''
+      generatedAt: record.generatedAt || '',
+      sourceId: record.sourceId, generationId: record.generationId, factsJobId: record.factsJobId,
+      outputHash: record.outputHash, reviewStatus: record.reviewStatus || 'unreviewed', imageTextMatchesFacts: record.imageTextMatchesFacts !== false
     };
   });
 }
@@ -764,35 +827,34 @@ function exportFactsJson() {
   const payload = {
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),
-    count: records.length,
+    count: exportFactsRows().length,
     items: exportFactsRows()
   };
   downloadBlob(`watch-generation-facts-${new Date().toISOString().slice(0,10)}.json`,
     new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }));
 }
 
-function csvCell(value) {
-  const text = String(value ?? '').replaceAll('"', '""');
-  return `"${text}"`;
-}
-
-function exportFactsCsv() {
-  const rows = exportFactsRows();
-  const headers = Object.keys(rows[0] || {
-    modelName:'', brand:'', sale:'', sourceQuality:'', titleBrand:'', titleSeries:'', titleModel:'',
-    utp1:'', utp2:'', waterResistance:'', waterResistanceValue:'', waterResistanceUnit:'',
-    caseSize:'', caseSizeValueMm:'', warnings:'', factsStatus:'', chatUrl:'', outputFileName:'', generatedAt:''
-  });
-  const csv = '\ufeff' + [headers.join(';'), ...rows.map((row) => headers.map((key) => csvCell(row[key])).join(';'))].join('\r\n');
-  downloadBlob(`watch-generation-facts-${new Date().toISOString().slice(0,10)}.csv`,
-    new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-}
-
 $('refreshGallery').addEventListener('click', () => {
   clearThumbCache();
   loadState().catch(showError);
 });
-$('exportFactsCsv')?.addEventListener('click', exportFactsCsv);
+function selectedViewerRecord() {
+  const accepted = filtered[viewerIndex];
+  return accepted && (galleryVersionsForRecord(accepted, allRevisions).find(item => item.generationId === viewerGenerationId) || accepted);
+}
+const reviewUi = initGalleryReview({ selected: selectedViewerRecord, current: () => filtered[viewerIndex],
+  allRecords: ({ scope = 'all' } = {}) => scope === 'filtered' ? filtered : records,
+  reload: loadState, renderViewer, showError, showToast, download: downloadBlob, escapeHtml,
+  selectVersion: (sourceId, id) => {
+    if (!filtered.some(record => record.sourceId === sourceId)) {
+      $('search').value = '';
+      ['brandFilter', 'saleFilter', 'qualityFilter', 'factsFilter'].forEach(key => { $(key).value = 'all'; });
+      applyFilters();
+    }
+    openViewerBySource(sourceId); viewerGenerationId = id; renderViewer().catch(showError);
+  } });
+$('viewerVersion').addEventListener('change', () => { viewerGenerationId = $('viewerVersion').value; renderViewer().catch(showError); });
+$('viewerCompare').addEventListener('change', () => renderViewer().catch(showError));
 $('exportFactsJson')?.addEventListener('click', exportFactsJson);
 initResultsTransfer({ reload: () => { clearThumbCache(); return loadState(); } });
 if (location.hash === '#transfer') $('resultsTransferOpen').click();
@@ -802,7 +864,7 @@ $('loadMore').addEventListener('click', () => { shown += PAGE_SIZE; render(); })
 $('viewerClose').addEventListener('click', closeViewer);
 $('viewerPrev').addEventListener('click', () => viewerMove(-1));
 $('viewerNext').addEventListener('click', () => viewerMove(1));
-$('viewerReject').addEventListener('click', () => reject(filtered[viewerIndex]).catch(showError));
+$('viewerReject').addEventListener('click', () => { if (!$('viewerReject').disabled) reject(selectedViewerRecord()).catch(showError); });
 $('viewerOpenFile').addEventListener('click', () => openCurrentFile().catch(showError));
 $('viewerOpenChat').addEventListener('click', () => { try { openCurrentChat(); } catch (error) { showError(error); } });
 $('zoomOut').addEventListener('click', () => setZoom(zoom - .25));
@@ -817,10 +879,11 @@ $('viewerStage').addEventListener('wheel', (event) => {
 $('viewer').addEventListener('click', (event) => { if (event.target === $('viewer')) closeViewer(); });
 window.addEventListener('keydown', (event) => {
   if (!$('viewer').open) return;
+  if (event.target.closest?.('input,textarea,select,button')) return;
   if (event.key === 'ArrowLeft') { event.preventDefault(); viewerMove(-1); }
   if (event.key === 'ArrowRight') { event.preventDefault(); viewerMove(1); }
   if (event.key === 'Escape') closeViewer();
-  if (event.key.toLowerCase() === 'b' || event.key === 'Delete') reject(filtered[viewerIndex]).catch(showError);
+  if ((event.key.toLowerCase() === 'b' || event.key === 'Delete') && !$('viewerReject').disabled) reject(selectedViewerRecord()).catch(showError);
 });
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local' || (!changes.generationMemory && !changes.queue && !changes.outputDestination && !changes[ACCOUNTING_SNAPSHOT_STORAGE_KEY])) return;
@@ -829,6 +892,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 window.addEventListener('beforeunload', () => {
   clearThumbCache();
   if (viewerObjectUrl?.startsWith('blob:')) URL.revokeObjectURL(viewerObjectUrl);
+  if (compareObjectUrl?.startsWith('blob:')) URL.revokeObjectURL(compareObjectUrl);
 });
 
 loadState().catch(showError);

@@ -947,6 +947,8 @@ function startHttpServer() {
       let task;
       if (request.method === 'POST' && requestUrl.pathname === '/results-transfer/export') {
         task = readRequestBody(request, 16 * 1024 * 1024).then((payload) => resultsTransfers.startExport(payload.records, owner));
+      } else if (request.method === 'POST' && requestUrl.pathname === '/results-transfer/customer') {
+        task = readRequestBody(request, 16 * 1024 * 1024).then(payload => resultsTransfers.startCustomerExport(payload.records, owner));
       } else if (request.method === 'POST' && requestUrl.pathname === '/results-transfer/import') {
         task = resultsTransfers.uploadImport(request, owner);
       } else if (request.method === 'POST' && requestUrl.pathname === '/results-transfer/install') {

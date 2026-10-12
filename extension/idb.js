@@ -406,8 +406,8 @@ export async function adoptLegacyGenerationRevisions(sourceAliases = {}) {
       const old = map.get(item.skuKey);
       if (!old || timestamp(item.revision) > timestamp(old.revision)) map.set(item.skuKey, item);
     };
-    if (item.revision.reviewStatus !== 'rejected') choose(latestImage);
-    if (item.factsValid && item.revision.reviewStatus !== 'rejected') choose(latestReady);
+    if (!['rejected', 'pending'].includes(item.revision.reviewStatus)) choose(latestImage);
+    if (item.factsValid && !['rejected', 'pending'].includes(item.revision.reviewStatus)) choose(latestReady);
   }
   const db = await openDb();
   try {
