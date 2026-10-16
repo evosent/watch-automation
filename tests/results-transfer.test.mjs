@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm, readdir, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, readdir, symlink, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import { Readable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { deflateSync } from 'node:zlib';
@@ -17,6 +18,7 @@ import { canonicalBrandIdentityId } from '../extension/sku-utils.js';
 import { DB_NAME, mergeResultsDatabase, getAllGenerationRevisions, getAllModelCatalog } from '../extension/idb.js';
 import { galleryRecordsFromCatalog } from '../extension/gallery-revision-utils.js';
 import { initResultsTransfer } from '../extension/results-transfer-ui.js';
+import { MAX_RESULTS_ARCHIVE_BYTES } from '../extension/results-archive-limits.js';
 
 const project = path.resolve(import.meta.dirname, '..');
 const owner = 'client:results-transfer-test';
@@ -332,6 +334,8 @@ test('actual watcher HTTP endpoints enforce extension access and round-trip uplo
     try { if ((await fetch(`${base}/health`)).ok) break; } catch (_) {}
     if (i === 99) throw new Error(log || 'watcher failed to start'); await delay(20);
   }
+  const health = await fetch(`${base}/health`).then(response => response.json());
+  assert.equal(health.resultsTransfer.maxArchiveBytes, MAX_RESULTS_ARCHIVE_BYTES);
   assert.equal((await fetch(`${base}/results-transfer/status`)).status, 403);
   const identity = new URLSearchParams({ extensionId: 'a'.repeat(32), clientId: 'transfer-http-test' });
   assert.equal((await fetch(`${base}/results-transfer/status?${identity}`, { headers: { Origin: 'https://example.com' } })).status, 403);
@@ -358,6 +362,105 @@ test('actual watcher HTTP endpoints enforce extension access and round-trip uplo
   const downloadedPath = path.join(temp, 'downloaded.zip');
   await writeFile(downloadedPath, Buffer.from(await downloaded.arrayBuffer()));
   assert.equal((await inspectResultsZip(downloadedPath)).length, 2);
+});
+
+test('a real ZIP above 2 GiB uploads over HTTP, extracts, installs and merges every result', {
+  skip: process.env.WATCH_RESULTS_LARGE_ARCHIVE_TEST !== '1'
+    ? 'Set WATCH_RESULTS_LARGE_ARCHIVE_TEST=1 for the multi-GB HTTP import.' : false,
+  timeout: 15 * 60000
+}, async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'watch-results-large-test-'));
+  let child;
+  t.after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      await new Promise(resolve => {
+        const timer = setTimeout(resolve, 3000);
+        child.once('exit', () => { clearTimeout(timer); resolve(); });
+        child.kill();
+      });
+    }
+    await rm(temp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  const source = path.join(temp, 'source'), receiverRoot = path.join(temp, 'WatchAutomation');
+  await mkdir(source); await mkdir(receiverRoot);
+  // A valid ancillary PNG text chunk keeps each image bounded while the ZIP
+  // crosses both the former 1 GiB cap and the signed 32-bit offset boundary.
+  const text = Buffer.alloc(32 * 1024 * 1024, 65);
+  text.write('padding\0', 0, 'ascii');
+  const padding = chunk('tEXt', text);
+  const records = [], imageEntries = [];
+  for (let i = 0; i < 65; i++) {
+    const small = png(i);
+    const bytes = Buffer.concat([small.subarray(0, -12), padding, small.subarray(-12)]);
+    const record = revision(i, bytes), file = path.join(source, `${i}.png`);
+    await writeFile(file, bytes);
+    records.push(record);
+    imageEntries.push({ name: `images/${record.outputHash}.png`, path: file });
+  }
+  const archive = path.join(temp, 'results.zip');
+  await writeResultsZip(archive, [
+    { name: 'manifest.json', bytes: Buffer.from(JSON.stringify(manifest(records))) }, ...imageEntries
+  ]);
+  const archiveBytes = (await stat(archive)).size;
+  assert.ok(archiveBytes > 2 * 1024 ** 3);
+  const inspected = await inspectResultsZip(archive);
+  assert.equal(inspected.length, records.length + 1);
+  assert.ok(inspected.some(entry => entry.local > 0x7fffffff));
+  t.diagnostic(`Real archive: ${archiveBytes} bytes; ${records.length} PNGs`);
+
+  const port = 23000 + Math.floor(Math.random() * 10000);
+  child = spawn(process.execPath, [path.join(project, 'dev/watch-extension.mjs')], {
+    env: { ...process.env, WATCH_AUTOMATION_PORT: String(port), WATCH_AUTOMATION_OUTPUT_ROOT: receiverRoot },
+    windowsHide: true, stdio: 'pipe'
+  });
+  let log = ''; child.stderr.on('data', data => { log += data; }); child.stdout.on('data', () => {});
+  const base = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(`${base}/health`)).ok) break; } catch (_) {}
+    if (i === 99) throw new Error(log || 'watcher failed to start');
+    await delay(20);
+  }
+  const health = await fetch(`${base}/health`).then(response => response.json());
+  assert.equal(health.resultsTransfer.maxArchiveBytes, MAX_RESULTS_ARCHIVE_BYTES);
+  const identity = new URLSearchParams({ extensionId: 'a'.repeat(32), clientId: 'large-import-release-test' });
+  const response = await fetch(`${base}/results-transfer/import?${identity}`, {
+    method: 'POST', body: createReadStream(archive), duplex: 'half',
+    headers: { 'Content-Type': 'application/zip', 'Content-Length': String(archiveBytes) },
+    signal: AbortSignal.timeout(10 * 60000)
+  });
+  assert.equal(response.status, 200);
+  const incoming = await response.json(); assert.equal(incoming.ok, true, incoming.error);
+  const query = `${identity}&id=${incoming.value.id}`;
+  const waitFor = async phase => {
+    const deadline = Date.now() + 10 * 60000;
+    while (Date.now() < deadline) {
+      const state = await fetch(`${base}/results-transfer/status?${query}`).then(result => result.json());
+      assert.equal(state.ok, true, state.error);
+      assert.notEqual(state.value.phase, 'error', state.value.error);
+      if (state.value.phase === phase) return state.value;
+      await delay(100);
+    }
+    throw new Error(`Large import did not reach ${phase}`);
+  };
+  const checked = await waitFor('ready');
+  assert.equal(checked.items.length, records.length);
+  const install = await fetch(`${base}/results-transfer/install?${query}`, { method: 'POST' });
+  assert.equal(install.status, 200);
+  const installed = await waitFor('installed');
+  for (const item of installed.items) {
+    assert.ok(item.outputPath.startsWith(receiverRoot + path.sep));
+    assert.equal(sha256(await readFile(item.outputPath)), item.outputHash);
+  }
+  await resetDb();
+  const plan = planResultsMerge(installed.items, { queue: { groups: {} }, catalog: [], revisions: [],
+    generationMemory: { version: 1, items: {} } });
+  assert.equal(plan.summary.newResults, records.length);
+  await mergeResultsDatabase(plan);
+  assert.equal((await getAllGenerationRevisions()).length, records.length);
+  assert.equal((await getAllModelCatalog({ includeRemoved: true })).length, records.length);
+  const finished = await fetch(`${base}/results-transfer/finish?${query}`, { method: 'POST' });
+  assert.equal(finished.status, 200);
+  t.diagnostic('HTTP upload, PNG validation, installation and database merge completed');
 });
 
 test('filesystem junctions cannot redirect exported or imported photographs outside Downloads/WatchAutomation', async (t) => {
@@ -406,7 +509,8 @@ test('gallery workflow previews before merge, waits for disk installation and re
   } } };
   globalThis.fetch = async (url, options = {}) => {
     const target = new URL(url);
-    if (target.pathname === '/health') return { ok: true, json: async () => ({ apiVersion: 11 }) };
+    if (target.pathname === '/health') return { ok: true, json: async () => ({ apiVersion: 12,
+      resultsTransfer: { maxArchiveBytes: MAX_RESULTS_ARCHIVE_BYTES } }) };
     if (target.pathname.endsWith('/import')) { assert.ok(options.body instanceof File); return { ok: true, json: async () => ({ ok: true, value: { id: 'import-id' } }) }; }
     if (target.pathname.endsWith('/install')) { phase = 'installed'; calls.push('DISK_INSTALL'); }
     return { ok: true, json: async () => ({ ok: true, value: { kind: 'import', phase, id: 'import-id' } }) };

@@ -9,6 +9,7 @@ import { createUpdateManager, installedUpdateStatus, scheduleApplicationRestart,
   AUTOMATION_LAUNCHER_TEMPLATE_MARKER, prepareAutomationBrowserStartup,
   repairAutomationLauncherFromTemplate, validateAutomationInstallation } from './update-utils.mjs';
 import { createResultsTransferManager } from '../extension/local-service/results-transfer.mjs';
+import { MAX_RESULTS_ARCHIVE_BYTES } from '../extension/results-archive-limits.js';
 import { createArtifactAccountingVerifier } from '../extension/local-service/artifact-accounting.mjs';
 import {
   controlCommandMatchesClient,
@@ -1175,7 +1176,9 @@ function startHttpServer() {
       return;
     }
     if (requestUrl.pathname === '/health') {
-      jsonResponse(response, 200, { ok: true, service: 'watch-extension', apiVersion: WATCHER_API_VERSION, buildId: WATCHER_BUILD_ID, pid: process.pid, projectRoot: PROJECT_ROOT });
+      jsonResponse(response, 200, { ok: true, service: 'watch-extension', apiVersion: WATCHER_API_VERSION,
+        buildId: WATCHER_BUILD_ID, pid: process.pid, projectRoot: PROJECT_ROOT,
+        resultsTransfer: { maxArchiveBytes: MAX_RESULTS_ARCHIVE_BYTES } });
       return;
     }
     if (requestUrl.pathname === '/status') {

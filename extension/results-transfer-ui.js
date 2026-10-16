@@ -1,3 +1,5 @@
+import { MAX_RESULTS_ARCHIVE_BYTES, RESULTS_ARCHIVE_TOO_LARGE_MESSAGE } from './results-archive-limits.js';
+
 const BASE = 'http://127.0.0.1:17321/results-transfer/';
 
 export function initResultsTransfer({ reload }) {
@@ -22,6 +24,17 @@ export function initResultsTransfer({ reload }) {
     const payload = await response.json();
     if (!response.ok || !payload.ok) throw new Error(payload.error || 'Ошибка передачи результатов');
     return payload.value;
+  };
+  const requireArchiveService = async () => {
+    const response = await fetch('http://127.0.0.1:17321/health', {
+      cache: 'no-store', signal: AbortSignal.timeout(8000)
+    });
+    if (!response.ok) throw new Error('Локальный сервис недоступен. Запусти приложение через START_AUTOGENERATION.cmd.');
+    const health = await response.json();
+    if (Number(health.apiVersion) < 11 || !Number.isFinite(health.resultsTransfer?.maxArchiveBytes)
+      || health.resultsTransfer.maxArchiveBytes < MAX_RESULTS_ARCHIVE_BYTES) {
+      throw new Error('Локальный сервис использует старое ограничение архива. Заверши активный прогон и полностью перезапусти приложение через START_AUTOGENERATION.cmd.');
+    }
   };
   const poll = async (id, phase) => {
     const deadline = Date.now() + 30 * 60000;
@@ -62,8 +75,7 @@ export function initResultsTransfer({ reload }) {
     void act(async () => {
       message('Читаю сохранённые результаты…');
       const info = await send('GET_RESULTS_TRANSFER_INFO'); identity = info.identity;
-      const health = await fetch('http://127.0.0.1:17321/health', { cache: 'no-store', signal: AbortSignal.timeout(8000) }).then((response) => response.json());
-      if (Number(health.apiVersion) < 11) throw new Error('Перезапусти приложение через START_AUTOGENERATION, чтобы включить передачу результатов.');
+      await requireArchiveService();
       $('resultsExportScope').replaceChildren(new Option(`Все сохранённые результаты (${info.count})`, ''));
       for (const run of info.runs) {
         const date = new Date(run.date);
@@ -91,7 +103,8 @@ export function initResultsTransfer({ reload }) {
   $('resultsImportCheck').addEventListener('click', () => void act(async () => {
     const file = $('resultsImportFile').files?.[0];
     if (!file || !/\.zip$/i.test(file.name)) throw new Error('Выбери ZIP-архив результатов');
-    if (file.size > 1024 * 1024 * 1024) throw new Error('Максимальный размер архива — 1 ГБ');
+    if (file.size > MAX_RESULTS_ARCHIVE_BYTES) throw new Error(RESULTS_ARCHIVE_TOO_LARGE_MESSAGE);
+    await requireArchiveService();
     message('Загружаю архив в локальный сервис…');
     const job = await request('import', { method: 'POST', body: file });
     await poll(job.id, 'ready'); importId = job.id;

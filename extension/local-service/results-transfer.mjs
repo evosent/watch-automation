@@ -5,7 +5,8 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { RESULTS_PACKAGE_FORMAT, RESULTS_PACKAGE_VERSION, MAX_RESULT_RECORDS,
   portableResult, portableRevisionKey, validateResultsManifest } from '../results-transfer-utils.js';
-import { MAX_RESULTS_ARCHIVE_BYTES, pngMetadata, writeResultsZip, extractResultsZip } from './results-archive.mjs';
+import { MAX_RESULTS_ARCHIVE_BYTES, RESULTS_ARCHIVE_TOO_LARGE_MESSAGE } from '../results-archive-limits.js';
+import { pngMetadata, writeResultsZip, extractResultsZip } from './results-archive.mjs';
 import { buildCardWorkbook } from '../card-workbook.js';
 import { auditCardRecords } from '../gallery-quality-utils.js';
 
@@ -162,7 +163,7 @@ export function createResultsTransferManager({ outputRoot }) {
       try {
         await pipeline(request, new Transform({ transform(chunk, _encoding, callback) {
           bytes += chunk.length;
-          callback(bytes > MAX_RESULTS_ARCHIVE_BYTES ? new Error('Архив превышает 1 ГБ') : null, chunk);
+          callback(bytes > MAX_RESULTS_ARCHIVE_BYTES ? new Error(RESULTS_ARCHIVE_TOO_LARGE_MESSAGE) : null, chunk);
         } }), createWriteStream(archivePath, { flags: 'wx' }));
       } catch (error) {
         job.phase = 'error'; job.error = error.message;

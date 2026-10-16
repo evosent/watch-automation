@@ -3,9 +3,13 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { inflateRawSync, inflateSync } from 'node:zlib';
+import { MAX_RESULTS_ARCHIVE_BYTES, RESULTS_ARCHIVE_SIZE_LABEL, RESULTS_ARCHIVE_TOO_LARGE_MESSAGE,
+  calculateZip32ArchiveLayout } from '../results-archive-limits.js';
+export { MAX_RESULTS_ARCHIVE_BYTES };
 
-export const MAX_RESULTS_ARCHIVE_BYTES = 1024 * 1024 * 1024;
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_COMPRESSED_ENTRY_BYTES = MAX_FILE_BYTES + 1024 * 1024;
+const MAX_DIRECTORY_BYTES = 2 * 1024 * 1024;
 const TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
   let crc = value;
   for (let bit = 0; bit < 8; bit++) crc = (crc & 1) ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
@@ -63,37 +67,94 @@ export function pngMetadata(bytes) {
   return { bytes: bytes.length, width, height, sha256: sha256(bytes) };
 }
 
-// PNGs are already compressed. Store entries sequentially; never load a whole
-// export or import archive into memory.
-export async function writeResultsZip(destination, entries, { allowedEntry = allowedName } = {}) {
-  const file = await fs.open(destination, 'wx');
-  const central = [];
-  let offset = 0;
+async function sizeOfEntry(entry) {
+  if (entry.bytes !== undefined && entry.bytes !== null) {
+    if (!Buffer.isBuffer(entry.bytes) && !(entry.bytes instanceof Uint8Array)) throw new Error('Некорректное содержимое ZIP-файла');
+    return entry.bytes.byteLength;
+  }
+  if (!entry.path) throw new Error('Не задан источник файла ZIP');
+  const info = await fs.stat(entry.path);
+  if (!info.isFile()) throw new Error('Источник ZIP должен быть обычным файлом');
+  return info.size;
+}
+
+async function readBoundedEntry(entry, expectedSize) {
+  if (entry.bytes !== undefined && entry.bytes !== null) {
+    const bytes = Buffer.isBuffer(entry.bytes) ? entry.bytes : Buffer.from(entry.bytes.buffer, entry.bytes.byteOffset, entry.bytes.byteLength);
+    if (bytes.length !== expectedSize || bytes.length > MAX_FILE_BYTES) throw new Error('Архив превышает допустимый размер записи');
+    return bytes;
+  }
+  const source = await fs.open(entry.path, 'r');
   try {
-    for (const entry of entries) {
-      if (!allowedEntry(entry.name)) throw new Error('Недопустимый путь в архиве');
-      const body = entry.bytes || await fs.readFile(entry.path);
-      if (body.length > MAX_FILE_BYTES || offset + body.length > MAX_RESULTS_ARCHIVE_BYTES) throw new Error('Архив превышает допустимый размер');
-      const name = Buffer.from(entry.name);
+    const info = await source.stat();
+    if (!info.isFile() || info.size > MAX_FILE_BYTES) throw new Error('Архив превышает допустимый размер записи');
+    if (info.size !== expectedSize) throw new Error('Файл изменился при создании архива');
+    const bytes = Buffer.allocUnsafe(info.size);
+    let position = 0;
+    while (position < bytes.length) {
+      const result = await source.read(bytes, position, bytes.length - position, position);
+      if (!result.bytesRead) throw new Error('Файл оборвался при создании архива');
+      position += result.bytesRead;
+    }
+    if ((await source.stat()).size !== info.size) throw new Error('Файл изменился при создании архива');
+    return bytes;
+  } finally { await source.close(); }
+}
+
+// PNGs are already compressed. Preflight the complete ZIP layout, then hold at
+// most one bounded entry body in memory while writing sequentially to disk.
+export async function writeResultsZip(destination, entries, { allowedEntry = allowedName } = {}) {
+  if (!Array.isArray(entries) || entries.length >= 0xffff) throw new Error('Слишком много файлов в ZIP-архиве');
+  const planned = [];
+  let localBytes = 0, directoryBytes = 0;
+  for (const entry of entries) {
+    if (typeof entry?.name !== 'string' || !entry.name || !allowedEntry(entry.name)) throw new Error('Недопустимый путь в архиве');
+    const name = Buffer.from(entry.name);
+    if (name.length > 0xffff) throw new Error('Слишком длинное имя файла в ZIP-архиве');
+    const size = await sizeOfEntry(entry);
+    if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE_BYTES) throw new Error('Архив превышает допустимый размер записи');
+    const localOffset = localBytes;
+    localBytes += 30 + name.length + size;
+    directoryBytes += 46 + name.length;
+    if (directoryBytes > MAX_DIRECTORY_BYTES) throw new Error('Оглавление ZIP превышает допустимый размер');
+    planned.push({ entry, name, size, localOffset });
+  }
+  const { centralDirectoryOffset } = calculateZip32ArchiveLayout(localBytes, directoryBytes, entries.length);
+
+  let file;
+  let created = false;
+  let complete = false;
+  try {
+    file = await fs.open(destination, 'wx');
+    created = true;
+    const central = [];
+    for (const item of planned) {
+      const body = await readBoundedEntry(item.entry, item.size);
       const crc = crc32(body);
       const header = Buffer.alloc(30);
       header.writeUInt32LE(0x04034b50); header.writeUInt16LE(20, 4); header.writeUInt16LE(0x800, 6);
       header.writeUInt32LE(crc, 14); header.writeUInt32LE(body.length, 18); header.writeUInt32LE(body.length, 22);
-      header.writeUInt16LE(name.length, 26);
+      header.writeUInt16LE(item.name.length, 26);
       const directory = Buffer.alloc(46);
       directory.writeUInt32LE(0x02014b50); directory.writeUInt16LE(20, 4); directory.writeUInt16LE(20, 6);
       directory.writeUInt16LE(0x800, 8); directory.writeUInt32LE(crc, 16);
       directory.writeUInt32LE(body.length, 20); directory.writeUInt32LE(body.length, 24);
-      directory.writeUInt16LE(name.length, 28); directory.writeUInt32LE(offset, 42);
-      await file.writeFile(Buffer.concat([header, name])); await file.writeFile(body);
-      central.push(directory, name); offset += header.length + name.length + body.length;
+      directory.writeUInt16LE(item.name.length, 28); directory.writeUInt32LE(item.localOffset, 42);
+      await file.writeFile(Buffer.concat([header, item.name])); await file.writeFile(body);
+      central.push(directory, item.name);
     }
     const directory = Buffer.concat(central);
     const end = Buffer.alloc(22);
     end.writeUInt32LE(0x06054b50); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10);
-    end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+    end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(centralDirectoryOffset, 16);
     await file.writeFile(directory); await file.writeFile(end); await file.sync();
-  } finally { await file.close(); }
+    complete = true;
+  } finally {
+    if (file) {
+      try { await file.close(); }
+      finally { if (created && !complete) await fs.rm(destination, { force: true }); }
+    }
+  }
 }
 
 async function readAt(file, count, offset) {
@@ -107,7 +168,8 @@ export async function inspectResultsZip(zipPath) {
   const file = await fs.open(zipPath, 'r');
   try {
     const size = (await file.stat()).size;
-    if (size < 22 || size > MAX_RESULTS_ARCHIVE_BYTES) throw new Error('Неверный размер ZIP: максимум 1 ГБ');
+    if (size < 22) throw new Error('Неверный размер ZIP');
+    if (size > MAX_RESULTS_ARCHIVE_BYTES) throw new Error(RESULTS_ARCHIVE_TOO_LARGE_MESSAGE);
     const tail = await readAt(file, Math.min(size, 65557), size - Math.min(size, 65557));
     let end;
     for (let i = tail.length - 22; i >= 0; i--) {
@@ -115,7 +177,7 @@ export async function inspectResultsZip(zipPath) {
     }
     if (!end || end.readUInt16LE(4) || end.readUInt16LE(6) || end.readUInt16LE(8) !== end.readUInt16LE(10)) throw new Error('Неверное оглавление ZIP');
     const count = end.readUInt16LE(10), directorySize = end.readUInt32LE(12), start = end.readUInt32LE(16);
-    if (!count || count > 5001 || directorySize > 2 * 1024 * 1024 || start + directorySize + end.length !== size) throw new Error('Неверное оглавление ZIP');
+    if (!count || count > 5001 || directorySize > MAX_DIRECTORY_BYTES || start + directorySize + end.length !== size) throw new Error('Неверное оглавление ZIP');
     const directory = await readAt(file, directorySize, start);
     const entries = [];
     const names = new Set();
@@ -130,9 +192,10 @@ export async function inspectResultsZip(zipPath) {
       if (next > directory.length) throw new Error('Повреждено имя файла ZIP');
       const name = new TextDecoder('utf-8', { fatal: true }).decode(directory.subarray(offset + 46, offset + 46 + nameLength));
       if (!allowedName(name) || names.has(name) || (flags & 1) || ![0, 8].includes(method)
-        || (unixMode & 0xf000) === 0xa000 || length > MAX_FILE_BYTES || local + 30 + compressed > start) throw new Error('Недопустимый файл в архиве результатов');
+        || (unixMode & 0xf000) === 0xa000 || length > MAX_FILE_BYTES || compressed > MAX_COMPRESSED_ENTRY_BYTES
+        || local + 30 + compressed > start) throw new Error('Недопустимый файл в архиве результатов');
       total += length;
-      if (total > MAX_RESULTS_ARCHIVE_BYTES) throw new Error('Распакованный архив превышает 1 ГБ');
+      if (total > MAX_RESULTS_ARCHIVE_BYTES) throw new Error(`Распакованный архив превышает лимит ${RESULTS_ARCHIVE_SIZE_LABEL}`);
       names.add(name); entries.push({ name, flags, method, checksum, compressed, length, local, directoryStart: start }); offset = next;
     }
     if (offset !== directory.length || !names.has('manifest.json')) throw new Error('Неверный состав ZIP');
